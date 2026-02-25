@@ -1,0 +1,7 @@
+name = "whisper-relay"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+SUPABASE_URL = "https://enshmhxaqwxfehtccjlu.supabase.co"
+GATEWAY_URL = "https://ghostr-gateway-831985391959.europe-north1.run.app"

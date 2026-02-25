@@ -1,0 +1,64 @@
+# exit-relay/fly.toml
+# Configuration Fly.io pour Whisper Exit Relay
+# Version 3.0
+#
+# Déploiement:
+#   fly deploy --config fly.toml
+#
+# Pour créer l'app initialement:
+#   fly apps create whisper-exit-relay-eu
+#
+# Configuration des secrets (NE PAS COMMITER):
+#   fly secrets set SFU_URL=wss://votre-sfu.workers.dev
+
+app = "whisper-exit-relay-eu-summer-surf-1900"
+primary_region = "cdg"  # Paris
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  LOG_LEVEL = "error"
+  ACCESS_LOG = "false"
+  # SFU_URL doit être défini via fly secrets
+  # fly secrets set SFU_URL=wss://whisper-sfu.ghostcrypt.workers.dev
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 1000
+    soft_limit = 800
+
+# Configuration des healthchecks
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [[services.http_checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+
+# Configuration VM
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
+
+# Métriques désactivées pour la vie privée
+# [metrics]
+#   port = 9091
+#   path = "/metrics"

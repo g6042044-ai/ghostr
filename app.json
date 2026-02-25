@@ -1,0 +1,100 @@
+{
+  "expo": {
+    "name": "Ghostr",
+    "slug": "whisper-app",
+    "version": "3.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0f0f0f"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.ghostr.app",
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Ghostr uses the camera to scan QR codes for joining conversations and verifying safety numbers.",
+        "NSFaceIDUsageDescription": "Use Face ID to unlock Ghostr",
+        "NSMicrophoneUsageDescription": "Ghostr needs microphone access for voice calls.",
+        "NSPhotoLibraryUsageDescription": "Ghostr needs access to your photos to send images in conversations.",
+        "NSPhotoLibraryAddUsageDescription": "Ghostr needs permission to save images to your photo library.",
+        "UIBackgroundModes": [
+          "audio"
+        ]
+      }
+    },
+    "android": {
+      "softwareKeyboardLayoutMode": "resize",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0f0f0f"
+      },
+      "package": "com.ghostr.app",
+      "versionCode": 1,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.VIBRATE",
+        "android.permission.USE_BIOMETRIC",
+        "android.permission.USE_FINGERPRINT",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.ACCESS_MEDIA_LOCATION",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Ghostr to access your camera for QR code scanning."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Ghostr to access your photos to share images.",
+          "savePhotosPermission": "Allow Ghostr to save images to your photo library.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Ghostr to access your photos to send images in conversations."
+        }
+      ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Allow Ghostr to access your microphone for voice calls."
+        }
+      ],
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Allow Ghostr to use Face ID to unlock the app."
+        }
+      ],
+      "expo-secure-store",
+      "expo-font",
+      "@siteed/expo-audio-studio"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "ef1bbfeb-0938-4269-94b6-891e6f15053a"
+      }
+    }
+  }
+}

@@ -1,0 +1,401 @@
+// src/screens/ConnectionSuccessScreen.tsx
+// Écran de célébration quand un contact accepte une invitation
+// Full-screen animé avec avatar, badges sécurité, CTA
+
+import React, { useEffect, useRef } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  Animated,
+  Easing,
+} from 'react-native';
+import { useNavigation, useRoute } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import type { RouteProp } from '@react-navigation/native';
+import { Ionicons } from '@expo/vector-icons';
+
+import { theme } from '../components/ui';
+import { suppressNotification } from '../components/InAppNotification';
+
+type RootStackParamList = {
+  ConversationList: undefined;
+  Conversation: { conversationId: string; conversationName: string };
+  ConnectionSuccess: {
+    sessionId: string;
+    contactName: string;
+    inviteLabel: string;
+    inviteTag?: string;
+  };
+};
+
+type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'ConnectionSuccess'>;
+type ScreenRouteProp = RouteProp<RootStackParamList, 'ConnectionSuccess'>;
+
+// Couleur avatar déterministe depuis le nom
+function avatarColor(name: string): string {
+  const colors = [
+    '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#A78BFA',
+    '#F7DC6F', '#DDA0DD', '#FF8C42', '#6BCB77', '#4D96FF',
+  ];
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return colors[Math.abs(hash) % colors.length];
+}
+
+export function ConnectionSuccessScreen() {
+  const navigation = useNavigation<NavigationProp>();
+  const route = useRoute<ScreenRouteProp>();
+  const insets = useSafeAreaInsets();
+  const { sessionId, contactName, inviteLabel, inviteTag } = route.params;
+
+  // Supprimer le toast "Connexion établie" — cet écran affiche déjà l'info
+  useEffect(() => {
+    if (inviteTag) {
+      suppressNotification(`accept_${inviteTag}`);
+    }
+  }, [inviteTag]);
+
+  // ── Animation values ──
+  const backdropOpacity = useRef(new Animated.Value(0)).current;
+  const avatarScale = useRef(new Animated.Value(0)).current;
+  const checkScale = useRef(new Animated.Value(0)).current;
+  const titleOpacity = useRef(new Animated.Value(0)).current;
+  const titleTranslateY = useRef(new Animated.Value(20)).current;
+  const subtitleOpacity = useRef(new Animated.Value(0)).current;
+  const subtitleTranslateY = useRef(new Animated.Value(16)).current;
+  const badgesOpacity = useRef(new Animated.Value(0)).current;
+  const badgesTranslateY = useRef(new Animated.Value(20)).current;
+  const buttonOpacity = useRef(new Animated.Value(0)).current;
+  const buttonTranslateY = useRef(new Animated.Value(30)).current;
+  const laterOpacity = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const sequence = Animated.stagger(60, [
+      // 1: Backdrop
+      Animated.timing(backdropOpacity, {
+        toValue: 1, duration: 300, useNativeDriver: true,
+      }),
+      // 2: Avatar
+      Animated.spring(avatarScale, {
+        toValue: 1, tension: 100, friction: 6, useNativeDriver: true,
+      }),
+      // 3: Check badge
+      Animated.spring(checkScale, {
+        toValue: 1, tension: 120, friction: 5, useNativeDriver: true,
+      }),
+      // 6: Title
+      Animated.parallel([
+        Animated.timing(titleOpacity, {
+          toValue: 1, duration: 350, useNativeDriver: true,
+        }),
+        Animated.timing(titleTranslateY, {
+          toValue: 0, duration: 350, easing: Easing.out(Easing.cubic), useNativeDriver: true,
+        }),
+      ]),
+      // 7: Subtitle
+      Animated.parallel([
+        Animated.timing(subtitleOpacity, {
+          toValue: 1, duration: 300, useNativeDriver: true,
+        }),
+        Animated.timing(subtitleTranslateY, {
+          toValue: 0, duration: 300, easing: Easing.out(Easing.cubic), useNativeDriver: true,
+        }),
+      ]),
+      // 8: Badges
+      Animated.parallel([
+        Animated.timing(badgesOpacity, {
+          toValue: 1, duration: 350, useNativeDriver: true,
+        }),
+        Animated.timing(badgesTranslateY, {
+          toValue: 0, duration: 350, easing: Easing.out(Easing.cubic), useNativeDriver: true,
+        }),
+      ]),
+      // 9: Button
+      Animated.parallel([
+        Animated.timing(buttonOpacity, {
+          toValue: 1, duration: 300, useNativeDriver: true,
+        }),
+        Animated.timing(buttonTranslateY, {
+          toValue: 0, duration: 400, easing: Easing.out(Easing.cubic), useNativeDriver: true,
+        }),
+      ]),
+      // 10: Later
+      Animated.timing(laterOpacity, {
+        toValue: 1, duration: 300, useNativeDriver: true,
+      }),
+    ]);
+    sequence.start();
+
+    return () => { sequence.stop(); };
+  }, []);
+
+  const handleOpenConversation = () => {
+    navigation.replace('Conversation', {
+      conversationId: sessionId,
+      conversationName: contactName,
+    });
+  };
+
+  const handleLater = () => {
+    navigation.navigate('ConversationList');
+  };
+
+  const accentColor = avatarColor(contactName);
+  const initial = contactName.charAt(0).toUpperCase();
+
+  return (
+    <Animated.View style={[
+      styles.container,
+      {
+        opacity: backdropOpacity,
+        paddingBottom: insets.bottom + 16,
+        paddingTop: insets.top,
+      },
+    ]}>
+
+      {/* ═══ Visual: Avatar + Check ═══ */}
+      <View style={styles.visualCenter}>
+        <Animated.View style={[styles.avatar, {
+          backgroundColor: accentColor,
+          transform: [{ scale: avatarScale }],
+        }]}>
+          <Text style={styles.avatarText}>{initial}</Text>
+        </Animated.View>
+
+        <Animated.View style={[styles.checkBadge, {
+          transform: [{ scale: checkScale }],
+        }]}>
+          <Ionicons name="checkmark" size={14} color={theme.colors.background} />
+        </Animated.View>
+      </View>
+
+      {/* ═══ Title ═══ */}
+      <Animated.Text style={[styles.title, {
+        opacity: titleOpacity,
+        transform: [{ translateY: titleTranslateY }],
+      }]}>
+        Connexion établie
+      </Animated.Text>
+
+      {/* ═══ Subtitle ═══ */}
+      <Animated.View style={{
+        opacity: subtitleOpacity,
+        transform: [{ translateY: subtitleTranslateY }],
+        alignItems: 'center' as const,
+      }}>
+        <Text style={styles.contactName}>{contactName}</Text>
+        <Text style={styles.subtitle}>Connecté via {inviteLabel}</Text>
+      </Animated.View>
+
+      {/* ═══ Security Badges ═══ */}
+      <Animated.View style={[styles.badges, {
+        opacity: badgesOpacity,
+        transform: [{ translateY: badgesTranslateY }],
+      }]}>
+        <View style={styles.badge}>
+          <View style={styles.badgeIcon}>
+            <Ionicons name="shield-checkmark" size={14} color="#34D399" />
+          </View>
+          <Text style={styles.badgeText}>Chiffrement de bout en bout</Text>
+        </View>
+        <View style={styles.badgeSep} />
+        <View style={styles.badge}>
+          <View style={styles.badgeIcon}>
+            <Ionicons name="key" size={14} color="#34D399" />
+          </View>
+          <Text style={styles.badgeText}>Post-quantique (ML-KEM-768)</Text>
+        </View>
+        <View style={styles.badgeSep} />
+        <View style={styles.badge}>
+          <View style={styles.badgeIcon}>
+            <Ionicons name="eye-off" size={14} color="#34D399" />
+          </View>
+          <Text style={styles.badgeText}>Aucune trace d'identité</Text>
+        </View>
+      </Animated.View>
+
+      {/* ═══ Actions ═══ */}
+      <View style={styles.actions}>
+        <Animated.View style={{
+          opacity: buttonOpacity,
+          transform: [{ translateY: buttonTranslateY }],
+          width: '100%' as const,
+        }}>
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={handleOpenConversation}
+            activeOpacity={0.85}
+          >
+            <Ionicons
+              name="chatbubble"
+              size={18}
+              color={theme.colors.background}
+              style={{ marginRight: 8 }}
+            />
+            <Text style={styles.primaryButtonText}>Commencer à discuter</Text>
+          </TouchableOpacity>
+        </Animated.View>
+
+        <Animated.View style={{ opacity: laterOpacity }}>
+          <TouchableOpacity
+            style={styles.laterButton}
+            onPress={handleLater}
+            activeOpacity={0.6}
+          >
+            <Text style={styles.laterText}>Plus tard</Text>
+          </TouchableOpacity>
+        </Animated.View>
+      </View>
+    </Animated.View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: theme.colors.background,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+  },
+  visualCenter: {
+    width: 160,
+    height: 160,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 32,
+  },
+  avatar: {
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.4,
+    shadowRadius: 16,
+    elevation: 12,
+  },
+  avatarText: {
+    fontSize: 36,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  checkBadge: {
+    position: 'absolute',
+    bottom: 28,
+    right: 28,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#34D399',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 3,
+    borderColor: theme.colors.background,
+    shadowColor: '#34D399',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.5,
+    shadowRadius: 6,
+    elevation: 6,
+  },
+  title: {
+    fontSize: 26,
+    fontWeight: '800',
+    color: theme.colors.text,
+    letterSpacing: -0.5,
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  contactName: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#00D9A6',
+    textAlign: 'center',
+    marginBottom: 4,
+  },
+  subtitle: {
+    fontSize: 15,
+    color: theme.colors.textMuted,
+    textAlign: 'center',
+    lineHeight: 22,
+    marginBottom: 32,
+  },
+  badges: {
+    width: '100%',
+    backgroundColor: theme.colors.surface,
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(139, 164, 184, 0.10)',
+    marginBottom: 36,
+  },
+  badge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 3,
+  },
+  badgeIcon: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    backgroundColor: 'rgba(52, 211, 153, 0.10)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  badgeText: {
+    fontSize: 14,
+    color: theme.colors.text,
+    fontWeight: '500',
+    flex: 1,
+  },
+  badgeSep: {
+    height: 1,
+    backgroundColor: 'rgba(240, 244, 248, 0.04)',
+    marginVertical: 8,
+    marginLeft: 40,
+  },
+  actions: {
+    width: '100%',
+    alignItems: 'center',
+    gap: 12,
+  },
+  primaryButton: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#00D9A6',
+    borderRadius: 16,
+    paddingVertical: 17,
+    shadowColor: '#00D9A6',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.35,
+    shadowRadius: 16,
+    elevation: 8,
+  },
+  primaryButtonText: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: theme.colors.background,
+    letterSpacing: -0.2,
+  },
+  laterButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+  },
+  laterText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: theme.colors.textMuted,
+  },
+});
+
+export default ConnectionSuccessScreen;

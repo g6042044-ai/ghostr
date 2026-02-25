@@ -1,0 +1,54 @@
+# cloudflare-relay/wrangler-entry.toml
+# Configuration Wrangler pour l'Entry Relay - Version 5.0
+# 
+# Déploiement: wrangler deploy -c wrangler-entry.toml
+
+name = "whisper-entry-relay"
+main = "entry-relay-worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ============================================
+# VARIABLES D'ENVIRONNEMENT
+# ============================================
+# IMPORTANT: Utiliser https:// (pas wss://) car fetch() utilise HTTP
+# Le header Upgrade: websocket gère la négociation WebSocket
+[vars]
+EXIT_RELAY_EU_WEST = "https://whisper-exit-relay-eu-summer-surf-1900.fly.dev"
+EXIT_RELAY_EU_CENTRAL = "https://whisper-exit-relay-eu-summer-surf-1900.fly.dev"
+EXIT_RELAY_US_EAST = "https://whisper-exit-relay-eu-summer-surf-1900.fly.dev"
+EXIT_RELAY_US_WEST = "https://whisper-exit-relay-eu-summer-surf-1900.fly.dev"
+EXIT_RELAY_ASIA = "https://whisper-exit-relay-eu-summer-surf-1900.fly.dev"
+DEFAULT_EXIT_RELAY = "https://whisper-exit-relay-eu-summer-surf-1900.fly.dev"
+
+# ============================================
+# OBSERVABILITÉ - DÉSACTIVÉ pour la vie privée
+# ============================================
+[observability]
+enabled = false
+
+# ============================================
+# DÉVELOPPEMENT LOCAL
+# ============================================
+[dev]
+port = 8788
+local_protocol = "http"
+
+# ============================================
+# MIGRATION - Suppression du Durable Object
+# ============================================
+[[migrations]]
+tag = "v5"
+deleted_classes = ["WebSocketProxy"]
+
+# ============================================
+# DURABLE OBJECTS - Rate Limiter centralisé
+# ============================================
+[durable_objects]
+bindings = [
+  { name = "RATE_LIMITER", class_name = "RateLimiter" }
+]
+
+[[migrations]]
+tag = "v6"
+new_sqlite_classes = ["RateLimiter"]

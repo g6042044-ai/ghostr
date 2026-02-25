@@ -1,0 +1,31 @@
+# cloudflare-relay/wrangler-sfu.toml
+# Configuration Wrangler pour le SFU - Version 8.0
+#
+# Déploiement: wrangler deploy -c wrangler-sfu.toml
+
+name = "whisper-sfu"
+main = "sfu-worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[durable_objects]
+bindings = [
+  { name = "VOICE_ROOM", class_name = "VoiceRoom" }
+]
+
+# Migration initiale (v1 - création)
+[[migrations]]
+tag = "v1"
+new_classes = ["VoiceRoom"]
+
+# Migration v8 - robustesse messages
+[[migrations]]
+tag = "v8"
+
+# Observabilité - DÉSACTIVÉ pour la vie privée
+[observability]
+enabled = false
+
+[dev]
+port = 8787
+local_protocol = "http"

@@ -1,0 +1,652 @@
+// src/components/MediaProgressOverlay.tsx
+// v25.0: Overlays de progression pour les transferts média chunkés
+//
+// COMPOSANTS:
+//   <MediaProgressOverlay />  — Overlay principal avec anneau circulaire (images)
+//   <FileProgressBar />       — Barre de progression linéaire (fichiers)
+//   <VoiceProgressBar />      — Barre fine (vocaux)
+//   <IncomingMediaPlaceholder /> — Placeholder pour média en cours de réception
+//
+// DESIGN:
+//   - Anneau circulaire SVG animé sur fond semi-transparent pour les images
+//   - Barre linéaire subtile pour fichiers et vocaux
+//   - Animations fluides via React Native Animated
+//   - Cohérent avec le thème sombre de Ghostr
+
+import React, { useEffect, useRef, useMemo } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  Animated,
+  Easing,
+  Platform,
+} from 'react-native';
+
+// ============================================
+// THÈME — Aligné avec ConversationScreen Colors
+// ============================================
+
+const ProgressColors = {
+  // Fond semi-transparent de l'overlay
+  overlayBg: 'rgba(10, 15, 20, 0.65)',
+  
+  // Anneau de progression
+  ringTrack: 'rgba(139, 164, 184, 0.2)',   // Piste inactive
+  ringFill: '#00D9A6',                       // Progression (accent primary)
+  ringFillReceive: '#00B4D8',                // Progression réception (accent secondary)
+  
+  // Barre linéaire
+  barTrack: 'rgba(139, 164, 184, 0.15)',
+  barFill: '#00D9A6',
+  barFillReceive: '#00B4D8',
+  
+  // Texte
+  percentText: '#FFFFFF',
+  phaseText: 'rgba(240, 244, 248, 0.7)',
+  
+  // Placeholder
+  placeholderBg: 'rgba(26, 37, 47, 0.85)',
+  placeholderBorder: 'rgba(0, 217, 166, 0.15)',
+  placeholderIcon: 'rgba(0, 217, 166, 0.4)',
+  
+  // Shimmer
+  shimmer: 'rgba(0, 217, 166, 0.08)',
+};
+
+// ============================================
+// ANNEAU DE PROGRESSION SVG (React Native compatible)
+// ============================================
+
+/**
+ * Anneau de progression circulaire.
+ * Utilise des borders et rotation Animated pour compatibilité RN pure.
+ *
+ * NOTE: En React Native pur (sans react-native-svg), un vrai arc SVG
+ * n'est pas disponible. On utilise une technique de demi-cercles rotatifs.
+ */
+const ProgressRing: React.FC<{
+  size: number;
+  strokeWidth: number;
+  progress: number;  // 0.0 → 1.0
+  color?: string;
+}> = ({ size, strokeWidth, progress, color = ProgressColors.ringFill }) => {
+  const animatedProgress = useRef(new Animated.Value(0)).current;
+  const pulseAnim = useRef(new Animated.Value(0.6)).current;
+  
+  useEffect(() => {
+    Animated.timing(animatedProgress, {
+      toValue: progress,
+      duration: 400,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+  }, [progress]);
+  
+  // Animation de pulsation douce quand en cours
+  useEffect(() => {
+    if (progress < 1 && progress > 0) {
+      const pulse = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, {
+            toValue: 1,
+            duration: 1200,
+            easing: Easing.inOut(Easing.sine),
+            useNativeDriver: true,
+          }),
+          Animated.timing(pulseAnim, {
+            toValue: 0.6,
+            duration: 1200,
+            easing: Easing.inOut(Easing.sine),
+            useNativeDriver: true,
+          }),
+        ])
+      );
+      pulse.start();
+      return () => pulse.stop();
+    } else {
+      pulseAnim.setValue(1);
+    }
+  }, [progress > 0 && progress < 1]);
+  
+  const innerSize = size - strokeWidth * 2;
+  const percentText = `${Math.round(progress * 100)}%`;
+  
+  // Rotation du premier demi-cercle (0-50%)
+  const firstHalfRotation = animatedProgress.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: ['0deg', '180deg', '180deg'],
+  });
+  
+  // Rotation du second demi-cercle (50-100%)
+  const secondHalfRotation = animatedProgress.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: ['0deg', '0deg', '180deg'],
+  });
+  
+  // Opacité du second demi-cercle (visible seulement > 50%)
+  const secondHalfOpacity = animatedProgress.interpolate({
+    inputRange: [0, 0.499, 0.5, 1],
+    outputRange: [0, 0, 1, 1],
+  });
+  
+  return (
+    <Animated.View style={[{ width: size, height: size }, { opacity: pulseAnim }]}>
+      {/* Piste (track) */}
+      <View style={[
+        ringStyles.track,
+        {
+          width: size,
+          height: size,
+          borderRadius: size / 2,
+          borderWidth: strokeWidth,
+          borderColor: ProgressColors.ringTrack,
+        },
+      ]} />
+      
+      {/* Première moitié (0-180°) */}
+      <View style={[ringStyles.halfContainer, { width: size, height: size }]}>
+        <View style={[ringStyles.halfClip, { width: size / 2, height: size, left: size / 2 }]}>
+          <Animated.View style={[
+            ringStyles.halfCircle,
+            {
+              width: size,
+              height: size,
+              borderRadius: size / 2,
+              borderWidth: strokeWidth,
+              borderColor: color,
+              left: -(size / 2),
+              transform: [{ rotate: firstHalfRotation }],
+            },
+          ]} />
+        </View>
+      </View>
+      
+      {/* Seconde moitié (180-360°) */}
+      <Animated.View style={[ringStyles.halfContainer, { width: size, height: size, opacity: secondHalfOpacity }]}>
+        <View style={[ringStyles.halfClip, { width: size / 2, height: size, left: 0 }]}>
+          <Animated.View style={[
+            ringStyles.halfCircle,
+            {
+              width: size,
+              height: size,
+              borderRadius: size / 2,
+              borderWidth: strokeWidth,
+              borderColor: color,
+              transform: [{ rotate: secondHalfRotation }],
+            },
+          ]} />
+        </View>
+      </Animated.View>
+      
+      {/* Pourcentage au centre */}
+      <View style={[ringStyles.center, { width: innerSize, height: innerSize, borderRadius: innerSize / 2, top: strokeWidth, left: strokeWidth }]}>
+        <Text style={[ringStyles.percentText, { fontSize: size * 0.22 }]}>
+          {percentText}
+        </Text>
+      </View>
+    </Animated.View>
+  );
+};
+
+const ringStyles = StyleSheet.create({
+  track: {
+    position: 'absolute',
+  },
+  halfContainer: {
+    position: 'absolute',
+    overflow: 'hidden',
+  },
+  halfClip: {
+    position: 'absolute',
+    overflow: 'hidden',
+  },
+  halfCircle: {
+    position: 'absolute',
+    borderLeftColor: 'transparent',
+    borderBottomColor: 'transparent',
+  },
+  center: {
+    position: 'absolute',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  percentText: {
+    color: ProgressColors.percentText,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+    letterSpacing: -0.5,
+  },
+});
+
+// ============================================
+// OVERLAY PRINCIPAL (pour images)
+// ============================================
+
+export interface MediaProgressOverlayProps {
+  /** Progression 0.0 → 1.0 */
+  progress: number;
+  
+  /** Phase du transfert */
+  phase: 'preparing' | 'transferring' | 'assembling' | 'complete' | 'error';
+  
+  /** Direction (affecte la couleur) */
+  direction?: 'send' | 'receive';
+  
+  /** Taille de l'anneau (défaut: 64) */
+  ringSize?: number;
+  
+  /** Texte de phase personnalisé */
+  phaseLabel?: string;
+}
+
+/**
+ * Overlay semi-transparent avec anneau de progression.
+ * Se superpose aux images pendant l'envoi/réception.
+ *
+ * USAGE:
+ *   <View style={{ position: 'relative' }}>
+ *     <Image source={...} />
+ *     {progress && <MediaProgressOverlay progress={0.42} phase="transferring" />}
+ *   </View>
+ */
+export const MediaProgressOverlay: React.FC<MediaProgressOverlayProps> = ({
+  progress,
+  phase,
+  direction = 'send',
+  ringSize = 64,
+  phaseLabel,
+}) => {
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  
+  useEffect(() => {
+    if (phase === 'complete') {
+      // Fade out quand terminé
+      Animated.timing(fadeAnim, {
+        toValue: 0,
+        duration: 500,
+        delay: 300,
+        useNativeDriver: true,
+      }).start();
+    } else {
+      // Fade in au début
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 200,
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [phase]);
+  
+  const ringColor = direction === 'receive'
+    ? ProgressColors.ringFillReceive
+    : ProgressColors.ringFill;
+  
+  const label = phaseLabel || (() => {
+    switch (phase) {
+      case 'preparing': return 'Préparation...';
+      case 'transferring': return direction === 'send' ? 'Envoi sécurisé' : 'Réception';
+      case 'assembling': return 'Assemblage...';
+      case 'complete': return 'Terminé';
+      case 'error': return 'Erreur';
+      default: return '';
+    }
+  })();
+  
+  return (
+    <Animated.View style={[overlayStyles.container, { opacity: fadeAnim }]}>
+      <View style={overlayStyles.backdrop} />
+      <View style={overlayStyles.content}>
+        <ProgressRing
+          size={ringSize}
+          strokeWidth={3}
+          progress={progress}
+          color={ringColor}
+        />
+        <Text style={overlayStyles.phaseLabel} numberOfLines={1}>
+          {label}
+        </Text>
+      </View>
+    </Animated.View>
+  );
+};
+
+const overlayStyles = StyleSheet.create({
+  container: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 10,
+  },
+  backdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: ProgressColors.overlayBg,
+  },
+  content: {
+    alignItems: 'center',
+    gap: 8,
+  },
+  phaseLabel: {
+    color: ProgressColors.phaseText,
+    fontSize: 11,
+    fontWeight: '500',
+    letterSpacing: 0.3,
+  },
+});
+
+// ============================================
+// BARRE DE PROGRESSION LINÉAIRE (fichiers)
+// ============================================
+
+export interface FileProgressBarProps {
+  progress: number;
+  direction?: 'send' | 'receive';
+  height?: number;
+}
+
+/**
+ * Barre de progression fine pour les fichiers.
+ * S'insère sous l'icône du fichier.
+ */
+export const FileProgressBar: React.FC<FileProgressBarProps> = ({
+  progress,
+  direction = 'send',
+  height = 3,
+}) => {
+  const widthAnim = useRef(new Animated.Value(0)).current;
+  
+  useEffect(() => {
+    Animated.timing(widthAnim, {
+      toValue: progress,
+      duration: 350,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+  }, [progress]);
+  
+  const fillColor = direction === 'receive'
+    ? ProgressColors.barFillReceive
+    : ProgressColors.barFill;
+  
+  return (
+    <View style={[barStyles.track, { height }]}>
+      <Animated.View
+        style={[
+          barStyles.fill,
+          {
+            height,
+            backgroundColor: fillColor,
+            width: widthAnim.interpolate({
+              inputRange: [0, 1],
+              outputRange: ['0%', '100%'],
+            }),
+          },
+        ]}
+      />
+    </View>
+  );
+};
+
+const barStyles = StyleSheet.create({
+  track: {
+    width: '100%',
+    backgroundColor: ProgressColors.barTrack,
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
+  fill: {
+    borderRadius: 2,
+  },
+});
+
+// ============================================
+// BARRE VOCALE (vocaux)
+// ============================================
+
+export interface VoiceProgressBarProps {
+  progress: number;
+  direction?: 'send' | 'receive';
+}
+
+/**
+ * Barre de progression pour les vocaux.
+ * Plus fine, s'insère dans la waveform.
+ */
+export const VoiceProgressBar: React.FC<VoiceProgressBarProps> = ({
+  progress,
+  direction = 'send',
+}) => {
+  return <FileProgressBar progress={progress} direction={direction} height={2} />;
+};
+
+// ============================================
+// PLACEHOLDER MÉDIA ENTRANT
+// ============================================
+
+export interface IncomingMediaPlaceholderProps {
+  /** Type de média attendu */
+  mediaType?: 'image' | 'file' | 'voice';
+  
+  /** Progression 0.0 → 1.0 */
+  progress: number;
+  
+  /** Nombre de chunks reçus / total */
+  receivedChunks: number;
+  totalChunks: number;
+  
+  /** Dimensions pour les images (optionnel) */
+  width?: number;
+  height?: number;
+}
+
+/**
+ * Placeholder affiché pendant la réception d'un média chunké.
+ * Apparaît dès le premier chunk reçu, avant l'assemblage complet.
+ *
+ * - Images: rectangle avec shimmer + anneau
+ * - Fichiers: icône fichier + barre de progression
+ * - Vocaux: waveform placeholder + barre
+ */
+export const IncomingMediaPlaceholder: React.FC<IncomingMediaPlaceholderProps> = ({
+  mediaType = 'image',
+  progress,
+  receivedChunks,
+  totalChunks,
+  width = 200,
+  height = 150,
+}) => {
+  const shimmerAnim = useRef(new Animated.Value(0)).current;
+  
+  useEffect(() => {
+    const shimmer = Animated.loop(
+      Animated.timing(shimmerAnim, {
+        toValue: 1,
+        duration: 2000,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      })
+    );
+    shimmer.start();
+    return () => shimmer.stop();
+  }, []);
+  
+  const shimmerTranslate = shimmerAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [-width, width],
+  });
+  
+  if (mediaType === 'image') {
+    // Clamp les dimensions
+    const displayWidth = Math.min(220, width);
+    const displayHeight = Math.min(180, height);
+    
+    return (
+      <View style={[
+        placeholderStyles.imageContainer,
+        { width: displayWidth, height: displayHeight },
+      ]}>
+        {/* Fond avec shimmer */}
+        <View style={StyleSheet.absoluteFill}>
+          <View style={[placeholderStyles.imageBg, { width: displayWidth, height: displayHeight }]} />
+          <Animated.View
+            style={[
+              placeholderStyles.shimmer,
+              {
+                width: displayWidth * 0.6,
+                height: displayHeight,
+                transform: [{ translateX: shimmerTranslate }],
+              },
+            ]}
+          />
+        </View>
+        
+        {/* Anneau de progression */}
+        <View style={placeholderStyles.ringWrapper}>
+          <ProgressRing
+            size={52}
+            strokeWidth={2.5}
+            progress={progress}
+            color={ProgressColors.ringFillReceive}
+          />
+          <Text style={placeholderStyles.chunkText}>
+            {receivedChunks}/{totalChunks}
+          </Text>
+        </View>
+      </View>
+    );
+  }
+  
+  // Fichier ou vocal
+  const iconName = mediaType === 'voice' ? '🎤' : '📎';
+  
+  return (
+    <View style={placeholderStyles.fileContainer}>
+      <View style={placeholderStyles.fileIconRow}>
+        <Text style={placeholderStyles.fileIcon}>{iconName}</Text>
+        <View style={placeholderStyles.fileInfo}>
+          <Text style={placeholderStyles.fileLabel}>
+            {mediaType === 'voice' ? 'Vocal en cours...' : 'Fichier en cours...'}
+          </Text>
+          <Text style={placeholderStyles.chunkText}>
+            {receivedChunks}/{totalChunks} fragments
+          </Text>
+        </View>
+      </View>
+      <FileProgressBar progress={progress} direction="receive" />
+    </View>
+  );
+};
+
+const placeholderStyles = StyleSheet.create({
+  imageContainer: {
+    borderRadius: 14,
+    overflow: 'hidden',
+    backgroundColor: ProgressColors.placeholderBg,
+    borderWidth: 1,
+    borderColor: ProgressColors.placeholderBorder,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  imageBg: {
+    backgroundColor: ProgressColors.placeholderBg,
+  },
+  shimmer: {
+    position: 'absolute',
+    top: 0,
+    backgroundColor: ProgressColors.shimmer,
+    ...Platform.select({
+      ios: {
+        shadowColor: ProgressColors.shimmer,
+        shadowOffset: { width: 0, height: 0 },
+        shadowOpacity: 1,
+        shadowRadius: 40,
+      },
+      android: {
+        opacity: 0.5,
+      },
+    }),
+  },
+  ringWrapper: {
+    alignItems: 'center',
+    gap: 6,
+  },
+  chunkText: {
+    color: ProgressColors.phaseText,
+    fontSize: 10,
+    fontWeight: '500',
+    fontVariant: ['tabular-nums'],
+  },
+  fileContainer: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    gap: 8,
+    minWidth: 180,
+  },
+  fileIconRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  fileIcon: {
+    fontSize: 24,
+  },
+  fileInfo: {
+    flex: 1,
+    gap: 2,
+  },
+  fileLabel: {
+    color: '#F0F4F8',
+    fontSize: 13,
+    fontWeight: '500',
+  },
+});
+
+// ============================================
+// SENDING STATUS AVEC PROGRESSION
+// ============================================
+
+export interface SendingProgressLabelProps {
+  progress: number;
+  phase: 'preparing' | 'transferring' | 'assembling' | 'complete' | 'error';
+  totalChunks: number;
+}
+
+/**
+ * Label compact "Envoi 42%" à afficher sous les bulles de texte
+ * quand le message est en cours de chunking.
+ */
+export const SendingProgressLabel: React.FC<SendingProgressLabelProps> = ({
+  progress,
+  phase,
+  totalChunks,
+}) => {
+  if (phase === 'complete') return null;
+  
+  const label = phase === 'preparing'
+    ? 'Chiffrement...'
+    : phase === 'error'
+    ? 'Erreur d\'envoi'
+    : `Envoi sécurisé ${Math.round(progress * 100)}%`;
+  
+  return (
+    <View style={sendingStyles.container}>
+      <Text style={sendingStyles.label}>{label}</Text>
+      <FileProgressBar progress={progress} direction="send" height={2} />
+    </View>
+  );
+};
+
+const sendingStyles = StyleSheet.create({
+  container: {
+    paddingHorizontal: 12,
+    paddingTop: 3,
+    paddingBottom: 1,
+    gap: 3,
+  },
+  label: {
+    color: 'rgba(139, 164, 184, 0.6)',
+    fontSize: 10,
+    fontWeight: '500',
+    letterSpacing: 0.2,
+  },
+});

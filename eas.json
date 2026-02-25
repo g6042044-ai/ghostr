@@ -1,0 +1,61 @@
+{
+  "cli": {
+    "version": ">= 5.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleDebug"
+      },
+      "ios": {
+        "simulator": false
+      },
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://enshmhxaqwxfehtccjlu.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVuc2htaHhhcXd4ZmVodGNjamx1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyNzUzMzEsImV4cCI6MjA4Mjg1MTMzMX0.yQdIh4RLnv06xRTMryVA6m1Xu7arjgpnD3MioNVsCtQ",
+        "EXPO_PUBLIC_RELAY_URL": "https://whisper-relay.ghostcrypt.workers.dev",
+        "EXPO_PUBLIC_SFU_URL": "https://whisper-sfu.ghostcrypt.workers.dev",
+        "EXPO_PUBLIC_GATEWAY_URL":  "https://ghostr-gateway-831985391959.europe-north1.run.app"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "ios": {
+        "simulator": false
+      },
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://enshmhxaqwxfehtccjlu.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVuc2htaHhhcXd4ZmVodGNjamx1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyNzUzMzEsImV4cCI6MjA4Mjg1MTMzMX0.yQdIh4RLnv06xRTMryVA6m1Xu7arjgpnD3MioNVsCtQ",
+        "EXPO_PUBLIC_RELAY_URL": "https://whisper-relay.ghostcrypt.workers.dev",
+        "EXPO_PUBLIC_SFU_URL": "https://whisper-sfu.ghostcrypt.workers.dev",
+        "EXPO_PUBLIC_GATEWAY_URL":  "https://ghostr-gateway-831985391959.europe-north1.run.app"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "android": {
+        "buildType": "app-bundle"
+      },
+      "ios": {
+        "autoIncrement": true
+      },
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://enshmhxaqwxfehtccjlu.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVuc2htaHhhcXd4ZmVodGNjamx1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyNzUzMzEsImV4cCI6MjA4Mjg1MTMzMX0.yQdIh4RLnv06xRTMryVA6m1Xu7arjgpnD3MioNVsCtQ",
+        "EXPO_PUBLIC_RELAY_URL": "https://whisper-relay.ghostcrypt.workers.dev",
+        "EXPO_PUBLIC_SFU_URL": "https://whisper-sfu.ghostcrypt.workers.dev",
+        "EXPO_PUBLIC_GATEWAY_URL":  "https://ghostr-gateway-831985391959.europe-north1.run.app"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

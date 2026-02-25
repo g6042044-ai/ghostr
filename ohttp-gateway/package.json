@@ -1,0 +1,12 @@
+{
+  "name": "ghostr-ohttp-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "keygen": "node -e \"const nacl=require('tweetnacl');const k=nacl.box.keyPair();console.log('GATEWAY_PUBLIC_KEY='+Buffer.from(k.publicKey).toString('base64'));console.log('GATEWAY_SECRET_KEY='+Buffer.from(k.secretKey).toString('base64'));\""
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  }
+}
