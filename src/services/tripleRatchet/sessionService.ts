@@ -99,6 +99,27 @@ import {
 // Les dynamic imports causent le re-bundling Metro en dev mode (500ms+ par module).
 import { secureRpc } from '../relayTransport';
 import { createSealedSenderEnvelope, isSealedSenderReady } from '../sealedSender';
+// R-02: Compteur monotone pour prévenir la réutilisation de nonce après rollback d'état
+import { verifySendCounter, updateSendCounter, deleteSendCounter } from './monotonicCounter';
+
+// Static imports for modules previously loaded via dynamic import() on the init path.
+// Each dynamic import() triggered Metro lazy-bundling (~300-600ms each, 5-6 on init path = 2-3s wasted).
+// With static imports, these modules are bundled upfront and resolve instantly.
+import {
+  isEncryptionEnabled as localCryptoIsEnabled,
+  encrypt as localCryptoEncrypt,
+  decryptIfNeeded as localCryptoDecrypt,
+  setEncryptionKey as localCryptoSetKey,
+  generateEncryptionKey as localCryptoGenKey,
+  isEncrypted as localCryptoIsEncrypted,
+} from '../localCrypto';
+import {
+  getGlobalDisplayName,
+  getGlobalAvatar,
+  setGlobalDisplayName,
+  setGlobalAvatar,
+} from '../storage';
+import { pendingInviteStore } from '../pendingInvites';
 
 // ============================================
 // CONSTANTES DE STOCKAGE V2
@@ -135,9 +156,70 @@ const STORAGE_KEYS = {
 // Cache pour éviter de lire SecureStore à chaque opération
 let _lockConfiguredCache: boolean | null = null;
 
+// P2 FIX: Clé de chiffrement device-level — chiffre les sessions même sans PIN.
+// Stockée dans SecureStore (Keychain iOS / Keystore Android) = inaccessible
+// sans biométrie ou déverrouillage device. Si l'utilisateur active un PIN,
+// la clé PIN prend le relais automatiquement via setEncryptionKeyAndRotate().
+const DEVICE_ENCRYPTION_KEY = 'ghostr_device_encryption_key_v1';
+
+/**
+ * P2 FIX: Garantit qu'une clé de chiffrement est TOUJOURS active.
+ * 
+ * Priorité : PIN > device-level key.
+ * Si aucun PIN n'est configuré, génère une clé aléatoire 256 bits
+ * et la stocke dans SecureStore (hardware-backed sur iOS/Android).
+ * 
+ * Résultat : les sessions Triple Ratchet ne sont JAMAIS stockées en clair
+ * dans AsyncStorage, même au premier lancement.
+ */
+async function ensureDeviceLevelEncryption(): Promise<void> {
+  // Static imports used (no dynamic import latency)
+  
+  // Si le PIN est déjà actif, rien à faire
+  if (localCryptoIsEnabled()) {
+    __DEV__ && console.log('[SessionService] 🔐 PIN encryption active');
+    return;
+  }
+  
+  // Si un PIN a été configuré mais la clé n'est pas en mémoire,
+  // on ne peut pas générer de clé device — il faut le PIN
+  if (await wasLockEverConfigured()) {
+    __DEV__ && console.log('[SessionService] 🔒 PIN was configured — waiting for unlock');
+    return;
+  }
+  
+  // Pas de PIN configuré : utiliser/générer une clé device-level
+  try {
+    let deviceKeyB64 = await SecureStore.getItemAsync(DEVICE_ENCRYPTION_KEY);
+    
+    if (!deviceKeyB64) {
+      // Première utilisation : générer et stocker
+      const deviceKey = localCryptoGenKey(); // 32 bytes random
+      deviceKeyB64 = encodeBase64(deviceKey);
+      await SecureStore.setItemAsync(DEVICE_ENCRYPTION_KEY, deviceKeyB64, {
+        keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+      });
+      __DEV__ && console.log('[SessionService] 🔐 Generated new device-level encryption key');
+    } else {
+      __DEV__ && console.log('[SessionService] 🔐 Loaded existing device-level encryption key');
+    }
+    
+    // Activer le chiffrement avec cette clé
+    localCryptoSetKey(deviceKeyB64);
+    
+  } catch (error) {
+    // SecureStore indisponible (ex: émulateur sans Keystore)
+    // Fallback : générer une clé volatile (perdue au redémarrage,
+    // mais au moins les données sur disque sont chiffrées pendant la session)
+    __DEV__ && console.warn('[SessionService] ⚠️ SecureStore unavailable, using volatile encryption key:', error);
+    const volatileKey = localCryptoGenKey();
+    localCryptoSetKey(volatileKey);
+  }
+}
+
 /**
  * Vérifie si le PIN/verrou a DÉJÀ été configuré.
- * - Si oui ET que isEncryptionEnabled() est false → la clé a été perdue = DANGER
+ * - Si oui ET que localCryptoIsEnabled() est false → la clé a été perdue = DANGER
  * - Si non → l'utilisateur n'a jamais défini de PIN = acceptable de stocker en clair
  */
 async function wasLockEverConfigured(): Promise<boolean> {
@@ -210,6 +292,15 @@ export interface StoredSession {
   // v19.0: userId original (pour sessions créées via PQXDH bundle)
   // Permet de retrouver la session via findSessionByAnyId
   originalUserId?: string;
+  
+  // ACTION-06 (Phase 2 Security): Key Transparency verification status.
+  // Stored at session creation so the UI can display warnings.
+  // 'verified' = key in log + valid proof + consistent STH
+  // 'not_in_log' = key not found (new contact, may be normal)
+  // 'invalid_proof' = proof failed verification (CRITICAL: possible MITM)
+  // 'sth_inconsistent' = tree may have been rewritten (CRITICAL)
+  // 'error' = verification failed due to network/gateway issue
+  ktStatus?: 'verified' | 'not_in_log' | 'invalid_proof' | 'sth_inconsistent' | 'error';
 }
 
 /**
@@ -377,47 +468,36 @@ export class SessionService {
     if (this.initialized) return;
     
     const t0 = Date.now();
-    const ts = (label: string) => console.log(`[SessionService] ⏱️ ${label}: ${Date.now() - t0}ms`);
+    const ts = (label: string) => __DEV__ && console.log(`[SessionService] ⏱️ ${label}: ${Date.now() - t0}ms`);
     
-    // Helper: yield au thread UI pour permettre aux animations de tourner
-    const yieldToUI = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+    // P2 FIX: Garantir qu'une clé de chiffrement est active AVANT de lire/écrire
+    // quoi que ce soit. Sans ça, les sessions étaient stockées en clair.
+    await ensureDeviceLevelEncryption();
+    ts('ensureDeviceLevelEncryption');
     
-    // Charger ou générer les clés d'identité
+    // Charger ou générer les clés d'identité (required before PreKeys/PQKeys)
     await this.loadOrCreateIdentityKeys();
     ts('loadOrCreateIdentityKeys');
-    await yieldToUI();
     
-    // Charger les PreKeys
-    await this.loadPreKeys();
-    ts('loadPreKeys');
-    await yieldToUI();
+    // PARALLELIZATION: Steps 3-7 are independent — run concurrently.
+    // Before: sequential (~20s). After: parallel (~max of any single step, ~9s)
+    await Promise.all([
+      this.loadPreKeys().then(() => ts('loadPreKeys')),
+      this.loadPQKeys().then(() => ts('loadPQKeys')),
+      this.loadOldKeys().then(() => ts('loadOldKeys')),
+      this.loadProfile().then(() => ts('loadProfile')),
+      this.loadSessionsIndex().then(() => ts('loadSessionsIndex')),
+    ]);
     
-    // Charger les clés PQ
-    await this.loadPQKeys();
-    ts('loadPQKeys');
-    await yieldToUI();
-    
-    // v25.0: Charger les anciennes clés (pour messages asynchrones)
-    await this.loadOldKeys();
-    ts('loadOldKeys');
-    await yieldToUI();
-    
-    // Charger le profil
-    await this.loadProfile();
-    ts('loadProfile');
-    await yieldToUI();
-    
-    // Charger les sessions
-    await this.loadSessionsIndex();
-    ts('loadSessionsIndex');
-    await yieldToUI();
-    
-    // [Bug #1] Reconstruire les réservations OTPK depuis les invitations en attente
-    await this.rebuildOtpkReservations();
-    ts('rebuildOtpkReservations');
-    
-    console.log(`[SessionService] ⏱️ TOTAL initialize: ${Date.now() - t0}ms`);
+    __DEV__ && console.log(`[SessionService] ⏱️ TOTAL initialize: ${Date.now() - t0}ms`);
     this.initialized = true;
+    
+    // Defer OTPK reservation rebuild to background (non-critical, after sealed sender + PoW)
+    setTimeout(() => {
+      this.rebuildOtpkReservations().then(() => {
+        ts('rebuildOtpkReservations (deferred)');
+      }).catch(() => {});
+    }, 15000);
     // NOTE: KT registration is now called explicitly from App.tsx
     // AFTER sealed sender is confirmed ready. This prevents the race condition
     // where KT tried to register before the relay was available.
@@ -449,9 +529,9 @@ export class SessionService {
     const result = await registerMyKey(myKeyB64);
 
     if (result) {
-      console.log(`[SessionService] 🌳 KT: Identity key registered at index #${result.index} (tree size: ${result.treeSize})`);
+      __DEV__ && console.log(`[SessionService] 🌳 KT: Identity key registered at index #${result.index} (tree size: ${result.treeSize})`);
     } else {
-      console.warn('[SessionService] 🌳 KT: Registration failed — will retry on next session creation');
+      __DEV__ && console.warn('[SessionService] 🌳 KT: Registration failed — will retry on next session creation');
     }
   }
   
@@ -461,7 +541,7 @@ export class SessionService {
    */
   private async rebuildOtpkReservations(): Promise<void> {
     try {
-      const { pendingInviteStore } = await import('../pendingInvites');
+      // Static import used
       await pendingInviteStore.load();
       const pending = pendingInviteStore.getPending();
       this.reservedOtpkIds.clear();
@@ -474,7 +554,7 @@ export class SessionService {
         __DEV__ && console.log(`[SessionService] 🔑 Rebuilt ${this.reservedOtpkIds.size} OTPK reservation(s) from pending invites`);
       }
     } catch (e) {
-      console.warn('[SessionService] Could not rebuild OTPK reservations:', e);
+      __DEV__ && console.warn('[SessionService] Could not rebuild OTPK reservations:', e);
     }
   }
   
@@ -526,7 +606,7 @@ export class SessionService {
         await this.saveIdentityKeys();
       }
     } catch (error) {
-      console.error('[SessionService] Error loading identity keys:', error);
+      __DEV__ && console.error('[SessionService] Error loading identity keys:', error);
       this.identityKeyPair = generateIdentityKeyPair();
       await this.saveIdentityKeys();
     }
@@ -588,10 +668,10 @@ export class SessionService {
       if (otpkStored) {
         let otpkJson: string;
         if (otpkStored.startsWith('enc1:')) {
-          const { decryptIfNeeded } = await import('../localCrypto');
-          otpkJson = decryptIfNeeded(otpkStored);
+          // Static import used (localCryptoDecrypt)
+          otpkJson = localCryptoDecrypt(otpkStored);
         } else if (await wasLockEverConfigured()) {
-          console.error('[SessionService] ❌ REJECTED unencrypted OTPK data (PIN was configured) — wiping');
+          __DEV__ && console.error('[SessionService] ❌ REJECTED unencrypted OTPK data (PIN was configured) — wiping');
           await AsyncStorage.removeItem(STORAGE_KEYS.ONE_TIME_PRE_KEYS);
           otpkJson = '[]';
         } else {
@@ -624,7 +704,7 @@ export class SessionService {
         await this.replenishOneTimePreKeys();
       }
     } catch (error) {
-      console.error('[SessionService] Error loading PreKeys:', error);
+      __DEV__ && console.error('[SessionService] Error loading PreKeys:', error);
       await this.rotateSignedPreKey();
       await this.replenishOneTimePreKeys();
     }
@@ -655,7 +735,10 @@ export class SessionService {
    * Régénère les One-Time PreKeys
    */
   private async replenishOneTimePreKeys(): Promise<void> {
-    const targetCount = 100;
+    // On first launch, generate only 10 OTPKs to avoid blocking init for 18+ seconds.
+    // The remaining 90 are generated lazily via replenishOneTimePreKeysBackground().
+    const isFirstLaunch = this.oneTimePreKeys.size === 0;
+    const targetCount = isFirstLaunch ? 10 : 100;
     const currentCount = this.oneTimePreKeys.size;
     const toGenerate = targetCount - currentCount;
     
@@ -669,6 +752,37 @@ export class SessionService {
     
     await this.saveOneTimePreKeys();
     await AsyncStorage.setItem(STORAGE_KEYS.NEXT_PRE_KEY_ID, this.nextPreKeyId.toString());
+    
+    // Schedule background replenishment AFTER sealed sender is ready
+    // to avoid CPU contention with PoW computation.
+    if (isFirstLaunch) {
+      setTimeout(() => this.replenishOneTimePreKeysBackground(), 30000);
+    }
+  }
+  
+  /**
+   * Background replenishment: generates remaining OTPKs after the app is responsive.
+   * Called 5s after first launch to avoid blocking the UI.
+   */
+  private async replenishOneTimePreKeysBackground(): Promise<void> {
+    const targetCount = 100;
+    const currentCount = this.oneTimePreKeys.size;
+    const toGenerate = targetCount - currentCount;
+    
+    if (toGenerate <= 0) return;
+    
+    __DEV__ && console.log(`[SessionService] 🔑 Background OTPK replenishment: generating ${toGenerate} keys...`);
+    
+    const newKeys = await generateOneTimePreKeys(this.nextPreKeyId, toGenerate);
+    for (const key of newKeys) {
+      this.oneTimePreKeys.set(key.id, key);
+    }
+    this.nextPreKeyId += toGenerate;
+    
+    await this.saveOneTimePreKeys();
+    await AsyncStorage.setItem(STORAGE_KEYS.NEXT_PRE_KEY_ID, this.nextPreKeyId.toString());
+    
+    __DEV__ && console.log(`[SessionService] 🔑 Background OTPK replenishment complete: ${this.oneTimePreKeys.size} total`);
   }
   
   /**
@@ -683,8 +797,8 @@ export class SessionService {
     
     // ACTION 07: Chiffrer les clés privées dans AsyncStorage
     const serialized = JSON.stringify(data);
-    const { isEncryptionEnabled, encrypt: localEncrypt } = await import('../localCrypto');
-    const toStore = isEncryptionEnabled() ? localEncrypt(serialized) : serialized;
+    // Static import used
+    const toStore = localCryptoIsEnabled() ? localCryptoEncrypt(serialized) : serialized;
     await AsyncStorage.setItem(STORAGE_KEYS.ONE_TIME_PRE_KEYS, toStore);
   }
   
@@ -702,10 +816,10 @@ export class SessionService {
       if (pqStored) {
         let pqJson: string;
         if (pqStored.startsWith('enc1:')) {
-          const { decryptIfNeeded } = await import('../localCrypto');
-          pqJson = decryptIfNeeded(pqStored);
+          // Static import used (localCryptoDecrypt)
+          pqJson = localCryptoDecrypt(pqStored);
         } else if (await wasLockEverConfigured()) {
-          console.error('[SessionService] ❌ REJECTED unencrypted PQ key data (PIN was configured) — wiping');
+          __DEV__ && console.error('[SessionService] ❌ REJECTED unencrypted PQ key data (PIN was configured) — wiping');
           await AsyncStorage.removeItem(STORAGE_KEYS.PQ_SIGNED_KEY);
           await this.rotatePQSignedKey();
           return;
@@ -741,7 +855,7 @@ export class SessionService {
         this.nextPQKeyId = parseInt(nextPQIdStored, 10);
       }
     } catch (error) {
-      console.error('[SessionService] Error loading PQ keys:', error);
+      __DEV__ && console.error('[SessionService] Error loading PQ keys:', error);
       await this.rotatePQSignedKey();
     }
   }
@@ -767,9 +881,9 @@ export class SessionService {
     await AsyncStorage.setItem(STORAGE_KEYS.NEXT_PQ_KEY_ID, this.nextPQKeyId.toString());
     
     // ACTION 07: Re-chiffrer les clés PQ si le chiffrement local est disponible
-    const { isEncryptionEnabled, encrypt: localEncrypt } = await import('../localCrypto');
-    if (isEncryptionEnabled()) {
-      const encrypted = localEncrypt(JSON.stringify(data));
+    // Static import used
+    if (localCryptoIsEnabled()) {
+      const encrypted = localCryptoEncrypt(JSON.stringify(data));
       await AsyncStorage.setItem(STORAGE_KEYS.PQ_SIGNED_KEY, encrypted);
     }
   }
@@ -800,7 +914,7 @@ export class SessionService {
       await this.syncFromGlobalStorageIfNeeded();
       
     } catch (error) {
-      console.error('[SessionService] Error loading profile:', error);
+      __DEV__ && console.error('[SessionService] Error loading profile:', error);
       // En cas d'erreur, essayer de récupérer depuis le stockage global
       await this.syncFromGlobalStorageIfNeeded();
     }
@@ -814,7 +928,7 @@ export class SessionService {
    */
   private async syncFromGlobalStorageIfNeeded(): Promise<void> {
     try {
-      const { getGlobalDisplayName, getGlobalAvatar } = await import('../storage');
+      // Static import used
       
       const globalDisplayName = await getGlobalDisplayName();
       const globalAvatar = await getGlobalAvatar();
@@ -834,7 +948,7 @@ export class SessionService {
                this.myProfile.displayName !== 'Anonymous' && 
                (!globalDisplayName || globalDisplayName.trim().length === 0)) {
         __DEV__ && console.log('[SessionService] Syncing displayName TO global storage');
-        const { setGlobalDisplayName } = await import('../storage');
+        // Static import used
         await setGlobalDisplayName(this.myProfile.displayName);
       }
       
@@ -849,7 +963,7 @@ export class SessionService {
       } else if (!globalAvatar && this.myProfile.avatarBase64) {
         // Si on a un avatar local mais pas global, synchroniser vers le global
         __DEV__ && console.log('[SessionService] 🖼️ Syncing avatar TO global storage');
-        const { setGlobalAvatar } = await import('../storage');
+        // Static import used
         await setGlobalAvatar(this.myProfile.avatarBase64);
       }
       
@@ -862,7 +976,7 @@ export class SessionService {
         __DEV__ && console.log('[SessionService] ✅ Profile synced, avatar:', this.myProfile.avatarBase64 ? 'SET' : 'NOT SET');
       }
     } catch (error) {
-      console.error('[SessionService] Error syncing from global storage:', error);
+      __DEV__ && console.error('[SessionService] Error syncing from global storage:', error);
     }
   }
   
@@ -917,7 +1031,7 @@ export class SessionService {
       try {
         listener(profile);
       } catch (e) {
-        console.error('[SessionService] Profile listener error:', e);
+        __DEV__ && console.error('[SessionService] Profile listener error:', e);
       }
     }
   }
@@ -950,7 +1064,7 @@ export class SessionService {
       try {
         listener(event);
       } catch (e) {
-        console.error('[SessionService] Key change listener error:', e);
+        __DEV__ && console.error('[SessionService] Key change listener error:', e);
       }
     }
   }
@@ -982,12 +1096,12 @@ export class SessionService {
       
       // Log si changement de clé critique (clé précédente vérifiée)
       if (result.action === 'changed' && result.wasVerified) {
-        console.warn(
+        __DEV__ && console.warn(
           `[SessionService] ⚠️🔴 CRITICAL: Verified identity key changed for ${contactName} (session ${sessionId}). ` +
           `This could indicate a man-in-the-middle attack. Previous key was manually verified.`
         );
       } else if (result.action === 'changed') {
-        console.warn(
+        __DEV__ && console.warn(
           `[SessionService] ⚠️ Identity key changed for ${contactName} (session ${sessionId}). ` +
           `This may be normal (device change) or suspicious (MITM).`
         );
@@ -997,7 +1111,7 @@ export class SessionService {
     } catch (e) {
       // Key verification failure is non-fatal — log and continue.
       // Don't block session creation for a key pinning error.
-      console.error('[SessionService] Key verification error (non-fatal):', e);
+      __DEV__ && console.error('[SessionService] Key verification error (non-fatal):', e);
       return null;
     }
   }
@@ -1062,7 +1176,7 @@ export class SessionService {
    */
   async syncProfileFromGlobal(): Promise<void> {
     try {
-      const { getGlobalDisplayName, getGlobalAvatar } = await import('../storage');
+      // Static import used
       
       const globalDisplayName = await getGlobalDisplayName();
       const globalAvatar = await getGlobalAvatar();
@@ -1097,7 +1211,7 @@ export class SessionService {
         __DEV__ && console.log('[SessionService] ⚠️ No globalDisplayName, sync skipped');
       }
     } catch (error) {
-      console.error('[SessionService] Error syncing profile:', error);
+      __DEV__ && console.error('[SessionService] Error syncing profile:', error);
     }
   }
   
@@ -1135,7 +1249,7 @@ export class SessionService {
         hasAvatar: !!this.myProfile.avatarBase64,
       });
     } catch (error) {
-      console.error('[SessionService] Error updating profile directly:', error);
+      __DEV__ && console.error('[SessionService] Error updating profile directly:', error);
     }
   }
   
@@ -1198,7 +1312,7 @@ export class SessionService {
       this.reservedOtpkIds.add(dedicatedOtpk.id);
       __DEV__ && console.log(`[SessionService] 🔑 OTPK #${dedicatedOtpk.id} reserved for invite (${this.reservedOtpkIds.size} reserved, ${this.oneTimePreKeys.size} total)`);
     } else {
-      console.warn('[SessionService] ⚠️ No unreserved OTPK available — invite will proceed without (reduced forward secrecy)');
+      __DEV__ && console.warn('[SessionService] ⚠️ No unreserved OTPK available — invite will proceed without (reduced forward secrecy)');
     }
     
     // Créer le bundle PQXDH complet
@@ -1277,16 +1391,16 @@ export class SessionService {
       __DEV__ && console.log('  - error:', JSON.stringify(error));
       
       if (error) {
-        console.error('[SessionService] Failed to upload bundle:', JSON.stringify(error));
-        console.error('  - error.message:', error.message);
-        console.error('  - error.code:', error.code);
-        console.error('  - error.details:', error.details);
-        console.error('  - error.hint:', error.hint);
+        __DEV__ && console.error('[SessionService] Failed to upload bundle:', JSON.stringify(error));
+        __DEV__ && console.error('  - error.message:', error.message);
+        __DEV__ && console.error('  - error.code:', error.code);
+        __DEV__ && console.error('  - error.details:', error.details);
+        __DEV__ && console.error('  - error.hint:', error.hint);
         throw new Error('Failed to upload invitation to server: ' + (error.message || error.code || JSON.stringify(error)));
       }
       
     } catch (e: any) {
-      console.error('[SessionService] Error uploading bundle:', e);
+      __DEV__ && console.error('[SessionService] Error uploading bundle:', e);
       throw new Error('Failed to upload invitation: ' + e.message);
     }
     
@@ -1360,7 +1474,7 @@ export class SessionService {
       throw new Error('Invitation not found on server');
       
     } catch (e: any) {
-      console.error('[SessionService] Error fetching invite:', e);
+      __DEV__ && console.error('[SessionService] Error fetching invite:', e);
       throw new Error('Failed to fetch invitation: ' + e.message);
     }
   }
@@ -1405,7 +1519,7 @@ export class SessionService {
         throw new Error('Unknown invite format');
       }
     } catch (error: any) {
-      console.error('[SessionService] Failed to decode invite:', error);
+      __DEV__ && console.error('[SessionService] Failed to decode invite:', error);
       throw new Error('Invalid invite format - ' + (error.message || 'make sure you copied the complete code'));
     }
     
@@ -1437,39 +1551,49 @@ export class SessionService {
     // This is the CRITICAL MITM protection: a substituted key won't be in the log.
     const theirKeyB64 = serializePublicKey(bundle.identityKey);
     let ktResult: KTVerificationResult | null = null;
+    let ktStatus: StoredSession['ktStatus'] = 'error';
     try {
       ktResult = await verifyKeyInTransparencyLog(theirKeyB64);
 
       if (ktResult.verified) {
+        ktStatus = 'verified';
         __DEV__ && console.log(`[SessionService] 🌳 KT: Correspondent's key VERIFIED in transparency log (tree size: ${ktResult.treeSize})`);
       } else if (!ktResult.inLog) {
         // Key not in log — might be a new contact who hasn't registered yet.
         // Warn but don't block (first-time contacts need graceful handling).
-        console.warn(
+        ktStatus = 'not_in_log';
+        __DEV__ && console.warn(
           `[SessionService] 🌳⚠️ KT: Correspondent's key NOT FOUND in transparency log. ` +
           `This may be normal for new contacts, or it may indicate key substitution. ` +
           `Error: ${ktResult.error}`
         );
       } else if (!ktResult.proofValid) {
-        // Key is in log but proof is invalid — this is HIGHLY SUSPICIOUS.
-        // This means the server returned a proof that doesn't verify.
-        console.error(
-          `[SessionService] 🌳🔴 KT: INVALID MERKLE PROOF for correspondent's key! ` +
-          `Possible MITM attack — the server may have substituted keys. ` +
-          `Proceeding with caution. Verify safety numbers manually.`
+        // ACTION-06 (Phase 2 Security): BLOCK the handshake.
+        // Key is in log but proof is invalid — the server returned a forged proof.
+        // This is a STRONG indicator of MITM. Do NOT proceed.
+        ktStatus = 'invalid_proof';
+        throw new Error(
+          `KT_INVALID_PROOF: The server provided an invalid Merkle proof for the correspondent's identity key. ` +
+          `This is a strong indicator of a man-in-the-middle attack. Session creation blocked.`
         );
       } else if (!ktResult.sthConsistent) {
-        // STH inconsistency — the tree may have been rewritten.
-        console.error(
-          `[SessionService] 🌳🔴 KT: STH INCONSISTENCY detected! ` +
-          `The transparency tree may have been rewritten. ` +
-          `This is a CRITICAL security event.`
+        // ACTION-06: BLOCK on STH inconsistency.
+        // The transparency tree may have been rewritten — append-only violation.
+        ktStatus = 'sth_inconsistent';
+        throw new Error(
+          `KT_STH_INCONSISTENT: The Key Transparency tree appears to have been rewritten. ` +
+          `This is a CRITICAL security event indicating possible server compromise. Session creation blocked.`
         );
       }
     } catch (ktError: any) {
+      if (ktError.message?.startsWith('KT_INVALID_PROOF') || ktError.message?.startsWith('KT_STH_INCONSISTENT')) {
+        // Re-throw blocking errors — these MUST stop the handshake.
+        throw ktError;
+      }
       // KT verification failed (network error, gateway down, etc.)
       // Don't block session creation — log the issue.
-      console.warn(`[SessionService] 🌳⚠️ KT verification failed (non-fatal): ${ktError.message}`);
+      ktStatus = 'error';
+      __DEV__ && console.warn(`[SessionService] 🌳⚠️ KT verification failed (non-fatal): ${ktError.message}`);
     }
 
     // Also ensure my own key is registered (retry if it failed at init)
@@ -1480,7 +1604,7 @@ export class SessionService {
     const existingSession = this.sessions.get(candidateSessionId);
     if (existingSession) {
       const contactName = existingSession.theirProfile.displayName || inviteData.profile.displayName;
-      console.warn(`[SessionService] ⚠️ Session already exists with ${contactName} (${candidateSessionId})`);
+      __DEV__ && console.warn(`[SessionService] ⚠️ Session already exists with ${contactName} (${candidateSessionId})`);
       const err = new Error(`EXISTING_SESSION:${contactName}:${candidateSessionId}`) as any;
       err.existingSessionId = candidateSessionId;
       err.existingContactName = contactName;
@@ -1535,6 +1659,7 @@ export class SessionService {
       messagesReceived: 0,
       tag: inviteData.tag,
       isPostQuantum: true,
+      ktStatus,
     };
     
     // Stocker la session
@@ -1624,14 +1749,14 @@ export class SessionService {
       });
       
       if (error) {
-        console.error('[SessionService] Failed to send response:', error);
+        __DEV__ && console.error('[SessionService] Failed to send response:', error);
         return { success: false, error: error.message };
       }
       
       return { success: true };
       
     } catch (e: any) {
-      console.error('[SessionService] Error sending response:', e);
+      __DEV__ && console.error('[SessionService] Error sending response:', e);
       return { success: false, error: e.message };
     }
   }
@@ -1652,7 +1777,7 @@ export class SessionService {
       );
       
       if (!sendResult.success) {
-        console.warn('[SessionService] Failed to send auto-response:', sendResult.error);
+        __DEV__ && console.warn('[SessionService] Failed to send auto-response:', sendResult.error);
         // On continue quand même - la session est créée localement
       }
     }
@@ -1700,7 +1825,7 @@ export class SessionService {
       const decoded = new TextDecoder().decode(decodeBase64(cleanedInput));
       responseData = JSON.parse(decoded);
     } catch (error) {
-      console.error('[SessionService] Failed to decode response:', error);
+      __DEV__ && console.error('[SessionService] Failed to decode response:', error);
       throw new Error('Invalid response format');
     }
     
@@ -1717,18 +1842,35 @@ export class SessionService {
     __DEV__ && console.log('  - KEM ciphertext size: ' + pqxdhMessage.kemCiphertext.bytes.length + ' bytes');
 
     // P0: Verify the accepter's identity key is in the Key Transparency log.
+    // ACTION-06 (Phase 2 Security): Block on invalid proofs.
+    let ktStatusResponder: StoredSession['ktStatus'] = 'error';
     try {
       const accepterKeyB64 = serializePublicKey(pqxdhMessage.identityKey);
       const ktResult = await verifyKeyInTransparencyLog(accepterKeyB64);
       if (ktResult.verified) {
+        ktStatusResponder = 'verified';
         __DEV__ && console.log(`[SessionService] 🌳 KT: Accepter's key VERIFIED in transparency log`);
       } else if (!ktResult.inLog) {
-        console.warn(`[SessionService] 🌳⚠️ KT: Accepter's key NOT FOUND in transparency log`);
+        ktStatusResponder = 'not_in_log';
+        __DEV__ && console.warn(`[SessionService] 🌳⚠️ KT: Accepter's key NOT FOUND in transparency log`);
       } else if (!ktResult.proofValid) {
-        console.error(`[SessionService] 🌳🔴 KT: INVALID MERKLE PROOF for accepter's key!`);
+        ktStatusResponder = 'invalid_proof';
+        throw new Error(
+          `KT_INVALID_PROOF: The server provided an invalid Merkle proof for the accepter's identity key. ` +
+          `Possible MITM attack. Session finalization blocked.`
+        );
+      } else if (!ktResult.sthConsistent) {
+        ktStatusResponder = 'sth_inconsistent';
+        throw new Error(
+          `KT_STH_INCONSISTENT: Key Transparency tree appears rewritten. Session finalization blocked.`
+        );
       }
     } catch (ktError: any) {
-      console.warn(`[SessionService] 🌳⚠️ KT verification failed (non-fatal): ${ktError.message}`);
+      if (ktError.message?.startsWith('KT_INVALID_PROOF') || ktError.message?.startsWith('KT_STH_INCONSISTENT')) {
+        throw ktError;
+      }
+      ktStatusResponder = 'error';
+      __DEV__ && console.warn(`[SessionService] 🌳⚠️ KT verification failed (non-fatal): ${ktError.message}`);
     }
     
     // Trouver les clés correspondantes (actuelles OU archivées)
@@ -1811,6 +1953,7 @@ export class SessionService {
       messagesReceived: 0,
       tag: responseData.tag,
       isPostQuantum: true,
+      ktStatus: ktStatusResponder,
     };
     
     // Stocker la session (écrase proprement si remplacement)
@@ -1849,17 +1992,26 @@ export class SessionService {
     }
     const promise = this._doEncrypt(sessionId, plaintext);
     this.cryptoLocks.set(sessionId, promise);
+    let counterUpdate: (() => Promise<void>) | null = null;
     try {
-      return await promise;
+      const { result, pendingCounterUpdate } = await promise;
+      counterUpdate = pendingCounterUpdate;
+      return result;
     } finally {
+      // Libérer le lock AVANT updateSendCounter pour éviter que le Keystore
+      // Android bloqué (jusqu'à 3s de timeout) retarde tous les encrypts suivants.
       this.cryptoLocks.delete(sessionId);
+      // Mettre à jour le compteur monotone hors du lock (best-effort, non-bloquant)
+      if (counterUpdate) {
+        counterUpdate().catch(() => {});
+      }
     }
   }
   
   private async _doEncrypt(
     sessionId: string,
     plaintext: string
-  ): Promise<string> {
+  ): Promise<{ result: string; pendingCounterUpdate: (() => Promise<void>) | null }> {
     this.ensureInitialized();
     
     // Charger l'état du ratchet
@@ -1869,12 +2021,51 @@ export class SessionService {
     }
     
     
+    // R-02 + GH-07: Protection contre la réutilisation de nonce après rollback d'état.
+    // Les nonces Triple Ratchet sont déterministes: HMAC(messageKey, msgNum || dir).
+    // Si l'état est restauré depuis une sauvegarde, messageNumberSend peut revenir
+    // en arrière → même (clé, nonce) → XOR plaintexts révélé.
+    //
+    // GH-07: Si SecureStore est indisponible (timeout), on force AUSSI un DH ratchet
+    // plutôt que de continuer en best-effort (risque de nonce reuse).
+    //
+    // IMPORTANT: Le compteur est LIÉ à la clé d'envoi courante (sendingRatchetKey).
+    // Un DH ratchet légitime remet messageNumberSend à 0 avec une NOUVELLE paire de
+    // clés → il ne faut PAS considérer cela comme un rollback.
+    // On utilise donc la clé comme discriminant: `sessionId_keyHex16`.
+    if (state.sendingRatchetKey) {
+      const keyHex16 = bytesToHex(state.sendingRatchetKey.publicKey.bytes).slice(0, 16);
+      const counterKey = `${sessionId}_${keyHex16}`;
+      const check = await verifySendCounter(counterKey, state.messageNumberSend);
+      if (check.mustForceDHRatchet) {
+        __DEV__ && console.warn(
+          `[R-02/GH-07] Session ${sessionId.slice(0, 8)}: ` +
+          (check.verified
+            ? `messageNumberSend (${state.messageNumberSend}) < storedCounter (${check.storedCounter}) — rollback detected`
+            : `SecureStore unavailable — cannot verify counter`) +
+          ` → forcing DH ratchet for nonce safety.`
+        );
+        state = { ...state, sendingChainKey: null };
+      }
+    }
+
     // Chiffrer avec Triple Ratchet (padding automatique)
     const plaintextBytes = new TextEncoder().encode(plaintext);
     const { message, newState } = await tripleRatchetEncrypt(state, plaintextBytes);
     
     // Mettre à jour l'état
     this.ratchetStates.set(sessionId, newState);
+    
+    // R-02: Préparer la mise à jour du compteur monotone.
+    // Retourné sous forme de closure pour être exécuté HORS du cryptoLock
+    // (le Keystore Android peut bloquer jusqu'à 3s → libérer le lock avant).
+    let pendingCounterUpdate: (() => Promise<void>) | null = null;
+    if (newState.sendingRatchetKey) {
+      const keyHex16 = bytesToHex(newState.sendingRatchetKey.publicKey.bytes).slice(0, 16);
+      const counterKey = `${sessionId}_${keyHex16}`;
+      const msgNum = newState.messageNumberSend;
+      pendingCounterUpdate = () => updateSendCounter(counterKey, msgNum);
+    }
     
     // Sauvegarder
     const session = this.sessions.get(sessionId);
@@ -1896,7 +2087,7 @@ export class SessionService {
       timestamp: Date.now(),
     };
     
-    return JSON.stringify(encryptedMessage);
+    return { result: JSON.stringify(encryptedMessage), pendingCounterUpdate };
   }
   
   /**
@@ -1971,7 +2162,7 @@ export class SessionService {
       
       return new TextDecoder().decode(result.plaintext);
     } catch (error) {
-      console.error('[SessionService] ❌ Decryption failed:', error);
+      __DEV__ && console.error('[SessionService] ❌ Decryption failed:', error);
       
       // RESTAURER l'état du ratchet à partir du snapshot
       // Empêche la corruption par les mutations du shallow copy
@@ -1980,7 +2171,7 @@ export class SessionService {
         this.ratchetStates.set(sessionId, restoredState);
         __DEV__ && console.log('[SessionService] 🔄 Ratchet state restored after failed decryption');
       } catch (restoreError) {
-        console.error('[SessionService] ❌ Failed to restore ratchet state:', restoreError);
+        __DEV__ && console.error('[SessionService] ❌ Failed to restore ratchet state:', restoreError);
       }
       
       return null;
@@ -2038,11 +2229,11 @@ export class SessionService {
       if (stored) {
         let idsJson: string;
         if (stored.startsWith('enc1:')) {
-          const { decryptIfNeeded } = await import('../localCrypto');
-          idsJson = decryptIfNeeded(stored);
+          // Static import used (localCryptoDecrypt)
+          idsJson = localCryptoDecrypt(stored);
         } else if (await wasLockEverConfigured()) {
           // PIN was set → plaintext data should not exist → corrupt/tampered
-          console.error('[SessionService] ❌ REJECTED unencrypted session index (PIN was configured)');
+          __DEV__ && console.error('[SessionService] ❌ REJECTED unencrypted session index (PIN was configured)');
           await AsyncStorage.removeItem(STORAGE_KEYS.SESSIONS);
           return;
         } else {
@@ -2051,12 +2242,15 @@ export class SessionService {
         }
         
         const ids: string[] = JSON.parse(idsJson);
-        for (const id of ids) {
-          await this.loadSession(id);
-        }
+        // PERF A7: Charger les sessions en parallèle au lieu de séquentiellement.
+        // Chaque loadSession est indépendant (clé AsyncStorage différente, entrée Map
+        // différente). Les JSON.parse et déchiffrements XSalsa20 s'exécutent en
+        // parallèle sur le thread JS entre les yields AsyncStorage.
+        // Avec 10 sessions : ~500ms séquentiel → ~100ms parallèle.
+        await Promise.all(ids.map(id => this.loadSession(id)));
       }
     } catch (error) {
-      console.error('[SessionService] Error loading sessions index:', error);
+      __DEV__ && console.error('[SessionService] Error loading sessions index:', error);
     }
   }
   
@@ -2072,11 +2266,11 @@ export class SessionService {
         let sessionJson: string;
         
         if (stored.startsWith('enc1:')) {
-          const { decryptIfNeeded } = await import('../localCrypto');
-          sessionJson = decryptIfNeeded(stored);
+          // Static import used (localCryptoDecrypt)
+          sessionJson = localCryptoDecrypt(stored);
         } else if (await wasLockEverConfigured()) {
           // PIN was set → plaintext session = corrupt/tampered
-          console.error(`[SessionService] ❌ REJECTED unencrypted session ${sessionId} (PIN was configured)`);
+          __DEV__ && console.error(`[SessionService] ❌ REJECTED unencrypted session ${sessionId} (PIN was configured)`);
           await AsyncStorage.removeItem(STORAGE_KEYS.SESSION_PREFIX + sessionId);
           return;
         } else {
@@ -2088,7 +2282,7 @@ export class SessionService {
         this.sessions.set(sessionId, session);
       }
     } catch (error) {
-      console.error(`[SessionService] Error loading session ${sessionId}:`, error);
+      __DEV__ && console.error(`[SessionService] Error loading session ${sessionId}:`, error);
     }
   }
   
@@ -2103,19 +2297,30 @@ export class SessionService {
     const serialized = JSON.stringify(session);
     
     // ACTION 07: Importer et vérifier le chiffrement local
-    const { isEncryptionEnabled, encrypt: localEncrypt } = await import('../localCrypto');
+    // Static import used
     
     let dataToStore: string;
-    if (isEncryptionEnabled()) {
+    if (localCryptoIsEnabled()) {
       // Chiffrer avec XSalsa20-Poly1305 via localCrypto
-      dataToStore = localEncrypt(serialized);
+      dataToStore = localCryptoEncrypt(serialized);
     } else if (await wasLockEverConfigured()) {
       // PIN était configuré mais la clé n'est plus en mémoire → danger
       throw new Error('ENCRYPTION_KEY_LOST: PIN was configured but encryption key is unavailable. Unlock the app first.');
     } else {
-      // PIN jamais défini → stocker en clair (sera re-chiffré quand le PIN sera activé)
-      __DEV__ && console.warn('[SessionService] ⚠️ Saving session without encryption (no PIN configured yet)');
-      dataToStore = serialized;
+      // P2 FIX: Ce cas ne devrait PLUS arriver grâce à ensureDeviceLevelEncryption()
+      // appelé dans initialize(). Si on arrive ici, c'est un bug — on refuse de
+      // stocker en clair plutôt que d'exposer les clés Triple Ratchet.
+      __DEV__ && console.error('[SessionService] 🚨 CRITICAL: No encryption key available — this should not happen');
+      __DEV__ && console.error('[SessionService] Calling ensureDeviceLevelEncryption as emergency fallback');
+      await ensureDeviceLevelEncryption();
+      
+      // Re-vérifier après le bootstrap d'urgence
+      // Static import used
+      if (localCryptoIsEnabled()) {
+        dataToStore = localCryptoEncrypt(serialized);
+      } else {
+        throw new Error('ENCRYPTION_UNAVAILABLE: Cannot save session without encryption. Device keystore may be unavailable.');
+      }
     }
     
     // AsyncStorage au lieu de SecureStore : l'état Triple Ratchet + SPQR
@@ -2128,7 +2333,7 @@ export class SessionService {
     const ids = Array.from(this.sessions.keys());
     // BUG FIX: Chiffrer l'index des sessions (sinon le nombre de conversations est visible sur disque)
     const idsJson = JSON.stringify(ids);
-    const idsToStore = isEncryptionEnabled() ? localEncrypt(idsJson) : idsJson;
+    const idsToStore = localCryptoIsEnabled() ? localCryptoEncrypt(idsJson) : idsJson;
     await AsyncStorage.setItem(STORAGE_KEYS.SESSIONS, idsToStore);
   }
   
@@ -2175,11 +2380,14 @@ export class SessionService {
     
     await AsyncStorage.removeItem(STORAGE_KEYS.SESSION_PREFIX + sessionId);
     
+    // R-02: Supprimer le compteur monotone de cette session
+    await deleteSendCounter(sessionId);
+    
     const ids = Array.from(this.sessions.keys());
     // BUG FIX: Chiffrer l'index des sessions
-    const { isEncryptionEnabled, encrypt: localEncrypt } = await import('../localCrypto');
+    // Static import used
     const idsJson = JSON.stringify(ids);
-    const idsToStore = isEncryptionEnabled() ? localEncrypt(idsJson) : idsJson;
+    const idsToStore = localCryptoIsEnabled() ? localCryptoEncrypt(idsJson) : idsJson;
     await AsyncStorage.setItem(STORAGE_KEYS.SESSIONS, idsToStore);
     
     __DEV__ && console.log(`[SessionService] 🗑 Session ${sessionId} deleted (invite preserved for potential re-connection)`);
@@ -2191,7 +2399,7 @@ export class SessionService {
   async updateContactProfile(sessionId: string, profile: Partial<UserProfile>): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) {
-      console.warn('[SessionService] Session not found for profile update:', sessionId);
+      __DEV__ && console.warn('[SessionService] Session not found for profile update:', sessionId);
       return;
     }
     
@@ -2277,6 +2485,14 @@ export class SessionService {
       try { await AsyncStorage.removeItem(STORAGE_KEYS.OLD_SIGNED_PRE_KEYS); } catch {}
       try { await AsyncStorage.removeItem(STORAGE_KEYS.OLD_PQ_SIGNED_KEYS); } catch {}
       
+      // BUG FIX #10: Nettoyer le cache Key Transparency (STH + registration).
+      // Quand les identity keys sont régénérées, le STH cache est périmé.
+      // Sans ce nettoyage, la re-registration produit un nouveau rootHash
+      // avec le même treeSize → checkSTHConsistency détecte un faux positif
+      // de "LEAF MODIFICATION" et bloque toutes les finalisations de session.
+      try { await AsyncStorage.removeItem('ghostr_kt_sth_latest'); } catch {}
+      try { await AsyncStorage.removeItem('ghostr_kt_my_registration'); } catch {}
+      
       // Vider les caches en mémoire (sauf le profil)
       this.sessions.clear();
       this.ratchetStates.clear();
@@ -2291,7 +2507,7 @@ export class SessionService {
       // NOTE: On ne réinitialise PAS this.myProfile pour conserver le profil
       
     } catch (error) {
-      console.error('[SessionService] Error clearing data:', error);
+      __DEV__ && console.error('[SessionService] Error clearing data:', error);
     }
   }
   
@@ -2477,7 +2693,7 @@ export class SessionService {
       
       __DEV__ && console.log(`[SessionService] Persisted ${this.oldSignedPreKeys.size} old SignedPreKeys, ${this.oldPQSignedKeys.size} old PQSignedKeys`);
     } catch (error) {
-      console.error('[SessionService] Failed to persist old keys:', error);
+      __DEV__ && console.error('[SessionService] Failed to persist old keys:', error);
     }
   }
 
@@ -2526,7 +2742,7 @@ export class SessionService {
       
       __DEV__ && console.log(`[SessionService] Loaded ${this.oldSignedPreKeys.size} old SignedPreKeys, ${this.oldPQSignedKeys.size} old PQSignedKeys`);
     } catch (error) {
-      console.error('[SessionService] Failed to load old keys:', error);
+      __DEV__ && console.error('[SessionService] Failed to load old keys:', error);
     }
   }
 
@@ -2560,8 +2776,8 @@ export class SessionService {
    * À appeler après setupLock() quand le PIN est configuré pour la première fois.
    */
   async reEncryptAllPlaintextData(): Promise<void> {
-    const { isEncryptionEnabled, encrypt: localEncrypt, isEncrypted } = await import('../localCrypto');
-    if (!isEncryptionEnabled()) {
+    // Static import used
+    if (!localCryptoIsEnabled()) {
       __DEV__ && console.warn('[SessionService] reEncrypt called but encryption not enabled');
       return;
     }
@@ -2571,8 +2787,8 @@ export class SessionService {
     
     // 1. Session index
     const indexStored = await AsyncStorage.getItem(STORAGE_KEYS.SESSIONS);
-    if (indexStored && !isEncrypted(indexStored)) {
-      await AsyncStorage.setItem(STORAGE_KEYS.SESSIONS, localEncrypt(indexStored));
+    if (indexStored && !localCryptoIsEncrypted(indexStored)) {
+      await AsyncStorage.setItem(STORAGE_KEYS.SESSIONS, localCryptoEncrypt(indexStored));
       count++;
     }
     
@@ -2580,23 +2796,23 @@ export class SessionService {
     for (const [sessionId, session] of this.sessions) {
       const key = STORAGE_KEYS.SESSION_PREFIX + sessionId;
       const stored = await AsyncStorage.getItem(key);
-      if (stored && !isEncrypted(stored)) {
-        await AsyncStorage.setItem(key, localEncrypt(stored));
+      if (stored && !localCryptoIsEncrypted(stored)) {
+        await AsyncStorage.setItem(key, localCryptoEncrypt(stored));
         count++;
       }
     }
     
     // 3. OTPK
     const otpk = await AsyncStorage.getItem(STORAGE_KEYS.ONE_TIME_PRE_KEYS);
-    if (otpk && !isEncrypted(otpk)) {
-      await AsyncStorage.setItem(STORAGE_KEYS.ONE_TIME_PRE_KEYS, localEncrypt(otpk));
+    if (otpk && !localCryptoIsEncrypted(otpk)) {
+      await AsyncStorage.setItem(STORAGE_KEYS.ONE_TIME_PRE_KEYS, localCryptoEncrypt(otpk));
       count++;
     }
     
     // 4. PQ keys
     const pq = await AsyncStorage.getItem(STORAGE_KEYS.PQ_SIGNED_KEY);
-    if (pq && !isEncrypted(pq)) {
-      await AsyncStorage.setItem(STORAGE_KEYS.PQ_SIGNED_KEY, localEncrypt(pq));
+    if (pq && !localCryptoIsEncrypted(pq)) {
+      await AsyncStorage.setItem(STORAGE_KEYS.PQ_SIGNED_KEY, localCryptoEncrypt(pq));
       count++;
     }
     

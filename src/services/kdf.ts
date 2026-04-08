@@ -450,9 +450,9 @@ export async function deriveKeyWithParams(
       );
     } else {
       // Argon2 requis mais non disponible
-      console.error('🔴 ERREUR: Les données ont été chiffrées avec Argon2id');
-      console.error('🔴 Argon2 natif non disponible dans cet environnement');
-      console.error('🔴 Utilisez un EAS Build pour déchiffrer');
+      __DEV__ && console.error('🔴 ERREUR: Les données ont été chiffrées avec Argon2id');
+      __DEV__ && console.error('🔴 Argon2 natif non disponible dans cet environnement');
+      __DEV__ && console.error('🔴 Utilisez un EAS Build pour déchiffrer');
       throw new Error(
         'Ces données nécessitent Argon2id qui n\'est pas disponible. ' +
         'Utilisez un build de production (EAS Build) pour y accéder.'
@@ -592,7 +592,7 @@ export async function deriveKeyLegacyV2(
   password: string,
   salt: Uint8Array
 ): Promise<Uint8Array> {
-  console.warn('⚠️ deriveKeyLegacyV2 est déprécié');
+  __DEV__ && console.warn('⚠️ deriveKeyLegacyV2 est déprécié');
   return deriveWithPBKDF2(password, salt, 20000);
 }
 
@@ -605,7 +605,7 @@ export async function deriveKeyLegacy(
   salt: Uint8Array,
   iterations: number = 10000
 ): Promise<Uint8Array> {
-  console.warn('⚠️ deriveKeyLegacy est déprécié');
+  __DEV__ && console.warn('⚠️ deriveKeyLegacy est déprécié');
   return deriveWithPBKDF2(password, salt, iterations);
 }
 

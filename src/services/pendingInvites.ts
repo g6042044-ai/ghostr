@@ -60,7 +60,7 @@ class PendingInviteStore {
         // Si les données sont chiffrées mais la clé n'est pas encore disponible
         // (startup avant unlock), on reporte le chargement
         if (raw.startsWith('enc1:') && !isEncryptionEnabled()) {
-          console.warn('[PendingInvites] Data encrypted, key not yet available — deferring load');
+          __DEV__ && console.warn('[PendingInvites] Data encrypted, key not yet available — deferring load');
           return; // this.loaded reste false → retry après unlock
         }
         const json = decryptIfNeeded(raw);
@@ -80,7 +80,7 @@ class PendingInviteStore {
       this.loaded = true;
       this.cleanupExpired();
     } catch (e) {
-      console.error('[PendingInvites] Load error:', e);
+      __DEV__ && console.error('[PendingInvites] Load error:', e);
       this.loaded = true;
     }
   }
@@ -91,7 +91,7 @@ class PendingInviteStore {
       await AsyncStorage.setItem(STORAGE_KEY, encryptIfEnabled(JSON.stringify(items)));
       await AsyncStorage.setItem(COUNTER_KEY, encryptIfEnabled(this.counter.toString()));
     } catch (e) {
-      console.error('[PendingInvites] Persist error:', e);
+      __DEV__ && console.error('[PendingInvites] Persist error:', e);
     }
   }
 
@@ -144,6 +144,28 @@ class PendingInviteStore {
       await this.persist();
       this.notify();
       __DEV__ && console.log(`[PendingInvites] Expired: ${inv.label}`);
+    }
+  }
+
+  /**
+   * Expire toutes les invitations associées à un sessionId.
+   * 
+   * CRITIQUE: Appelé quand une session est supprimée intentionnellement.
+   * Sans cela, l'InviteWatcher détecte l'invite comme "orpheline"
+   * et re-finalise l'ancien accept PQXDH → session zombie avec ratchet périmé.
+   */
+  async markExpiredBySessionId(sessionId: string): Promise<void> {
+    let changed = false;
+    for (const inv of this.invites.values()) {
+      if (inv.sessionId === sessionId && inv.status === 'accepted') {
+        inv.status = 'expired';
+        changed = true;
+        __DEV__ && console.log(`[PendingInvites] Expired by sessionId: ${inv.label} (tag: ${inv.tag.substring(0, 12)}...)`);
+      }
+    }
+    if (changed) {
+      await this.persist();
+      this.notify();
     }
   }
 
@@ -203,7 +225,7 @@ class PendingInviteStore {
       }
     }
     if (changed) {
-      this.persist().catch(console.error);
+      this.persist().catch(e => __DEV__ && console.error(e));
     }
   }
 
@@ -218,7 +240,7 @@ class PendingInviteStore {
 
   private notify(): void {
     for (const l of this.listeners) {
-      try { l(); } catch (e) { console.error('[PendingInvites] Listener error:', e); }
+      try { l(); } catch (e) { __DEV__ && console.error('[PendingInvites] Listener error:', e); }
     }
   }
 }

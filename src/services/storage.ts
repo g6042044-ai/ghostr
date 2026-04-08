@@ -33,7 +33,13 @@ import {
   setEncryptionKeyAndRotate,
   clearEncryptionKey as clearLocalEncryptionKey,
   isEncryptionEnabled,
+  initHardwareEncryption,
+  transitionPinToHardware,
+  opaqueStorageKey,
+  setOpaqueKeySeed,
+  clearOpaqueKeySeed,
 } from './localCrypto';
+import { getOrCreateHardwareConvKey, deleteHardwareKeys } from './hardwareKeyProvider';
 // Legacy ratchet cleanup (inline, ratchetStorage.ts supprimé)
 const LEGACY_RATCHET_PREFIX = 'whisper_ratchet_v1_';
 
@@ -67,7 +73,7 @@ export function notifyCallMessageAdded(conversationId: string, message: LocalMes
     try {
       listener(conversationId, message);
     } catch (error) {
-      console.error('Error in call message listener:', error);
+      __DEV__ && console.error('Error in call message listener:', error);
     }
   });
 }
@@ -150,10 +156,44 @@ const LAST_SEEN_PREFIX = 'whisper_lastseen_';
 const PARTICIPANTS_PREFIX = 'whisper_participants_';
 
 // ============================================
+// ACTION 5: OPAQUE KEY HELPERS
+// ============================================
+
+/**
+ * Génère la clé AsyncStorage opaque pour les données d'une conversation.
+ * Quand le seed opaque est initialisé, les noms de clés sont hashés
+ * pour cacher les métadonnées (nombre de conversations, IDs, etc.).
+ */
+function msgKey(conversationId: string): string {
+  return opaqueStorageKey(MESSAGES_PREFIX + conversationId);
+}
+
+function deletedKey(conversationId: string): string {
+  return opaqueStorageKey(DELETED_IDS_PREFIX + conversationId);
+}
+
+function lastSeenKey(conversationId: string): string {
+  return opaqueStorageKey(LAST_SEEN_PREFIX + conversationId);
+}
+
+function participantsKey(conversationId: string): string {
+  return opaqueStorageKey(PARTICIPANTS_PREFIX + conversationId);
+}
+
+// ============================================
 // GESTION CLÉS DE CHIFFREMENT
 // ============================================
 
 let conversationsEncryptionKey: Uint8Array | null = null;
+
+// ACTION-04: Hardware-backed key for conversations (separate from PIN key).
+// Same pattern as localCrypto: invisible to the rest of the code.
+let conversationsHardwareKey: Uint8Array | null = null;
+
+/** Returns the active conversations key: PIN key takes priority over hardware key. */
+function getActiveConvKey(): Uint8Array | null {
+  return conversationsEncryptionKey || conversationsHardwareKey;
+}
 
 export function setEncryptionKey(
   localKey: Uint8Array | string | null,
@@ -190,12 +230,40 @@ export async function setEncryptionKeys(
   convKey: Uint8Array | null
 ): Promise<void> {
   if (localKey) {
+    // ACTION 5: Initialize opaque key seed from localKey
+    // We use SHA-256(localKey || "opaque-seed") to get a stable seed
+    const { sha256 } = await import('@noble/hashes/sha256');
+    const seedInput = new Uint8Array(localKey.length + 11);
+    seedInput.set(localKey, 0);
+    seedInput.set(new TextEncoder().encode('opaque-seed'), localKey.length);
+    setOpaqueKeySeed(sha256(seedInput));
+    
     // Rotation de la clé locale (HKDF + re-chiffrement des sessions)
     await setEncryptionKeyAndRotate(localKey);
   } else {
     setLocalEncryptionKey(null);
+    clearOpaqueKeySeed();
   }
-  conversationsEncryptionKey = convKey;
+  
+  // ACTION-04 FIX: Re-encrypt conversations when transitioning keys.
+  // If conversations are encrypted with the old key (e.g. hardware key),
+  // we must read them with the old key before switching to the new one.
+  if (convKey && getActiveConvKey()) {
+    try {
+      // Read with old key (getActiveConvKey() returns hardware or PIN key)
+      const conversations = await getConversations();
+      // Switch to new PIN key
+      conversationsEncryptionKey = convKey;
+      // Re-write with new key (getActiveConvKey() now returns PIN key)
+      await saveConversations(conversations);
+      __DEV__ && console.log('[storage] 🔄 Conversations re-encrypted with new key');
+    } catch (e) {
+      __DEV__ && console.error('[storage] ⚠️ Failed to re-encrypt conversations:', e);
+      conversationsEncryptionKey = convKey;
+    }
+  } else {
+    conversationsEncryptionKey = convKey;
+  }
 }
 
 export function getEncryptionKey(): Uint8Array | null {
@@ -214,18 +282,99 @@ export function clearEncryptionKey(): void {
 
 export { isEncryptionEnabled };
 
+/**
+ * ACTION-04 (Phase 2 Security): Initialize hardware-backed encryption for ALL local data.
+ * Sets both the AsyncStorage encryption key (localCrypto) and the conversations encryption key.
+ * Called at app startup when no PIN is configured.
+ */
+export async function initHardwareEncryptionAll(): Promise<boolean> {
+  try {
+    const localOk = await initHardwareEncryption();
+    if (!localOk) return false;
+    
+    const hwConvKey = await getOrCreateHardwareConvKey();
+    // Set HARDWARE conv key, NOT conversationsEncryptionKey.
+    // conversationsEncryptionKey stays null → PIN-specific code unaffected.
+    conversationsHardwareKey = new Uint8Array(hwConvKey);
+    
+    // ACTION 5: Initialize opaque key seed from hardware key
+    const { sha256 } = await import('@noble/hashes/sha256');
+    const seedInput = new Uint8Array(hwConvKey.length + 11);
+    seedInput.set(hwConvKey, 0);
+    seedInput.set(new TextEncoder().encode('opaque-seed'), hwConvKey.length);
+    setOpaqueKeySeed(sha256(seedInput));
+    
+    __DEV__ && console.log('[storage] 🔒 Hardware encryption initialized for all local data');
+    return true;
+  } catch (error) {
+    __DEV__ && console.error('[storage] ❌ Hardware encryption init failed:', error);
+    return false;
+  }
+}
+
+/**
+ * Transition ALL encrypted data from PIN-based keys to hardware-backed keys.
+ * Called when the user disables the lock/PIN protection.
+ *
+ * Without this step, disabling the PIN leaves data encrypted with PIN-derived
+ * keys that no longer exist on next app start → everything becomes unreadable.
+ *
+ * Handles both layers:
+ *   1. AsyncStorage (messages, sessions, ratchet states) via localCrypto
+ *   2. Conversations list via storage's own encryption
+ */
+export async function transitionToHardwareEncryption(): Promise<boolean> {
+  try {
+    // 1. Transition AsyncStorage entries (localCrypto layer)
+    const localOk = await transitionPinToHardware();
+    if (!localOk) {
+      __DEV__ && console.error('[storage] transitionToHardwareEncryption: localCrypto transition failed');
+      return false;
+    }
+
+    // 2. Transition conversations (storage layer)
+    // Read with current active key (still PIN key at this point for conversations)
+    const conversations = await getConversations();
+
+    // Switch to hardware conversation key
+    const hwConvKey = await getOrCreateHardwareConvKey();
+    if (conversationsEncryptionKey) {
+      conversationsEncryptionKey.fill(0);
+    }
+    conversationsEncryptionKey = null;
+    conversationsHardwareKey = new Uint8Array(hwConvKey);
+
+    // Re-write conversations encrypted with hardware key
+    await saveConversations(conversations);
+
+    // 3. Update opaque key seed from hardware key
+    const { sha256 } = await import('@noble/hashes/sha256');
+    const seedInput = new Uint8Array(hwConvKey.length + 11);
+    seedInput.set(hwConvKey, 0);
+    seedInput.set(new TextEncoder().encode('opaque-seed'), hwConvKey.length);
+    setOpaqueKeySeed(sha256(seedInput));
+
+    __DEV__ && console.log('[storage] ✅ Full transition PIN → hardware encryption complete');
+    return true;
+  } catch (error) {
+    __DEV__ && console.error('[storage] ❌ transitionToHardwareEncryption failed:', error);
+    return false;
+  }
+}
+
 // ============================================
 // CHIFFREMENT CONVERSATIONS
 // ============================================
 
 function encryptConversations(data: string): string {
-  if (!conversationsEncryptionKey) {
+  const key = getActiveConvKey();
+  if (!key) {
     return data;
   }
   
   const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
   const dataBytes = new TextEncoder().encode(data);
-  const encrypted = nacl.secretbox(dataBytes, nonce, conversationsEncryptionKey);
+  const encrypted = nacl.secretbox(dataBytes, nonce, key);
   
   if (!encrypted) {
     throw new Error('Conversations encryption failed');
@@ -243,7 +392,8 @@ function decryptConversations(data: string): string {
     return data;
   }
   
-  if (!conversationsEncryptionKey) {
+  const key = getActiveConvKey();
+  if (!key) {
     throw new Error('Conversations are encrypted but no key is available');
   }
   
@@ -251,7 +401,7 @@ function decryptConversations(data: string): string {
   const nonce = combined.slice(0, nacl.secretbox.nonceLength);
   const ciphertext = combined.slice(nacl.secretbox.nonceLength);
   
-  const decrypted = nacl.secretbox.open(ciphertext, nonce, conversationsEncryptionKey);
+  const decrypted = nacl.secretbox.open(ciphertext, nonce, key);
   
   if (!decrypted) {
     throw new Error('Conversations decryption failed');
@@ -328,7 +478,7 @@ export async function getConversationSenderToken(conversationId: string): Promis
   const masterKey = await getMasterKey(conversationId);
   if (!masterKey) {
     // Fallback sur le token global si pas de masterKey (ne devrait pas arriver)
-    console.warn('⚠️ getConversationSenderToken: No masterKey, falling back to global token');
+    __DEV__ && console.warn('⚠️ getConversationSenderToken: No masterKey, falling back to global token');
     return getSenderToken();
   }
   
@@ -447,13 +597,13 @@ export async function hasGlobalDisplayName(): Promise<boolean> {
           return true;
         }
       } catch (parseError) {
-        console.warn('👤 hasGlobalDisplayName: Failed to parse session profile');
+        __DEV__ && console.warn('👤 hasGlobalDisplayName: Failed to parse session profile');
       }
     }
     
     return false;
   } catch (error) {
-    console.error('❌ hasGlobalDisplayName error:', error);
+    __DEV__ && console.error('❌ hasGlobalDisplayName error:', error);
     return false;
   }
 }
@@ -467,7 +617,7 @@ export async function getGlobalDisplayName(): Promise<string | null> {
     __DEV__ && console.log(`👤 getGlobalDisplayName: "${name?.slice(0, 20) || 'null'}"`);
     return name || null;
   } catch (error) {
-    console.error('❌ getGlobalDisplayName error:', error);
+    __DEV__ && console.error('❌ getGlobalDisplayName error:', error);
     return null;
   }
 }
@@ -485,7 +635,7 @@ export async function setGlobalDisplayName(name: string): Promise<void> {
     await AsyncStorage.setItem(GLOBAL_DISPLAY_NAME_KEY, trimmedName);
     __DEV__ && console.log('👤 Global display name saved:', trimmedName);
   } catch (error) {
-    console.error('❌ setGlobalDisplayName error:', error);
+    __DEV__ && console.error('❌ setGlobalDisplayName error:', error);
     throw error;
   }
 }
@@ -503,7 +653,7 @@ export async function getGlobalAvatar(): Promise<string | null> {
     const avatar = await AsyncStorage.getItem(GLOBAL_AVATAR_KEY);
     return avatar || null;
   } catch (error) {
-    console.error('Failed to get avatar:', error);
+    __DEV__ && console.error('Failed to get avatar:', error);
     return null;
   }
 }
@@ -522,7 +672,7 @@ export async function setGlobalAvatar(avatarBase64: string | null): Promise<void
       __DEV__ && console.log('🖼️ Global avatar removed');
     }
   } catch (error) {
-    console.error('Failed to set avatar:', error);
+    __DEV__ && console.error('Failed to set avatar:', error);
     throw error;
   }
 }
@@ -561,7 +711,7 @@ export async function getConversations(): Promise<StoredConversation[]> {
         const decrypted = decryptConversations(encryptedData);
         return JSON.parse(decrypted);
       } catch (e) {
-        console.warn('Failed to decrypt conversations, trying legacy key');
+        __DEV__ && console.warn('Failed to decrypt conversations, trying legacy key');
       }
     }
     
@@ -574,7 +724,7 @@ export async function getConversations(): Promise<StoredConversation[]> {
     
     return [];
   } catch (error) {
-    console.error('Failed to get conversations:', error);
+    __DEV__ && console.error('Failed to get conversations:', error);
     return [];
   }
 }
@@ -697,7 +847,7 @@ export async function getMyIdentity(conversationId: string): Promise<MyIdentity 
       // Sauvegarder pour la prochaine fois
       await updateIdentityCommitment(conversationId, commitment);
     } catch (e) {
-      console.warn('Failed to generate identity commitment:', e);
+      __DEV__ && console.warn('Failed to generate identity commitment:', e);
     }
   }
   
@@ -753,12 +903,12 @@ export async function deleteConversation(id: string): Promise<void> {
   const filtered = conversations.filter(c => c.id !== id);
   await saveConversations(filtered);
   
-  await AsyncStorage.removeItem(MESSAGES_PREFIX + id);
-  await AsyncStorage.removeItem(DELETED_IDS_PREFIX + id);
-  await AsyncStorage.removeItem(LAST_SEEN_PREFIX + id);
-  await AsyncStorage.removeItem(PARTICIPANTS_PREFIX + id);
+  await AsyncStorage.removeItem(msgKey(id));
+  await AsyncStorage.removeItem(deletedKey(id));
+  await AsyncStorage.removeItem(lastSeenKey(id));
+  await AsyncStorage.removeItem(participantsKey(id));
   
-  invalidateCache(MESSAGES_PREFIX + id);
+  invalidateCache(msgKey(id));
   
   conversationTokenCache.delete(id);
   
@@ -799,7 +949,7 @@ export async function getParticipants(
   conversationId: string
 ): Promise<Map<string, ConversationParticipant>> {
   try {
-    const key = PARTICIPANTS_PREFIX + conversationId;
+    const key = participantsKey(conversationId);
     const rawData = await AsyncStorage.getItem(key);
     
     if (!rawData) {
@@ -816,7 +966,7 @@ export async function getParticipants(
     
     return map;
   } catch (error) {
-    console.error('Failed to get participants:', error);
+    __DEV__ && console.error('Failed to get participants:', error);
     return new Map();
   }
 }
@@ -876,7 +1026,7 @@ export async function saveParticipant(
   }
   
   // Sauvegarder
-  const key = PARTICIPANTS_PREFIX + conversationId;
+  const key = participantsKey(conversationId);
   const data = JSON.stringify(Array.from(participants.values()));
   const encrypted = encryptIfEnabled(data);
   await AsyncStorage.setItem(key, encrypted);
@@ -934,7 +1084,7 @@ export async function getParticipantDisplayName(
 // ============================================
 
 export async function getLocalMessages(conversationId: string): Promise<LocalMessage[]> {
-  const cacheKey = MESSAGES_PREFIX + conversationId;
+  const cacheKey = msgKey(conversationId);
   
   try {
     const rawData = await AsyncStorage.getItem(cacheKey);
@@ -948,13 +1098,13 @@ export async function getLocalMessages(conversationId: string): Promise<LocalMes
     
     return messages || [];
   } catch (error) {
-    console.error('Failed to get local messages:', error);
+    __DEV__ && console.error('Failed to get local messages:', error);
     return [];
   }
 }
 
 export async function addLocalMessage(message: LocalMessage): Promise<void> {
-  const cacheKey = MESSAGES_PREFIX + message.conversationId;
+  const cacheKey = msgKey(message.conversationId);
   
   let messages = await getLocalMessages(message.conversationId);
   
@@ -975,7 +1125,7 @@ export async function addLocalMessage(message: LocalMessage): Promise<void> {
 
 async function saveLocalMessages(conversationId: string, messages: LocalMessage[]): Promise<void> {
   const dataToStore = encryptIfEnabled(JSON.stringify(messages));
-  await AsyncStorage.setItem(MESSAGES_PREFIX + conversationId, dataToStore);
+  await AsyncStorage.setItem(msgKey(conversationId), dataToStore);
 }
 
 /**
@@ -991,7 +1141,7 @@ export async function updateMessagesAvatarForSender(
   senderToken: string,
   avatarBase64: string
 ): Promise<void> {
-  const cacheKey = MESSAGES_PREFIX + conversationId;
+  const cacheKey = msgKey(conversationId);
   
   try {
     const messages = await getLocalMessages(conversationId);
@@ -1010,7 +1160,7 @@ export async function updateMessagesAvatarForSender(
       __DEV__ && console.log(`🖼️ Updated avatar for ${senderToken.slice(0, 8)}... in ${messages.filter(m => m.senderToken === senderToken).length} messages`);
     }
   } catch (error) {
-    console.error('Failed to update messages avatar:', error);
+    __DEV__ && console.error('Failed to update messages avatar:', error);
   }
 }
 
@@ -1040,15 +1190,15 @@ export async function getLatestAvatarForSender(
 }
 
 export async function clearLocalMessages(conversationId: string): Promise<void> {
-  await AsyncStorage.removeItem(MESSAGES_PREFIX + conversationId);
-  invalidateCache(MESSAGES_PREFIX + conversationId);
+  await AsyncStorage.removeItem(msgKey(conversationId));
+  invalidateCache(msgKey(conversationId));
 }
 
 export async function deleteLocalMessages(
   conversationId: string,
   messageIds: string[]
 ): Promise<void> {
-  const cacheKey = MESSAGES_PREFIX + conversationId;
+  const cacheKey = msgKey(conversationId);
   const messages = await getLocalMessages(conversationId);
   const idsToDelete = new Set(messageIds);
   
@@ -1079,8 +1229,8 @@ export async function deleteLocalMessages(
 export async function deleteAllLocalMessages(conversationId: string): Promise<void> {
   await setLastSeenTimestamp(conversationId, new Date());
   await saveLocalMessages(conversationId, []);
-  invalidateCache(MESSAGES_PREFIX + conversationId);
-  await AsyncStorage.removeItem(DELETED_IDS_PREFIX + conversationId);
+  invalidateCache(msgKey(conversationId));
+  await AsyncStorage.removeItem(deletedKey(conversationId));
 }
 
 // ============================================
@@ -1089,7 +1239,7 @@ export async function deleteAllLocalMessages(conversationId: string): Promise<vo
 
 export async function getLastSeenTimestamp(conversationId: string): Promise<Date | null> {
   try {
-    const data = await AsyncStorage.getItem(LAST_SEEN_PREFIX + conversationId);
+    const data = await AsyncStorage.getItem(lastSeenKey(conversationId));
     if (!data) return null;
     return new Date(parseInt(data, 10));
   } catch {
@@ -1099,7 +1249,7 @@ export async function getLastSeenTimestamp(conversationId: string): Promise<Date
 
 export async function setLastSeenTimestamp(conversationId: string, timestamp: Date): Promise<void> {
   await AsyncStorage.setItem(
-    LAST_SEEN_PREFIX + conversationId,
+    lastSeenKey(conversationId),
     timestamp.getTime().toString()
   );
 }
@@ -1110,7 +1260,7 @@ export async function setLastSeenTimestamp(conversationId: string, timestamp: Da
 
 export async function getDeletedMessageIds(conversationId: string): Promise<Set<string>> {
   try {
-    const data = await AsyncStorage.getItem(DELETED_IDS_PREFIX + conversationId);
+    const data = await AsyncStorage.getItem(deletedKey(conversationId));
     if (!data) return new Set();
     return new Set(JSON.parse(data));
   } catch {
@@ -1128,13 +1278,13 @@ export async function addDeletedMessageIds(
   const idsArray = Array.from(existing).slice(-1000);
   
   await AsyncStorage.setItem(
-    DELETED_IDS_PREFIX + conversationId,
+    deletedKey(conversationId),
     JSON.stringify(idsArray)
   );
 }
 
 export async function clearDeletedMessageIds(conversationId: string): Promise<void> {
-  await AsyncStorage.removeItem(DELETED_IDS_PREFIX + conversationId);
+  await AsyncStorage.removeItem(deletedKey(conversationId));
 }
 
 // ============================================
@@ -1177,7 +1327,39 @@ export async function importAllData(data: string): Promise<number> {
 }
 
 export async function clearAllData(): Promise<void> {
-  __DEV__ && console.log('[storage] Starting complete data wipe...');
+  __DEV__ && console.log('[storage] Starting data wipe (preserving profile & PIN)...');
+  
+  // BUG FIX #6: Stopper TOUS les services réseau AVANT le nettoyage
+  // Sans cela, le polling continue en arrière-plan et tente de déchiffrer
+  // avec des sessions/clés qui n'existent plus → erreurs en boucle
+  try {
+    const { stopGlobalPolling1to1 } = await import('./api1to1');
+    stopGlobalPolling1to1();
+    __DEV__ && console.log('[storage] ✅ Global polling stopped');
+  } catch (e) {
+    __DEV__ && console.error('[storage] Failed to stop polling:', e);
+  }
+  try {
+    const { stopConstantTraffic } = await import('./constantTraffic');
+    stopConstantTraffic();
+    __DEV__ && console.log('[storage] ✅ Constant traffic stopped');
+  } catch (e) {
+    __DEV__ && console.error('[storage] Failed to stop constant traffic:', e);
+  }
+  try {
+    const { inviteWatcher } = await import('./inviteWatcher');
+    inviteWatcher.stop();
+    __DEV__ && console.log('[storage] ✅ Invite watcher stopped');
+  } catch (e) {
+    __DEV__ && console.error('[storage] Failed to stop invite watcher:', e);
+  }
+  try {
+    const { pausePrivacyServices } = await import('./privacySettings');
+    pausePrivacyServices();
+    __DEV__ && console.log('[storage] ✅ Privacy services paused');
+  } catch (e) {
+    __DEV__ && console.error('[storage] Failed to pause privacy services:', e);
+  }
   
   clearCache();
   clearConversationTokenCache();
@@ -1185,10 +1367,10 @@ export async function clearAllData(): Promise<void> {
   const conversations = await getConversations();
   
   for (const conv of conversations) {
-    await AsyncStorage.removeItem(MESSAGES_PREFIX + conv.id);
-    await AsyncStorage.removeItem(DELETED_IDS_PREFIX + conv.id);
-    await AsyncStorage.removeItem(LAST_SEEN_PREFIX + conv.id);
-    await AsyncStorage.removeItem(PARTICIPANTS_PREFIX + conv.id);
+    await AsyncStorage.removeItem(msgKey(conv.id));
+    await AsyncStorage.removeItem(deletedKey(conv.id));
+    await AsyncStorage.removeItem(lastSeenKey(conv.id));
+    await AsyncStorage.removeItem(participantsKey(conv.id));
   }
   
   // Nettoyer les clés de conversation
@@ -1197,26 +1379,16 @@ export async function clearAllData(): Promise<void> {
   await SecureStore.deleteItemAsync(SENDER_TOKEN_KEY);
   await SecureStore.deleteItemAsync(USER_SECRET_KEY);
   
-  // NOTE: On NE supprime PAS le pseudo et l'avatar pour permettre à l'utilisateur
-  // de garder son identité après un reset. L'écran de setup ne sera pas affiché.
-  // Pour un reset COMPLET incluant le profil, utiliser clearAllDataIncludingProfile()
-  __DEV__ && console.log('[storage] Display name and avatar PRESERVED');
-  
-  // Nettoyer les paramètres de verrouillage
+  // NOTE: PIN et profil sont PRESERVÉS ici (reset depuis Settings).
+  __DEV__ && console.log('[storage] PIN, display name and avatar PRESERVED');
+
+  // ACTION-04 (Phase 2 Security): Delete hardware-backed encryption keys
   try {
-    await SecureStore.deleteItemAsync('whisper_lock_data_v4');
-    await SecureStore.deleteItemAsync('whisper_lock_data_v3');
-    await SecureStore.deleteItemAsync('whisper_lock_enabled');
-    await SecureStore.deleteItemAsync('whisper_lock_password_hash');
-    await SecureStore.deleteItemAsync('whisper_lock_settings');
-    await SecureStore.deleteItemAsync('whisper_encryption_key');
-    await SecureStore.deleteItemAsync('whisper_lock_salt');
-    await SecureStore.deleteItemAsync('whisper_password_hash');
-    await SecureStore.deleteItemAsync('whisper_password_salt');
-    await SecureStore.deleteItemAsync('whisper_use_biometrics');
-    await SecureStore.deleteItemAsync('whisper_lock_timeout');
+    await deleteHardwareKeys();
+    conversationsHardwareKey = null;
+    __DEV__ && console.log('[storage] Hardware encryption keys deleted');
   } catch (e) {
-    __DEV__ && console.log('Some lock settings did not exist:', e);
+    __DEV__ && console.log('[storage] Hardware key cleanup error:', e);
   }
   
   await AsyncStorage.removeItem(DEVICE_STATE_KEY);
@@ -1230,7 +1402,7 @@ export async function clearAllData(): Promise<void> {
     await sessionService.clearAllData();
     __DEV__ && console.log('[storage] Triple Ratchet cleared');
   } catch (e) {
-    console.error('[storage] Triple Ratchet cleanup error:', e);
+    __DEV__ && console.error('[storage] Triple Ratchet cleanup error:', e);
   }
   
   // ======================================
@@ -1241,15 +1413,13 @@ export async function clearAllData(): Promise<void> {
     await clearAll1to1Data();
     __DEV__ && console.log('[storage] 1-to-1 messages cleared');
   } catch (e) {
-    console.error('[storage] 1-to-1 messages cleanup error:', e);
+    __DEV__ && console.error('[storage] 1-to-1 messages cleanup error:', e);
   }
   
   // ======================================
-  // NETTOYAGE ASYNCSTORAGE COMPLET
+  // NETTOYAGE ASYNCSTORAGE (préserve profil)
   // ======================================
   try {
-    // Supprimer toutes les clés qui commencent par ghostr_, @ghostr, whisper_ ou @whisper
-    // SAUF les clés de profil qu'on veut conserver
     const PROFILE_KEYS_TO_PRESERVE = [
       GLOBAL_DISPLAY_NAME_KEY,  // 'whisper_display_name_v1'
       GLOBAL_AVATAR_KEY,        // 'whisper_avatar_v1'
@@ -1257,31 +1427,143 @@ export async function clearAllData(): Promise<void> {
     ];
     
     const allKeys = await AsyncStorage.getAllKeys();
-    __DEV__ && console.log('[storage] All AsyncStorage keys:', allKeys);
     
     const ghostrKeys = allKeys.filter(key => 
       (key.startsWith('ghostr_') || 
        key.startsWith('@ghostr') ||
        key.startsWith('whisper_') ||
-       key.startsWith('@whisper')) &&
-      !PROFILE_KEYS_TO_PRESERVE.includes(key)  // Exclure les clés de profil
+       key.startsWith('@whisper') ||
+       key.startsWith('g_')) &&  // ACTION 5: opaque storage keys
+      !PROFILE_KEYS_TO_PRESERVE.includes(key)
     );
-    
-    __DEV__ && console.log('[storage] Keys to remove:', ghostrKeys);
     
     if (ghostrKeys.length > 0) {
       await AsyncStorage.multiRemove(ghostrKeys);
-      __DEV__ && console.log(`[storage] Removed ${ghostrKeys.length} additional keys (profile preserved)`);
+      __DEV__ && console.log(`[storage] Removed ${ghostrKeys.length} keys (profile preserved)`);
     }
     
-    // Nettoyage des données legacy
     await AsyncStorage.removeItem('@ghostr_groups');
     await AsyncStorage.removeItem('ghostr_pending_group_invitations');
   } catch (e) {
-    console.error('[storage] Additional cleanup error:', e);
+    __DEV__ && console.error('[storage] Additional cleanup error:', e);
   }
   
-  __DEV__ && console.log('[storage] ✅ All data cleared successfully');
+  __DEV__ && console.log('[storage] ✅ Data cleared (profile & PIN preserved)');
+}
+
+/**
+ * NUCLEAR RESET: Efface ABSOLUMENT TOUT.
+ * PIN, profil, clés hardware, clés de rotation, conversations, sessions, onboarding.
+ * Utilisé uniquement par le flag RESET_ALL_DATA dans App.tsx.
+ * Après appel, l'app redémarre comme un fresh install.
+ */
+export async function nuclearReset(): Promise<void> {
+  __DEV__ && console.log('[storage] ☢️ NUCLEAR RESET — erasing EVERYTHING...');
+  
+  // BUG FIX #6: Stopper TOUS les services réseau AVANT le nettoyage
+  try {
+    const { stopGlobalPolling1to1 } = await import('./api1to1');
+    stopGlobalPolling1to1();
+  } catch {}
+  try {
+    const { stopConstantTraffic } = await import('./constantTraffic');
+    stopConstantTraffic();
+  } catch {}
+  try {
+    const { inviteWatcher } = await import('./inviteWatcher');
+    inviteWatcher.stop();
+  } catch {}
+  try {
+    const { pausePrivacyServices } = await import('./privacySettings');
+    pausePrivacyServices();
+  } catch {}
+  __DEV__ && console.log('[storage] ☢️ Network services stopped');
+  
+  // 1. Wipe ALL AsyncStorage (conversations, messages, onboarding flag, profile, everything)
+  try {
+    await AsyncStorage.clear();
+    __DEV__ && console.log('[storage] ☢️ AsyncStorage cleared');
+  } catch (e) {
+    __DEV__ && console.error('[storage] AsyncStorage clear error:', e);
+  }
+  
+  // 2. Wipe ALL SecureStore keys (PIN, lock data, conversations, tokens, secrets)
+  const secureStoreKeys = [
+    // Conversations
+    CONVERSATIONS_KEY,
+    CONVERSATIONS_KEY_ENCRYPTED,
+    SENDER_TOKEN_KEY,
+    USER_SECRET_KEY,
+    // Lock / PIN (ALL versions)
+    'whisper_lock_data_v6',
+    'whisper_lock_data_v5',
+    'whisper_lock_data_v4',
+    'whisper_lock_data_v3',
+    'whisper_lock_enabled',
+    'whisper_lock_password_hash',
+    'whisper_lock_settings',
+    'whisper_encryption_key',
+    'whisper_lock_salt',
+    'whisper_password_hash',
+    'whisper_password_salt',
+    'whisper_use_biometrics',
+    'whisper_lock_timeout',
+    'whisper_failed_attempts',
+    'whisper_lockout_until',
+    // ACTION 1: New brute-force counters (SecureStore v2)
+    'whisper_failed_attempts_v2',
+    'whisper_lockout_until_v2',
+    // ACTION 4: Auto-wipe setting
+    'whisper_auto_wipe_enabled',
+    // Crypto rotation keys
+    'ghostr_rotated_enc_key_v1',
+    'ghostr_rotated_enc_key_v1_pending',
+    // Device-level encryption key (from ensureDeviceLevelEncryption)
+    'ghostr_device_encryption_key_v1',
+  ];
+  
+  for (const key of secureStoreKeys) {
+    try {
+      await SecureStore.deleteItemAsync(key);
+    } catch {
+      // Key might not exist, that's fine
+    }
+  }
+  __DEV__ && console.log('[storage] ☢️ SecureStore keys cleared');
+  
+  // 3. Hardware encryption keys
+  try {
+    await deleteHardwareKeys();
+    conversationsHardwareKey = null;
+    __DEV__ && console.log('[storage] ☢️ Hardware encryption keys deleted');
+  } catch (e) {
+    __DEV__ && console.log('[storage] Hardware key cleanup error:', e);
+  }
+  
+  // 4. SessionService (identity keys, ratchet states, prekeys)
+  try {
+    const { sessionService } = await import('./tripleRatchet');
+    await sessionService.clearAllData();
+    __DEV__ && console.log('[storage] ☢️ SessionService cleared');
+  } catch (e) {
+    __DEV__ && console.error('[storage] SessionService cleanup error:', e);
+  }
+  
+  // 5. 1-to-1 message data
+  try {
+    const { clearAll1to1Data } = await import('./api1to1');
+    await clearAll1to1Data();
+    __DEV__ && console.log('[storage] ☢️ 1-to-1 data cleared');
+  } catch (e) {
+    __DEV__ && console.error('[storage] 1-to-1 cleanup error:', e);
+  }
+  
+  // 6. Reset in-memory state
+  clearCache();
+  clearConversationTokenCache();
+  cachedDeviceState = null;
+  
+  __DEV__ && console.log('[storage] ☢️ NUCLEAR RESET COMPLETE — app is a blank slate');
 }
 
 // ============================================
@@ -1327,7 +1609,7 @@ export async function getOrCreateDeviceState(): Promise<DeviceState> {
       return cachedDeviceState!;
     }
   } catch (error) {
-    console.error('Failed to load device state:', error);
+    __DEV__ && console.error('Failed to load device state:', error);
   }
   
   cachedDeviceState = {
@@ -1425,7 +1707,7 @@ export async function cleanupCorruptedConversations(): Promise<{
     };
     
   } catch (error) {
-    console.error('❌ Erreur lors du nettoyage:', error);
+    __DEV__ && console.error('❌ Erreur lors du nettoyage:', error);
     throw error;
   }
 }
@@ -1451,7 +1733,7 @@ export async function diagnoseConversations(): Promise<void> {
       __DEV__ && console.log('CORRUPTED:', isConversationCorrupted(conv) ? '❌ YES' : '✅ NO');
     }
   } catch (error) {
-    console.error('Erreur diagnostic:', error);
+    __DEV__ && console.error('Erreur diagnostic:', error);
   }
   
   __DEV__ && console.log('\n========== FIN DIAGNOSTIC ==========\n');

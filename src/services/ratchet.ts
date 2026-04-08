@@ -49,7 +49,7 @@ const DEBUG_RATCHET = __DEV__ ?? false;
 
 function debugLog(...args: any[]) {
   if (DEBUG_RATCHET) {
-    console.log('[Ratchet]', ...args);
+    __DEV__ && console.log('[Ratchet]', ...args);
   }
 }
 

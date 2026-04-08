@@ -57,6 +57,8 @@ export { getSecureRandomBytes };
 // Si libsodium est initialisé, utilise sodium.memzero() (garantie C-level).
 // Sinon, fallback 4-pass JS avec volatile sink (best-effort).
 import { sodiumMemzero } from '../sodiumZeroize';
+// R-11: Conversion Ed25519→X25519 constant-time via libsodium
+import { ed25519PkToCurve25519 } from '../sodiumEd25519';
 
 // ============================================
 // UTILITAIRES HEXADÉCIMAUX
@@ -531,28 +533,39 @@ export function ed25519KeyPairToX25519(
 }
 
 /**
- * Convertit une clé publique Ed25519 en X25519 (standalone)
- * 
- * Utilise la formule mathématique: u = (1 + y) / (1 - y) mod p
- * où y est la coordonnée y du point Ed25519
- * 
- * NOTE: Cette implémentation utilise l'arithmétique de corps fini
- * sur GF(2^255 - 19)
+ * Convertit une clé publique Ed25519 en X25519
+ *
+ * R-11: Utilise libsodium.crypto_sign_ed25519_pk_to_curve25519() (constant-time).
+ * Fallback BigInt si libsodium non disponible (non-constant-time, clé publique seulement).
+ *
+ * IMPORTANT: Cette fonction est async (libsodium est initialisé de façon async).
+ * Utiliser ed25519KeyPairToX25519() de préférence si la clé privée est disponible,
+ * car la dérivation via scalar multiplication (nacl.scalarMult.base) est toujours
+ * constant-time.
  */
-export function ed25519PublicKeyToX25519(
+export async function ed25519PublicKeyToX25519(
+  edPublicKey: Ed25519PublicKey
+): Promise<X25519PublicKey> {
+  const u = await ed25519PkToCurve25519(edPublicKey.bytes);
+  return {
+    _brand: 'X25519PublicKey' as const,
+    bytes: u,
+  };
+}
+
+/**
+ * Version synchrone de ed25519PublicKeyToX25519 (utilise le fallback BigInt).
+ * Préférer la version async si possible.
+ * @deprecated — Utiliser ed25519PublicKeyToX25519() (async, constant-time via libsodium)
+ */
+export function ed25519PublicKeyToX25519Sync(
   edPublicKey: Ed25519PublicKey
 ): X25519PublicKey {
   const ed = edPublicKey.bytes;
-  
-  // Extraire la coordonnée y (les 255 bits inférieurs de la clé publique Ed25519)
-  // Le bit de poids fort encode le signe de x
   const y = new Uint8Array(32);
   y.set(ed);
-  y[31] &= 0x7f; // Effacer le bit de signe
-  
-  // Convertir y en coordonnée u de Montgomery: u = (1 + y) / (1 - y) mod p
+  y[31] &= 0x7f;
   const u = edwardsYToMontgomeryU(y);
-  
   return {
     _brand: 'X25519PublicKey' as const,
     bytes: u,
@@ -917,21 +930,41 @@ export function deriveDeterministicNonce(
 
 /**
  * Chiffrement AEAD (Authenticated Encryption with Associated Data)
- * 
+ *
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║  AVERTISSEMENT SÉCURITÉ CRITIQUE — NE PAS MODIFIER SANS LIRE CECI      ║
+ * ║                                                                          ║
+ * ║  nacl.secretbox (XSalsa20-Poly1305) N'ACCEPTE PAS de paramètre AAD.    ║
+ * ║  La couche Poly1305 interne n'authentifie QUE le ciphertext.            ║
+ * ║                                                                          ║
+ * ║  Le HMAC-SHA256 EXTERNE (étape 4) est l'UNIQUE mécanisme qui           ║
+ * ║  authentifie les données associées (encryptedHeader + contexte).        ║
+ * ║  Supprimer ou contourner ce HMAC rend les métadonnées non-authentifiées ║
+ * ║  → un attaquant actif peut modifier le header chiffré, le numéro de    ║
+ * ║    message ou le contexte sans invalider la vérification d'intégrité.   ║
+ * ║                                                                          ║
+ * ║  Construction : Encrypt-then-MAC avec clés SÉPARÉES (HKDF-derived).    ║
+ * ║  Le tag couvre : HMAC(macKey, nonce ‖ AAD_len ‖ AAD ‖ ciphertext)     ║
+ * ║                                                                          ║
+ * ║  Migration future conseillée : libsodium AEGIS-256 ou                  ║
+ * ║  ChaCha20-Poly1305 (RFC 8439) qui acceptent l'AAD nativement.          ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ *
  * Construction sécurisée Encrypt-then-MAC avec clés dérivées distinctes:
  * 1. Dériver encKey et macKey de la clé maître via HKDF
  * 2. Générer un nonce DÉTERMINISTE (v3.0) ou aléatoire (fallback)
- * 3. Chiffrer avec XSalsa20-Poly1305 (encKey)
+ * 3. Chiffrer avec XSalsa20-Poly1305 (encKey) — SANS AAD natif
  * 4. Calculer HMAC-SHA256 sur (nonce || AAD_length || AAD || ciphertext) avec macKey
+ *    ↑ C'EST CETTE ÉTAPE QUI AUTHENTIFIE LES AAD. Elle est obligatoire.
  * 5. Retourner: authTag || ciphertext
- * 
+ *
  * SÉCURITÉ v3.0:
  * - NONCES DÉTERMINISTES: Élimine le risque de collision par birthday paradox
- * - Clés distinctes pour chiffrement et MAC (prévient les attaques par réutilisation)
+ * - Clés distinctes pour chiffrement et MAC (prévient la réutilisation de clé)
  * - Nonce inclus dans le calcul du MAC (binding cryptographique)
- * - Longueur AAD encodée (prévient les attaques par extension)
- * - Double authentification: Poly1305 + HMAC-SHA256 (défense en profondeur)
- * 
+ * - Longueur AAD encodée (prévient les attaques par extension de longueur)
+ * - Double authentification: Poly1305 (corps) + HMAC-SHA256 (corps + AAD)
+ *
  * @param key - Clé maître de 32 bytes
  * @param plaintext - Données à chiffrer
  * @param associatedData - Données authentifiées mais non chiffrées (AAD)

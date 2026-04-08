@@ -14,12 +14,14 @@ import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 import { supabaseStorage } from './api';
 import { getRandomBytes } from './crypto';
+// P0-A2: legacyMediaProxy supprimé — tous les downloads via OHTTP relay
+import { fetchMediaViaRelay } from './encryptedBlobService';
 
 // ============================================
 // CONFIGURATION
 // ============================================
 
-const STORAGE_BUCKET = 'whisper-media';
+const STORAGE_BUCKET = 'ghostr-blobs';
 const MAX_VOICE_DURATION_MS = 5 * 60 * 1000; // 5 minutes max
 const MAX_VOICE_SIZE_MB = 10;
 const MAX_VOICE_SIZE_BYTES = MAX_VOICE_SIZE_MB * 1024 * 1024;
@@ -143,7 +145,7 @@ export async function initializeVoiceService(): Promise<boolean> {
     // Demander les permissions
     const { status } = await Audio.requestPermissionsAsync();
     if (status !== 'granted') {
-      console.error('🎤 Permission microphone refusée');
+      __DEV__ && console.error('🎤 Permission microphone refusée');
       return false;
     }
 
@@ -168,7 +170,7 @@ export async function initializeVoiceService(): Promise<boolean> {
     __DEV__ && console.log('🎤 Voice service initialized (playback mode)');
     return true;
   } catch (error) {
-    console.error('🎤 Voice service init error:', error);
+    __DEV__ && console.error('🎤 Voice service init error:', error);
     return false;
   }
 }
@@ -255,7 +257,7 @@ export async function startRecording(
     __DEV__ && console.log('🎤 Recording started');
     return true;
   } catch (error) {
-    console.error('🎤 Start recording error:', error);
+    __DEV__ && console.error('🎤 Start recording error:', error);
     return false;
   }
 }
@@ -303,7 +305,7 @@ export async function stopRecording(): Promise<{
     });
 
     if (!uri) {
-      console.error('🎤 No recording URI');
+      __DEV__ && console.error('🎤 No recording URI');
       return null;
     }
 
@@ -315,7 +317,7 @@ export async function stopRecording(): Promise<{
       waveform,
     };
   } catch (error) {
-    console.error('🎤 Stop recording error:', error);
+    __DEV__ && console.error('🎤 Stop recording error:', error);
     state.recording = null;
     return null;
   }
@@ -358,7 +360,7 @@ export async function cancelRecording(): Promise<void> {
 
     __DEV__ && console.log('🎤 Recording cancelled');
   } catch (error) {
-    console.error('🎤 Cancel recording error:', error);
+    __DEV__ && console.error('🎤 Cancel recording error:', error);
   }
 }
 
@@ -435,7 +437,7 @@ export async function playVoice(
     __DEV__ && console.log('🎤 Playing voice:', voiceId);
     return true;
   } catch (error) {
-    console.error('🎤 Play voice error:', error);
+    __DEV__ && console.error('🎤 Play voice error:', error);
     return false;
   }
 }
@@ -639,7 +641,7 @@ export async function uploadEncryptedVoice(
   try {
     await FileSystem.deleteAsync(voiceUri, { idempotent: true });
   } catch (e) {
-    console.warn('Erreur suppression fichier vocal temporaire:', e);
+    __DEV__ && console.warn('Erreur suppression fichier vocal temporaire:', e);
   }
 
   return {
@@ -733,13 +735,8 @@ export async function downloadAndDecryptVoice(
   const nonce = decodeBase64(nonceBase64);
 
   // Télécharger le fichier chiffré
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Échec téléchargement: ${response.status}`);
-  }
-
-  const encryptedBuffer = await response.arrayBuffer();
-  const encryptedData = new Uint8Array(encryptedBuffer);
+  // ACTION-01: Route via OHTTP pour cacher le tag au CF Relay
+  const encryptedData = await fetchMediaViaRelay(url);
 
   // Déchiffrer
   const decryptedData = decryptVoice(encryptedData, nonce, fileKey);
@@ -800,7 +797,7 @@ export async function clearVoiceCache(): Promise<void> {
     await FileSystem.deleteAsync(cacheDir, { idempotent: true });
     voiceCache.clear();
   } catch (e) {
-    console.warn('Erreur nettoyage cache vocaux:', e);
+    __DEV__ && console.warn('Erreur nettoyage cache vocaux:', e);
   }
 }
 
@@ -909,7 +906,7 @@ export async function validateVoiceFile(uri: string): Promise<{ valid: boolean; 
 
     return { valid: true };
   } catch (e) {
-    console.error('Erreur validation vocal:', e);
+    __DEV__ && console.error('Erreur validation vocal:', e);
     return { valid: false, error: 'Impossible de valider le fichier' };
   }
 }

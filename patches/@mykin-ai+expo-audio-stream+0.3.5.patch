@@ -1,0 +1,104 @@
+diff --git a/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/AudioPlaybackManager.kt b/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/AudioPlaybackManager.kt
+--- a/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/AudioPlaybackManager.kt
++++ b/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/AudioPlaybackManager.kt
+@@ -3,6 +3,9 @@
+ import android.media.AudioAttributes
+ import android.media.AudioFormat
+ import android.media.AudioTrack
++import android.content.Context
++import android.media.AudioDeviceInfo
++import android.media.AudioManager
+ import android.os.Bundle
+ import android.util.Base64
+ import android.util.Log
+@@ -48,6 +51,6 @@
+ ) // contains the decoded base64 chunk
+ 
+-class AudioPlaybackManager(private val eventSender: EventSender? = null) {
++class AudioPlaybackManager(private val context: Context? = null, private val eventSender: EventSender? = null) {
+     private lateinit var processingChannel: Channel<ChunkData>
+     private lateinit var playbackChannel: Channel<AudioChunk>
+ 
+@@ -91,7 +94,14 @@
+ 
+         // Configure audio attributes based on playback mode
+         val audioAttributesBuilder = AudioAttributes.Builder()
+-            .setUsage(AudioAttributes.USAGE_MEDIA)
++            .setUsage(
++                when (config.playbackMode) {
++                    PlaybackMode.CONVERSATION, PlaybackMode.VOICE_PROCESSING ->
++                        AudioAttributes.USAGE_VOICE_COMMUNICATION
++                    else ->
++                        AudioAttributes.USAGE_MEDIA
++                }
++            )
+ 
+         // Set content type based on playback mode
+         val contentType = when (config.playbackMode) {
+@@ -106,10 +116,26 @@
+         audioTrack =
+             AudioTrack.Builder()
+                 .setAudioAttributes(audioAttributesBuilder.build())
+                 .setAudioFormat(audioFormat)
+                 .setBufferSizeInBytes(minBufferSize * 2)
+                 .setTransferMode(AudioTrack.MODE_STREAM)
+                 .build()
++
++        // Samsung fix: route AudioTrack directly to earpiece for voice communication.
++        // During ringback there is no active mic, so setCommunicationDevice(earpiece)
++        // silently fails on Samsung. setPreferredDevice binds at the AudioTrack level.
++        if (config.playbackMode == PlaybackMode.CONVERSATION || config.playbackMode == PlaybackMode.VOICE_PROCESSING) {
++            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
++                try {
++                    val am = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
++                    val earpiece = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
++                        ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
++                    earpiece?.let { audioTrack.setPreferredDevice(it) }
++                } catch (e: Exception) {
++                    Log.w("ExpoPlayStreamModule", "setPreferredDevice failed: ${e.message}")
++                }
++            }
++        }
+     }
+ 
+     private fun initializeChannels() {
+diff --git a/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/ExpoPlayAudioStreamModule.kt b/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/ExpoPlayAudioStreamModule.kt
+--- a/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/ExpoPlayAudioStreamModule.kt
++++ b/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/ExpoPlayAudioStreamModule.kt
+@@ -280,6 +280,6 @@
+ 
+     private fun initializePlaybackManager() {
+-        audioPlaybackManager = AudioPlaybackManager(this)
++        audioPlaybackManager = AudioPlaybackManager(appContext.reactContext, this)
+     }
+ 
+     private fun initializeWavPlayer() {
+diff --git a/node_modules/@mykin-ai/expo-audio-stream/ios/AudioSessionManager.swift b/node_modules/@mykin-ai/expo-audio-stream/ios/AudioSessionManager.swift
+--- a/node_modules/@mykin-ai/expo-audio-stream/ios/AudioSessionManager.swift
++++ b/node_modules/@mykin-ai/expo-audio-stream/ios/AudioSessionManager.swift
+@@ -427,7 +427,7 @@
+                 newSettings.sampleRate = session.sampleRate
+             }
+             
+-            try session.setCategory(.playAndRecord, mode: .videoChat, options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
++            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .allowBluetoothA2DP])
+             try session.setPreferredSampleRate(settings.sampleRate)
+             try session.setPreferredIOBufferDuration(1024 / settings.sampleRate)
+             try session.setActive(true)
+diff --git a/node_modules/@mykin-ai/expo-audio-stream/ios/ExpoPlayAudioStreamModule.swift b/node_modules/@mykin-ai/expo-audio-stream/ios/ExpoPlayAudioStreamModule.swift
+--- a/node_modules/@mykin-ai/expo-audio-stream/ios/ExpoPlayAudioStreamModule.swift
++++ b/node_modules/@mykin-ai/expo-audio-stream/ios/ExpoPlayAudioStreamModule.swift
+@@ -394,7 +394,10 @@
+         let audioSession = AVAudioSession.sharedInstance()
+-        try audioSession.setCategory(
+-            .playAndRecord, mode: .voiceChat,
+-            options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
++        // Always call setCategory even if already in playAndRecord/voiceChat.
++        // On call 2+, I/O routes are stale from ringback AVAudioPlayer.
++        try audioSession.setCategory(
++            .playAndRecord, mode: .voiceChat,
++            options: [.allowBluetooth, .allowBluetoothA2DP])
++        try audioSession.setActive(true)
+         if let settings = recordingSettings {
+             try audioSession.setPreferredSampleRate(settings.sampleRate)
+             try audioSession.setPreferredIOBufferDuration(1024 / settings.sampleRate)

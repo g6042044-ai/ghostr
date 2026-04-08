@@ -132,7 +132,7 @@ export async function initializePinning(): Promise<PinningStatus> {
 
     // Vérifier que le module natif est disponible
     if (!isSslPinningAvailable()) {
-      console.warn('⚠️ SSL pinning native module not available');
+      __DEV__ && console.warn('⚠️ SSL pinning native module not available');
       pinningAvailable = false;
       pinningInitialized = true;
       pinningError = 'native_module_unavailable';
@@ -155,12 +155,12 @@ export async function initializePinning(): Promise<PinningStatus> {
     pinningError = error.message;
 
     if (__DEV__) {
-      console.warn(
+      __DEV__ && console.warn(
         '⚠️ Certificate pinning not available (normal in Expo Go).\n' +
         'For production: npm install react-native-ssl-public-key-pinning && npx expo prebuild'
       );
     } else {
-      console.error('🚨 Certificate pinning failed to initialize:', error.message);
+      __DEV__ && console.error('🚨 Certificate pinning failed to initialize:', error.message);
     }
 
     return { active: false, reason: error.message, domains: [] };
@@ -199,7 +199,7 @@ export function isPinningAvailable(): boolean {
 export function verifyPinningOrWarn(): string | null {
   if (__DEV__) {
     if (!pinningAvailable) {
-      console.warn('⚠️ Certificate pinning not available (dev mode - OK)');
+      __DEV__ && console.warn('⚠️ Certificate pinning not available (dev mode - OK)');
     }
     return null;
   }

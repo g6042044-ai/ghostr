@@ -66,6 +66,7 @@ import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
+import { suppressLock, releaseLock } from '../services/lockGuard';
 import { useUnifiedMessages, UnifiedMessage, ConversationInfo } from '../hooks/useUnifiedMessages';
 import { MessageStatus } from '../services/messageStatus';
 import { LocalMessage, getConversation, StoredConversation, getConversationKeys, getMasterKey } from '../services/storage';
@@ -518,6 +519,8 @@ const MessageStatusIcon: React.FC<MessageStatusIconProps> = ({ status, isMine })
       return <Icons.DoubleCheck size={14} color={Colors.status.delivered} />;
     case 'read':
       return <Icons.DoubleCheck size={14} color={Colors.status.read} />;
+    case 'failed':
+      return <Ionicons name="alert-circle" size={14} color="#E74C3C" />;
     default:
       return <Icons.DoubleCheck size={14} color={Colors.status.read} />;
   }
@@ -1530,6 +1533,8 @@ export function ConversationScreen() {
     deleteAllMessages,
     toggleReaction,
     markAsRead,
+    retryMessage,
+    deleteFailedMessage,
     conversationInfo,
   } = useUnifiedMessages(conversationId);
   
@@ -1675,9 +1680,10 @@ export function ConversationScreen() {
     if (msg.isMine) {
       return myCurrentAvatar;
     }
-    // Pour les autres, priorité : avatar du mapping (le plus récent), sinon l'avatar du message
-    return latestAvatarByUser.get(msg.senderToken) || msg.avatarBase64;
-  }, [latestAvatarByUser, myCurrentAvatar]);
+    // Pour les autres, priorité : avatar du mapping (le plus récent), sinon l'avatar du message,
+    // sinon le profil de session (fallback nécessaire car avatar-on-change strip l'avatar de 99% des messages)
+    return latestAvatarByUser.get(msg.senderToken) || msg.avatarBase64 || conversationInfo?.avatarBase64;
+  }, [latestAvatarByUser, myCurrentAvatar, conversationInfo]);
 
   // Effects
   useEffect(() => {
@@ -2033,6 +2039,7 @@ export function ConversationScreen() {
   const handleCameraPress = async () => {
     setShowEmojiPicker(false);
     setShowAttachMenu(false);
+    suppressLock();
     try {
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
       if (status !== 'granted') {
@@ -2045,11 +2052,14 @@ export function ConversationScreen() {
       }
     } catch (error) {
       Alert.alert('Erreur', 'Impossible de prendre la photo.');
+    } finally {
+      releaseLock();
     }
   };
 
   const handlePickGallery = async () => {
     setShowAttachMenu(false);
+    suppressLock();
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== 'granted') {
@@ -2057,7 +2067,7 @@ export function ConversationScreen() {
         return;
       }
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        mediaTypes: ["images"],
         quality: 0.8,
       });
       if (!result.canceled && result.assets[0]) {
@@ -2065,11 +2075,14 @@ export function ConversationScreen() {
       }
     } catch (error) {
       Alert.alert('Erreur', 'Impossible de sélectionner l\'image.');
+    } finally {
+      releaseLock();
     }
   };
 
   const handlePickCamera = async () => {
     setShowAttachMenu(false);
+    suppressLock();
     try {
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
       if (status !== 'granted') {
@@ -2082,11 +2095,14 @@ export function ConversationScreen() {
       }
     } catch (error) {
       Alert.alert('Erreur', 'Impossible de prendre la photo.');
+    } finally {
+      releaseLock();
     }
   };
 
   const handlePickFile = async () => {
     setShowAttachMenu(false);
+    suppressLock();
     try {
       const file = await pickFile();
       if (file) {
@@ -2100,6 +2116,8 @@ export function ConversationScreen() {
       }
     } catch (error) {
       Alert.alert('Erreur', 'Impossible de sélectionner le fichier.');
+    } finally {
+      releaseLock();
     }
   };
 
@@ -3924,6 +3942,29 @@ export function ConversationScreen() {
           )}
         </Pressable>
         
+        {/* P7 FIX: Actions pour messages échoués (tous types: texte, image, fichier, vocal) */}
+        {item.isMine && (item as MessageWithStatus).status === 'failed' && (
+          <View style={[styles.failedActionsRow, { alignSelf: 'flex-end', marginRight: 44 }]}>
+            <TouchableOpacity 
+              style={styles.failedActionBtn} 
+              onPress={() => retryMessage(item.id)}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="refresh" size={13} color="#E74C3C" />
+              <Text style={styles.failedActionText}>Réessayer</Text>
+            </TouchableOpacity>
+            <View style={styles.failedActionSep} />
+            <TouchableOpacity 
+              style={styles.failedActionBtn} 
+              onPress={() => deleteFailedMessage(item.id)}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="trash-outline" size={13} color="rgba(255,255,255,0.4)" />
+              <Text style={[styles.failedActionText, { color: 'rgba(255,255,255,0.4)' }]}>Supprimer</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+        
         {/* Réactions - EN DESSOUS du message (hors du Pressable row) */}
         {hasReactions && (
           <View style={[
@@ -4059,11 +4100,11 @@ export function ConversationScreen() {
           avatar={
             <Avatar
               displayName={conversationInfo.name || conversationName}
-              size="small"
+              size="medium"
               avatarUri={conversationInfo.avatarBase64}
             />
           }
-          subtitle='🔐 Chiffré E2E'
+          subtitle=''
           rightActions={
             conversationInfo.session ? (
               <CallButton1to1 
@@ -4460,7 +4501,7 @@ export function ConversationScreen() {
       {selectedImage && (
         <Modal visible={true} transparent animationType="fade">
           <View style={styles.previewScreen}>
-            <View style={styles.previewHeader}>
+            <View style={[styles.previewHeader, { paddingTop: insets.top + 12 }]}>
               <TouchableOpacity style={styles.previewClose} onPress={() => setSelectedImage(null)}>
                 <Icons.Close size={24} color="#FFF" />
               </TouchableOpacity>
@@ -4505,7 +4546,7 @@ export function ConversationScreen() {
       {selectedFile && (
         <Modal visible={true} transparent animationType="fade">
           <View style={styles.previewScreen}>
-            <View style={styles.previewHeader}>
+            <View style={[styles.previewHeader, { paddingTop: insets.top + 12 }]}>
               <TouchableOpacity style={styles.previewClose} onPress={() => setSelectedFile(null)}>
                 <Icons.Close size={24} color="#FFF" />
               </TouchableOpacity>
@@ -4556,7 +4597,7 @@ export function ConversationScreen() {
       {viewerImage && (
         <Modal visible={true} transparent animationType="fade">
           <View style={styles.viewerScreen}>
-            <View style={styles.viewerHeader}>
+            <View style={[styles.viewerHeader, { paddingTop: insets.top + 12 }]}>
               <TouchableOpacity style={styles.viewerClose} onPress={() => setViewerImage(null)}>
                 <Icons.Close size={24} color="#FFF" />
               </TouchableOpacity>
@@ -5192,6 +5233,34 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.5)',
   },
   
+  // P7 FIX: Failed message retry/delete actions
+  failedActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    paddingTop: 4,
+    paddingHorizontal: 2,
+    gap: 0,
+  },
+  failedActionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 3,
+    paddingHorizontal: 6,
+    gap: 4,
+  },
+  failedActionText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#E74C3C',
+  },
+  failedActionSep: {
+    width: 1,
+    height: 12,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    marginHorizontal: 2,
+  },
+  
   // Reactions
   reactionOverlay: {
     flex: 1,
@@ -5601,7 +5670,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row', 
     justifyContent: 'space-between', 
     alignItems: 'center', 
-    paddingTop: Platform.OS === 'ios' ? 56 : 24, 
     paddingHorizontal: Space.lg, 
     paddingBottom: Space.lg,
   },
@@ -5717,7 +5785,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row', 
     justifyContent: 'space-between', 
     alignItems: 'center', 
-    paddingTop: Platform.OS === 'ios' ? 56 : 24, 
     paddingHorizontal: Space.lg, 
     paddingBottom: Space.lg,
   },

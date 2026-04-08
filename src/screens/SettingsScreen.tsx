@@ -2,7 +2,7 @@
 // Paramètres de l'application
 // v5.0 - Design compact et moderne pour le profil
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -10,42 +10,33 @@ import {
   ScrollView,
   TouchableOpacity,
   Image,
-  TextInput,
-  Modal,
   Alert,
-  ActivityIndicator,
-  Animated,
-  Pressable,
-  Dimensions,
   Platform,
-  KeyboardAvoidingView,
+  Switch,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import * as ImagePicker from 'expo-image-picker';
-import * as ImageManipulator from 'expo-image-manipulator';
 import { 
   getOrCreateDeviceState, 
   clearAllData, 
   getGlobalDisplayName, 
-  setGlobalDisplayName,
   getGlobalAvatar,
-  setGlobalAvatar,
 } from '../services/storage';
 import { isLockEnabled } from '../services/appLock';
 import { getPrivacyStatus } from '../services/privacySettings';
-import { sessionService } from '../services/tripleRatchet';
 import { theme, Header, AlertModal } from '../components/ui';
 import { Avatar } from '../components/Avatar';
-import { AVATAR_COLORS } from '../services/crypto';
-
-const { height: SCREEN_HEIGHT } = Dimensions.get('window');
+import { Ionicons } from '@expo/vector-icons';
+import { isSilentMode, setSilentMode, loadSilentMode } from '../services/callTones';
+import { isPushEnabled, setPushEnabled } from '../services/pushNotificationService';
+import { SplashScreen } from './SplashScreen';
 
 type RootStackParamList = {
   ConversationList: undefined;
   Settings: undefined;
   Security: undefined;
+  EditProfile: undefined;
 };
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Settings'>;
@@ -63,25 +54,14 @@ export function SettingsScreen({ onSecurityChange }: Props) {
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [relayEnabled, setRelayEnabled] = useState(false);
+  const [silentModeEnabled, setSilentModeEnabled] = useState(false);
+  const [pushNotifEnabled, setPushNotifEnabled] = useState(false);
   
   // Profil
   const [displayName, setDisplayName] = useState<string>('');
   const [avatarUri, setAvatarUri] = useState<string | null>(null);
-  const [showEditProfile, setShowEditProfile] = useState(false);
-  const [showPhotoOptions, setShowPhotoOptions] = useState(false);
-  const [newDisplayName, setNewDisplayName] = useState('');
-  const [newAvatarUri, setNewAvatarUri] = useState<string | null>(null);
-  const [savingProfile, setSavingProfile] = useState(false);
-  const [profileError, setProfileError] = useState<string | null>(null);
-  const [processingImage, setProcessingImage] = useState(false);
-  const [inputFocused, setInputFocused] = useState(false);
   
-  // Animations
-  const avatarScale = useRef(new Animated.Value(1)).current;
-  const slideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
-  const fadeAnim = useRef(new Animated.Value(0)).current;
-  const photoOptionsSlide = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
-  const photoOptionsFade = useRef(new Animated.Value(0)).current;
+  // (No profile-edit animations needed — now a dedicated screen)
 
   useEffect(() => {
     loadInfo();
@@ -91,70 +71,6 @@ export function SettingsScreen({ onSecurityChange }: Props) {
     const unsubscribe = navigation.addListener('focus', loadInfo);
     return unsubscribe;
   }, [navigation]);
-
-  // Animation pour le BottomSheet d'édition
-  useEffect(() => {
-    if (showEditProfile) {
-      Animated.parallel([
-        Animated.spring(slideAnim, {
-          toValue: 0,
-          useNativeDriver: true,
-          tension: 65,
-          friction: 11,
-        }),
-        Animated.timing(fadeAnim, {
-          toValue: 1,
-          duration: 200,
-          useNativeDriver: true,
-        }),
-      ]).start();
-    } else {
-      Animated.parallel([
-        Animated.timing(slideAnim, {
-          toValue: SCREEN_HEIGHT,
-          duration: 250,
-          useNativeDriver: true,
-        }),
-        Animated.timing(fadeAnim, {
-          toValue: 0,
-          duration: 200,
-          useNativeDriver: true,
-        }),
-      ]).start();
-    }
-  }, [showEditProfile]);
-
-  // Animation pour le ActionSheet des options photo
-  useEffect(() => {
-    if (showPhotoOptions) {
-      Animated.parallel([
-        Animated.spring(photoOptionsSlide, {
-          toValue: 0,
-          useNativeDriver: true,
-          tension: 65,
-          friction: 11,
-        }),
-        Animated.timing(photoOptionsFade, {
-          toValue: 1,
-          duration: 200,
-          useNativeDriver: true,
-        }),
-      ]).start();
-    } else {
-      Animated.parallel([
-        Animated.timing(photoOptionsSlide, {
-          toValue: SCREEN_HEIGHT,
-          duration: 250,
-          useNativeDriver: true,
-        }),
-        Animated.timing(photoOptionsFade, {
-          toValue: 0,
-          duration: 200,
-          useNativeDriver: true,
-        }),
-      ]).start();
-    }
-  }, [showPhotoOptions]);
 
   const loadInfo = async () => {
     try {
@@ -172,13 +88,34 @@ export function SettingsScreen({ onSecurityChange }: Props) {
       
       const avatar = await getGlobalAvatar();
       setAvatarUri(avatar);
+      
+      const silent = await loadSilentMode();
+      setSilentModeEnabled(silent);
+      
+      setPushNotifEnabled(isPushEnabled());
     } catch (e) {
       console.error('Failed to load settings info:', e);
     }
   };
 
+  const handleToggleSilentMode = async (enabled: boolean) => {
+    setSilentModeEnabled(enabled);
+    await setSilentMode(enabled);
+  };
+
+  const handleTogglePush = async (enabled: boolean) => {
+    setPushNotifEnabled(enabled);
+    await setPushEnabled(enabled);
+    if (enabled) {
+      // Re-enregistrer les tokens pour toutes les sessions
+      const { sendPushTokenToAllPeers } = require('../services/api1to1');
+      sendPushTokenToAllPeers().catch(() => {});
+    }
+  };
+
   const handleClearData = async () => {
     setClearing(true);
+    await new Promise<void>(resolve => setTimeout(resolve, 80));
     try {
       await clearAllData();
       setShowClearConfirm(false);
@@ -190,178 +127,12 @@ export function SettingsScreen({ onSecurityChange }: Props) {
     }
   };
 
-  const processImage = async (uri: string): Promise<string> => {
-    // 160×160 @ q0.5: ~4-5KB base64. Net à toutes les tailles UI:
-    //   - ConversationScreen: 28dp (84px) ✓
-    //   - SettingsScreen: 72dp (216px) ✓
-    //   - ContactInfoScreen: 110dp (330px) — légèrement soft, acceptable
-    //
-    // IMPACT RÉSEAU: L'avatar est envoyé seulement au premier message par
-    // session (après restart app) ou quand il change (getAvatarIfChanged).
-    // ~99% des messages n'incluent PAS l'avatar → tier 2KB = decoys small.
-    // Le ~1% qui l'inclut: 200B texte + 5KB avatar = ~5.2KB → tier 8KB
-    //   = match 30% des decoys (medium). Acceptable.
-    //
-    // IMPACT LOCAL: Pas stocké par message (strippé des isMine dans saveLocalMessage1to1).
-    // Stocké 1× dans GLOBAL_AVATAR_KEY + 1× dans MY_PROFILE.
-    const manipulated = await ImageManipulator.manipulateAsync(
-      uri,
-      [{ resize: { width: 160, height: 160 } }],
-      { 
-        compress: 0.5, 
-        format: ImageManipulator.SaveFormat.JPEG,
-        base64: true,
-      }
-    );
-    return `data:image/jpeg;base64,${manipulated.base64}`;
-  };
-
-  const handlePickGallery = async () => {
-    setShowPhotoOptions(false);
-    try {
-      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission requise', 'Veuillez autoriser l\'accès à la galerie.');
-        return;
-      }
-      
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        allowsEditing: true,
-        aspect: [1, 1],
-        quality: 0.8,
-      });
-      
-      if (!result.canceled && result.assets[0]) {
-        setProcessingImage(true);
-        const base64 = await processImage(result.assets[0].uri);
-        setNewAvatarUri(base64);
-        setProcessingImage(false);
-      }
-    } catch (error) {
-      console.error('Gallery pick failed:', error);
-      setProcessingImage(false);
-      Alert.alert('Erreur', 'Impossible de charger l\'image.');
-    }
-  };
-
-  const handleTakePhoto = async () => {
-    setShowPhotoOptions(false);
-    try {
-      const { status } = await ImagePicker.requestCameraPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission requise', 'Veuillez autoriser l\'accès à la caméra.');
-        return;
-      }
-      
-      const result = await ImagePicker.launchCameraAsync({
-        allowsEditing: true,
-        aspect: [1, 1],
-        quality: 0.8,
-      });
-      
-      if (!result.canceled && result.assets[0]) {
-        setProcessingImage(true);
-        const base64 = await processImage(result.assets[0].uri);
-        setNewAvatarUri(base64);
-        setProcessingImage(false);
-      }
-    } catch (error) {
-      console.error('Camera capture failed:', error);
-      setProcessingImage(false);
-      Alert.alert('Erreur', 'Impossible de prendre la photo.');
-    }
-  };
-
-  const handleRemovePhoto = () => {
-    setShowPhotoOptions(false);
-    setNewAvatarUri('');
-  };
-
   const handleEditProfile = () => {
-    setNewDisplayName(displayName);
-    setNewAvatarUri(avatarUri);
-    setProfileError(null);
-    setShowEditProfile(true);
+    navigation.navigate('EditProfile');
   };
 
-  const handleSaveProfile = async () => {
-    const trimmed = newDisplayName.trim();
-    
-    if (!trimmed) {
-      setProfileError('Le pseudo ne peut pas être vide');
-      return;
-    }
-    
-    if (trimmed.length < 2) {
-      setProfileError('Minimum 2 caractères');
-      return;
-    }
-    
-    if (trimmed.length > 30) {
-      setProfileError('Maximum 30 caractères');
-      return;
-    }
-    
-    setSavingProfile(true);
-    try {
-      // Déterminer le nouvel avatar
-      const finalAvatar = newAvatarUri === '' ? null : (newAvatarUri && newAvatarUri !== avatarUri ? newAvatarUri : avatarUri);
-      
-      // 1. Écrire les deux valeurs en parallèle (au lieu de séquentiel)
-      const writes: Promise<void>[] = [setGlobalDisplayName(trimmed)];
-      if (newAvatarUri === '') {
-        writes.push(setGlobalAvatar(null));
-      } else if (newAvatarUri && newAvatarUri !== avatarUri) {
-        writes.push(setGlobalAvatar(newAvatarUri));
-      }
-      await Promise.all(writes);
-      
-      // 2. Mise à jour UI immédiate (avant sync async)
-      setDisplayName(trimmed);
-      setAvatarUri(finalAvatar);
-      setShowEditProfile(false);
-      
-      // 3. Sync sessionService DIRECTEMENT avec les valeurs en mémoire
-      //    (au lieu de syncProfileFromGlobal qui relit tout depuis AsyncStorage)
-      await sessionService.updateMyProfileDirect({
-        displayName: trimmed,
-        avatarBase64: finalAvatar || undefined,
-      });
-    } catch (e) {
-      setProfileError('Erreur lors de la sauvegarde');
-    } finally {
-      setSavingProfile(false);
-    }
-  };
-
-  const handleAvatarPressIn = () => {
-    Animated.spring(avatarScale, { toValue: 0.95, useNativeDriver: true }).start();
-  };
-  
-  const handleAvatarPressOut = () => {
-    Animated.spring(avatarScale, { toValue: 1, useNativeDriver: true }).start();
-  };
-
-  const getAvatarColor = (name: string): string => {
-    if (!name.trim()) return AVATAR_COLORS[0];
-    let hash = 0;
-    for (let i = 0; i < name.length; i++) {
-      hash = ((hash << 5) - hash) + name.charCodeAt(i);
-    }
-    return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
-  };
-
-  const getInitials = (name: string): string => {
-    if (!name.trim()) return '?';
-    const parts = name.trim().split(/\s+/);
-    if (parts.length >= 2) {
-      return (parts[0][0] + parts[1][0]).toUpperCase();
-    }
-    return name.trim().substring(0, 2).toUpperCase();
-  };
-
-  const remainingChars = 30 - newDisplayName.length;
+  // Full-screen loading when clearing data
+  if (clearing) return <SplashScreen statusMessage="Effacement des données…" />;
 
   return (
     <View style={[styles.container, { paddingBottom: insets.bottom }]}>
@@ -375,7 +146,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
       >
-        {/* ========== PROFIL - Row compacte ========== */}
+        {/* ========== PROFIL ========== */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>PROFIL</Text>
           
@@ -391,7 +162,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
                 size="large"
               />
               <View style={styles.profileAvatarBadge}>
-                <Text style={styles.profileAvatarBadgeIcon}>✎</Text>
+                <Ionicons name="camera" size={11} color="#FFFFFF" />
               </View>
             </View>
             
@@ -399,10 +170,10 @@ export function SettingsScreen({ onSecurityChange }: Props) {
               <Text style={styles.profileName} numberOfLines={1}>
                 {displayName || 'Définir un pseudo'}
               </Text>
-              <Text style={styles.profileHint}>Nom et photo de profil</Text>
+              <Text style={styles.profileHint}>Appuyez pour modifier</Text>
             </View>
             
-            <Text style={styles.chevron}>›</Text>
+            <Ionicons name="chevron-forward" size={18} color={theme.colors.textMuted} />
           </TouchableOpacity>
         </View>
 
@@ -415,8 +186,8 @@ export function SettingsScreen({ onSecurityChange }: Props) {
             onPress={() => navigation.navigate('Security')}
             activeOpacity={0.7}
           >
-            <View style={[styles.settingIcon, { backgroundColor: theme.colors.primary + '20' }]}>
-              <Text style={styles.iconEmoji}>🔐</Text>
+            <View style={[styles.settingIcon, { backgroundColor: theme.colors.primary + '15' }]}>
+              <Ionicons name="lock-closed" size={20} color={theme.colors.primary} />
             </View>
             <View style={styles.settingContent}>
               <Text style={styles.settingLabel}>Verrouillage de l'app</Text>
@@ -428,15 +199,37 @@ export function SettingsScreen({ onSecurityChange }: Props) {
               styles.statusBadge,
               lockEnabled ? styles.statusActive : styles.statusInactive
             ]}>
-              <Text style={[
-                styles.statusText,
-                lockEnabled ? styles.statusTextActive : styles.statusTextInactive
-              ]}>
-                {lockEnabled ? 'ON' : 'OFF'}
+              <Ionicons 
+                name={lockEnabled ? 'shield-checkmark' : 'shield-outline'} 
+                size={14} 
+                color={lockEnabled ? theme.colors.success : theme.colors.textMuted} 
+              />
+            </View>
+            <Ionicons name="chevron-forward" size={18} color={theme.colors.textMuted} />
+          </TouchableOpacity>
+        </View>
+
+        {/* Confidentialité */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>NOTIFICATIONS</Text>
+          
+          <View style={styles.settingRow}>
+            <View style={[styles.settingIcon, { backgroundColor: theme.colors.primary + '15' }]}>
+              <Ionicons name="notifications" size={20} color={theme.colors.primary} />
+            </View>
+            <View style={[styles.settingContent, { flex: 1 }]}>
+              <Text style={styles.settingLabel}>Notifications push</Text>
+              <Text style={[styles.settingValue, { fontSize: 12, marginTop: 2, lineHeight: 16 }]}>
+                Un signal vide transite par Google/Apple — aucun contenu n'est exposé.
               </Text>
             </View>
-            <Text style={styles.chevron}>›</Text>
-          </TouchableOpacity>
+            <Switch
+              value={pushNotifEnabled}
+              onValueChange={handleTogglePush}
+              trackColor={{ false: '#333', true: theme.colors.primary + '60' }}
+              thumbColor={pushNotifEnabled ? theme.colors.primary : '#888'}
+            />
+          </View>
         </View>
 
         {/* Confidentialité */}
@@ -446,7 +239,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
           <View style={styles.privacyCard}>
             <View style={styles.privacyRow}>
               <View style={[styles.checkIcon, styles.checkIconActive]}>
-                <Text style={styles.checkText}>✓</Text>
+                <Ionicons name="checkmark" size={16} color={theme.colors.success} />
               </View>
               <View style={styles.privacyContent}>
                 <Text style={styles.privacyLabel}>Chiffré sur votre appareil</Text>
@@ -456,7 +249,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
             
             <View style={styles.privacyRow}>
               <View style={[styles.checkIcon, styles.checkIconActive]}>
-                <Text style={styles.checkText}>✓</Text>
+                <Ionicons name="checkmark" size={16} color={theme.colors.success} />
               </View>
               <View style={styles.privacyContent}>
                 <Text style={styles.privacyLabel}>Clés locales</Text>
@@ -466,7 +259,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
             
             <View style={styles.privacyRow}>
               <View style={[styles.checkIcon, styles.checkIconActive]}>
-                <Text style={styles.checkText}>✓</Text>
+                <Ionicons name="checkmark" size={16} color={theme.colors.success} />
               </View>
               <View style={styles.privacyContent}>
                 <Text style={styles.privacyLabel}>Protection renforcée</Text>
@@ -479,9 +272,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
                 styles.checkIcon, 
                 relayEnabled ? styles.checkIconActive : styles.checkIconInactive
               ]}>
-                <Text style={[styles.checkText, !relayEnabled && styles.checkTextInactive]}>
-                  {relayEnabled ? '✓' : '○'}
-                </Text>
+                <Ionicons name={relayEnabled ? 'checkmark' : 'ellipse-outline'} size={16} color={relayEnabled ? theme.colors.success : theme.colors.textMuted} />
               </View>
               <View style={styles.privacyContent}>
                 <Text style={[styles.privacyLabel, !relayEnabled && styles.privacyLabelInactive]}>
@@ -504,6 +295,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
 
 
 
+
         {/* Zone de danger */}
         <View style={styles.section}>
           <Text style={[styles.sectionTitle, styles.dangerSectionTitle]}>ZONE DE DANGER</Text>
@@ -514,7 +306,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
             activeOpacity={0.7}
           >
             <View style={[styles.settingIcon, styles.dangerIcon]}>
-              <Text style={styles.iconEmoji}>🗑️</Text>
+              <Ionicons name="trash-outline" size={20} color={theme.colors.danger} />
             </View>
             <View style={styles.settingContent}>
               <Text style={styles.dangerLabel}>Effacer toutes les données</Text>
@@ -522,7 +314,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
                 Supprime définitivement conversations et messages
               </Text>
             </View>
-            <Text style={styles.chevron}>›</Text>
+            <Ionicons name="chevron-forward" size={18} color={theme.colors.danger + '60'} />
           </TouchableOpacity>
         </View>
 
@@ -535,230 +327,16 @@ export function SettingsScreen({ onSecurityChange }: Props) {
             />
             <View style={styles.aboutTextContainer}>
               <Text style={styles.aboutTitle}>Ghostr</Text>
-              <Text style={styles.aboutTagline}>Messagerie privée</Text>
             </View>
             <View style={styles.versionBadge}>
-              <Text style={styles.versionText}>v4.0</Text>
+              <Text style={styles.versionText}>v5.0</Text>
             </View>
           </View>
           <Text style={styles.aboutCopyright}>
-            Vos conversations, votre vie privée
+            Triple Ratchet · X25519 · ML-KEM-768
           </Text>
         </View>
       </ScrollView>
-
-      {/* ========== BOTTOM SHEET - Édition du profil ========== */}
-      <Modal
-        visible={showEditProfile}
-        transparent
-        animationType="none"
-        statusBarTranslucent
-        onRequestClose={() => setShowEditProfile(false)}
-      >
-        <KeyboardAvoidingView 
-          style={styles.modalContainer}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
-        >
-          <Animated.View style={[styles.modalOverlay, { opacity: fadeAnim }]}>
-            <Pressable 
-              style={StyleSheet.absoluteFill} 
-              onPress={() => setShowEditProfile(false)} 
-            />
-          </Animated.View>
-
-          <Animated.View
-            style={[
-              styles.bottomSheet,
-              {
-                transform: [{ translateY: slideAnim }],
-                paddingBottom: Math.max(insets.bottom, 16),
-              },
-            ]}
-          >
-            <View style={styles.bottomSheetHandle} />
-            
-            <View style={styles.bottomSheetHeader}>
-              <Text style={styles.bottomSheetTitle}>Modifier le profil</Text>
-            </View>
-            
-            {/* Avatar + Input en ligne */}
-            <View style={styles.editProfileContent}>
-              <TouchableOpacity
-                onPress={() => setShowPhotoOptions(true)}
-                onPressIn={handleAvatarPressIn}
-                onPressOut={handleAvatarPressOut}
-                activeOpacity={1}
-                disabled={processingImage}
-              >
-                <Animated.View style={[
-                  styles.editAvatarWrapper,
-                  { transform: [{ scale: avatarScale }] }
-                ]}>
-                  {processingImage ? (
-                    <View style={[styles.editAvatar, styles.editAvatarLoading]}>
-                      <ActivityIndicator size="small" color={theme.colors.primary} />
-                    </View>
-                  ) : newAvatarUri && newAvatarUri !== '' ? (
-                    <Image source={{ uri: newAvatarUri }} style={styles.editAvatar} />
-                  ) : (
-                    <View 
-                      style={[
-                        styles.editAvatar, 
-                        styles.editAvatarPlaceholder,
-                        { backgroundColor: getAvatarColor(newDisplayName) }
-                      ]}
-                    >
-                      <Text style={styles.editAvatarInitials}>
-                        {getInitials(newDisplayName)}
-                      </Text>
-                    </View>
-                  )}
-                  <View style={styles.editAvatarBadge}>
-                    <Text style={styles.editAvatarBadgeIcon}>📷</Text>
-                  </View>
-                </Animated.View>
-              </TouchableOpacity>
-              
-              <View style={styles.editInputSection}>
-                <View style={[
-                  styles.editInputWrapper,
-                  inputFocused && styles.editInputWrapperFocused,
-                  profileError && styles.editInputWrapperError,
-                ]}>
-                  <TextInput
-                    style={styles.editInput}
-                    value={newDisplayName}
-                    onChangeText={(text) => {
-                      setNewDisplayName(text);
-                      setProfileError(null);
-                    }}
-                    placeholder="Votre pseudo"
-                    placeholderTextColor={theme.colors.placeholder}
-                    maxLength={30}
-                    returnKeyType="done"
-                    blurOnSubmit
-                    onFocus={() => setInputFocused(true)}
-                    onBlur={() => setInputFocused(false)}
-                    autoCorrect={false}
-                  />
-                  <Text style={[
-                    styles.editInputCounter,
-                    remainingChars <= 5 && styles.editInputCounterWarning,
-                  ]}>
-                    {remainingChars}
-                  </Text>
-                </View>
-                {profileError && (
-                  <Text style={styles.editError}>{profileError}</Text>
-                )}
-              </View>
-            </View>
-            
-            {/* Actions */}
-            <View style={styles.bottomSheetActions}>
-              <TouchableOpacity
-                style={styles.cancelButton}
-                onPress={() => setShowEditProfile(false)}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.cancelButtonText}>Annuler</Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity
-                style={[
-                  styles.saveButton,
-                  (savingProfile || processingImage || !newDisplayName.trim()) && styles.saveButtonDisabled
-                ]}
-                onPress={handleSaveProfile}
-                disabled={savingProfile || processingImage || !newDisplayName.trim()}
-                activeOpacity={0.7}
-              >
-                {savingProfile ? (
-                  <ActivityIndicator size="small" color="#FFFFFF" />
-                ) : (
-                  <Text style={styles.saveButtonText}>Enregistrer</Text>
-                )}
-              </TouchableOpacity>
-            </View>
-          </Animated.View>
-        </KeyboardAvoidingView>
-      </Modal>
-
-      {/* ========== ACTION SHEET - Options photo ========== */}
-      <Modal
-        visible={showPhotoOptions}
-        transparent
-        animationType="none"
-        statusBarTranslucent
-        onRequestClose={() => setShowPhotoOptions(false)}
-      >
-        <View style={styles.modalContainer}>
-          <Animated.View style={[styles.modalOverlay, { opacity: photoOptionsFade }]}>
-            <Pressable 
-              style={StyleSheet.absoluteFill} 
-              onPress={() => setShowPhotoOptions(false)} 
-            />
-          </Animated.View>
-
-          <Animated.View
-            style={[
-              styles.actionSheet,
-              {
-                transform: [{ translateY: photoOptionsSlide }],
-                paddingBottom: Math.max(insets.bottom, 16),
-              },
-            ]}
-          >
-            <View style={styles.bottomSheetHandle} />
-            
-            <View style={styles.photoOptionsGrid}>
-              <TouchableOpacity
-                style={styles.photoOptionItem}
-                onPress={handleTakePhoto}
-                activeOpacity={0.7}
-              >
-                <View style={[styles.photoOptionIcon, { backgroundColor: theme.colors.primary + '20' }]}>
-                  <Text style={styles.photoOptionEmoji}>📷</Text>
-                </View>
-                <Text style={styles.photoOptionLabel}>Caméra</Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity
-                style={styles.photoOptionItem}
-                onPress={handlePickGallery}
-                activeOpacity={0.7}
-              >
-                <View style={[styles.photoOptionIcon, { backgroundColor: '#BB8FCE20' }]}>
-                  <Text style={styles.photoOptionEmoji}>🖼️</Text>
-                </View>
-                <Text style={styles.photoOptionLabel}>Galerie</Text>
-              </TouchableOpacity>
-              
-              {(newAvatarUri || avatarUri) && newAvatarUri !== '' && (
-                <TouchableOpacity
-                  style={styles.photoOptionItem}
-                  onPress={handleRemovePhoto}
-                  activeOpacity={0.7}
-                >
-                  <View style={[styles.photoOptionIcon, { backgroundColor: theme.colors.danger + '20' }]}>
-                    <Text style={styles.photoOptionEmoji}>🗑️</Text>
-                  </View>
-                  <Text style={[styles.photoOptionLabel, { color: theme.colors.danger }]}>Supprimer</Text>
-                </TouchableOpacity>
-              )}
-            </View>
-            
-            <TouchableOpacity
-              style={styles.actionSheetCancel}
-              onPress={() => setShowPhotoOptions(false)}
-              activeOpacity={0.7}
-            >
-              <Text style={styles.actionSheetCancelText}>Annuler</Text>
-            </TouchableOpacity>
-          </Animated.View>
-        </View>
-      </Modal>
 
       {/* Modal de confirmation effacement */}
       <AlertModal
@@ -766,7 +344,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
         onClose={() => setShowClearConfirm(false)}
         title="Effacer toutes les données"
         message="Cette action supprimera définitivement toutes vos conversations et messages. Cette action est irréversible."
-        icon={<Text style={{ fontSize: 48 }}>⚠️</Text>}
+        icon={<Ionicons name="warning" size={48} color={theme.colors.warning} />}
         primaryButton={{
           title: 'Effacer tout',
           onPress: handleClearData,
@@ -803,7 +381,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: theme.colors.surface,
     borderRadius: 16,
-    padding: 12,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
   },
   profileAvatarContainer: {
     position: 'relative',
@@ -811,20 +391,16 @@ const styles = StyleSheet.create({
   },
   profileAvatarBadge: {
     position: 'absolute',
-    bottom: -2,
-    right: -2,
-    width: 22,
-    height: 22,
-    borderRadius: 11,
+    bottom: -1,
+    right: -1,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
     backgroundColor: theme.colors.primary,
     alignItems: 'center',
     justifyContent: 'center',
-    borderWidth: 2,
+    borderWidth: 2.5,
     borderColor: theme.colors.surface,
-  },
-  profileAvatarBadgeIcon: {
-    fontSize: 10,
-    color: '#FFFFFF',
   },
   profileContent: {
     flex: 1,
@@ -862,6 +438,7 @@ const styles = StyleSheet.create({
   settingRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
     backgroundColor: theme.colors.surface,
     borderRadius: 16,
     padding: 16,
@@ -894,6 +471,28 @@ const styles = StyleSheet.create({
     fontSize: 24,
     color: theme.colors.textMuted,
     marginLeft: 8,
+  },
+  // Notification settings extras
+  settingRowLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    gap: 12,
+  },
+  settingIconWrap: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  settingTextWrap: {
+    flex: 1,
+  },
+  settingDesc: {
+    fontSize: 12,
+    color: theme.colors.textMuted,
+    marginTop: 2,
   },
   
   // Status Badge
@@ -1073,8 +672,9 @@ const styles = StyleSheet.create({
     letterSpacing: -0.3,
   },
   aboutTagline: {
-    fontSize: 14,
-    color: theme.colors.textSecondary,
+    fontSize: 13,
+    color: theme.colors.primary,
+    fontWeight: '500',
     marginTop: 2,
   },
   versionBadge: {
@@ -1089,222 +689,13 @@ const styles = StyleSheet.create({
     color: theme.colors.primary,
   },
   aboutCopyright: {
-    fontSize: 13,
+    fontSize: 11,
     color: theme.colors.textMuted,
     textAlign: 'center',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    letterSpacing: 0.3,
   },
   
-  // ============================================
-  // MODAL & BOTTOM SHEET
-  // ============================================
-  modalContainer: {
-    flex: 1,
-    justifyContent: 'flex-end',
-  },
-  modalOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
-  },
-  bottomSheet: {
-    backgroundColor: theme.colors.background,
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-  },
-  bottomSheetHandle: {
-    width: 36,
-    height: 4,
-    backgroundColor: theme.colors.borderLight,
-    borderRadius: 2,
-    alignSelf: 'center',
-    marginTop: 10,
-    marginBottom: 6,
-  },
-  bottomSheetHeader: {
-    paddingHorizontal: 20,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: theme.colors.divider,
-  },
-  bottomSheetTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: theme.colors.text,
-    textAlign: 'center',
-  },
-  
-  // ============================================
-  // EDIT PROFILE - Compact Layout
-  // ============================================
-  editProfileContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: 20,
-    gap: 16,
-  },
-  editAvatarWrapper: {
-    position: 'relative',
-  },
-  editAvatar: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-  },
-  editAvatarPlaceholder: {
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  editAvatarLoading: {
-    backgroundColor: theme.colors.surfaceLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  editAvatarInitials: {
-    fontSize: 26,
-    fontWeight: '600',
-    color: '#FFFFFF',
-  },
-  editAvatarBadge: {
-    position: 'absolute',
-    bottom: -2,
-    right: -2,
-    width: 26,
-    height: 26,
-    borderRadius: 13,
-    backgroundColor: theme.colors.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 2,
-    borderColor: theme.colors.background,
-  },
-  editAvatarBadgeIcon: {
-    fontSize: 12,
-  },
-  editInputSection: {
-    flex: 1,
-  },
-  editInputWrapper: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: theme.colors.inputBackground,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    borderColor: theme.colors.inputBorder,
-    paddingHorizontal: 14,
-  },
-  editInputWrapperFocused: {
-    borderColor: theme.colors.primary,
-  },
-  editInputWrapperError: {
-    borderColor: theme.colors.danger,
-  },
-  editInput: {
-    flex: 1,
-    paddingVertical: 12,
-    fontSize: 16,
-    color: theme.colors.text,
-  },
-  editInputCounter: {
-    fontSize: 12,
-    color: theme.colors.textMuted,
-    marginLeft: 8,
-  },
-  editInputCounterWarning: {
-    color: theme.colors.warning,
-  },
-  editError: {
-    fontSize: 12,
-    color: theme.colors.danger,
-    marginTop: 6,
-    marginLeft: 4,
-  },
-  
-  // ============================================
-  // BOTTOM SHEET ACTIONS
-  // ============================================
-  bottomSheetActions: {
-    flexDirection: 'row',
-    paddingHorizontal: 20,
-    paddingBottom: 8,
-    gap: 12,
-  },
-  cancelButton: {
-    flex: 1,
-    height: 48,
-    backgroundColor: theme.colors.surfaceLight,
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  cancelButtonText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: theme.colors.text,
-  },
-  saveButton: {
-    flex: 1,
-    height: 48,
-    backgroundColor: theme.colors.primary,
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  saveButtonDisabled: {
-    opacity: 0.5,
-  },
-  saveButtonText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#FFFFFF',
-  },
-  
-  // ============================================
-  // ACTION SHEET - Photo Options Grid
-  // ============================================
-  actionSheet: {
-    backgroundColor: theme.colors.background,
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-  },
-  photoOptionsGrid: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    paddingVertical: 20,
-    paddingHorizontal: 16,
-    gap: 24,
-  },
-  photoOptionItem: {
-    alignItems: 'center',
-    gap: 8,
-  },
-  photoOptionIcon: {
-    width: 56,
-    height: 56,
-    borderRadius: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  photoOptionEmoji: {
-    fontSize: 24,
-  },
-  photoOptionLabel: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: theme.colors.text,
-  },
-  actionSheetCancel: {
-    marginHorizontal: 16,
-    marginBottom: 8,
-    height: 48,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: theme.colors.surface,
-    borderRadius: 12,
-  },
-  actionSheetCancelText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: theme.colors.textSecondary,
-  },
 });
 
 export default SettingsScreen;

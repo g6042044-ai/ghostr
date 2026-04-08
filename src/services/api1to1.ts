@@ -24,6 +24,7 @@ import {
 } from './tripleRatchet';
 import { LocalMessage } from './storage';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { AppState } from 'react-native';
 import { getRandomBytes } from './crypto';
 import { encryptIfEnabled, decryptIfNeeded, isEncryptionEnabled } from './localCrypto';
 import { sendSingleDecoy, sendSingleDecoyMediumTier, generateSizedPayload } from './decoyService';
@@ -43,10 +44,20 @@ import { startConstantTraffic, stopConstantTraffic, enqueueMessage, getPollGener
 // Audit Fix C-01: Sealed Sender
 import { isSealedSenderReady, createSealedSenderEnvelope, bootstrapSealedSender, invalidateSenderCertificate, SenderCertificate } from './sealedSender';
 import { secureRpc } from './relayTransport';
+// Push Notifications — Sender-Side Architecture
+import {
+  createPushBlobForPeer,
+  generateRandomPushBlob,
+  getOwnPushTokenInfo,
+  storePeerPushToken,
+  isPushEnabled,
+} from './pushNotificationService';
 // v20.0: SHA-256 pour le tag de session (remplace XOR faible)
 import { sha256 } from '@noble/hashes/sha256';
 import * as Crypto from 'expo-crypto';
-import { externalizeMedia, migrateMessagesToFileStore, clearAllMediaFiles } from './mediaFileStore';
+import { externalizeMedia, migrateMessagesToFileStore, clearAllMediaFiles, deleteSessionMedia, resolveMediaToBase64, isMediaRef } from './mediaFileStore';
+// P7 FIX: Import blob upload for media retry
+import { encryptAndUploadBlob, base64ToUint8Array } from './encryptedBlobService';
 // PHASE 1: Epoch tags (rotation 5min) — legacy
 // ACTION 3: Tags directionnels asymétriques avec rotation 24h
 import {
@@ -130,13 +141,76 @@ export type MessageType =
   | 'call_signal'  // v5.0: Signaux d'appel vocal
   | 'call'         // v7.0: Message "Appel terminé"
   | 'handshake_ack'    // Accusé de réception du handshake
-  | 'media_chunk';     // v25.0: Legacy — réception uniquement (backward compat)
+  | 'media_chunk'      // v25.0: Legacy — réception uniquement (backward compat)
+  | 'session_reset'    // P1-A3: Force une réinitialisation PQXDH de la session
+  | 'push_token_update'; // v2.0: Partage du push token via E2E
 
 // v20.0: Types de messages de protocole à ne jamais afficher dans l'UI
 const PROTOCOL_MESSAGE_TYPES: MessageType[] = [
   'handshake_ack',
-  'media_chunk', // v25.0: Chunks intermédiaires masqués — seul le média assemblé est affiché
+  'media_chunk',
+  'session_reset',
+  'push_token_update', // Invisible dans l'UI
 ];
+
+// ============================================
+// PUSH NOTIFICATION — Sender-Side Architecture
+// ============================================
+// Chaque send_sealed_message inclut un p_push_blob.
+// Le type (msg/call) est chiffré DANS le blob → invisible au Gateway.
+
+/** Détermine si un payload est un appel entrant (offer) */
+function isCallOffer(innerPayload: InnerPayload): boolean {
+  return innerPayload.type === 'call_signal' && innerPayload.callSignalType === 'offer';
+}
+
+/**
+ * Détermine si un payload est un signal de TERMINAISON d'appel
+ * (hangup, decline, busy). Ces signaux nécessitent un push data-only
+ * silencieux (is_call_cancel / t:'h') pour stopper la sonnerie côté
+ * destinataire sans afficher "Nouveau message".
+ */
+function isCallTermination(innerPayload: InnerPayload): boolean {
+  return innerPayload.type === 'call_signal'
+    && (innerPayload.callSignalType === 'hangup'
+      || innerPayload.callSignalType === 'decline'
+      || innerPayload.callSignalType === 'busy');
+}
+
+/**
+ * Détermine si un payload est un signal d'appel qui ne nécessite AUCUN push.
+ *
+ * • crypto : envoyé AVANT l'offer — sera récupéré par le polling déclenché
+ *   par le push t:'c' de l'offer. Si on envoie un push t:'h' pour crypto,
+ *   il peut arriver APRÈS le push t:'c' de l'offer et tuer la notification
+ *   d'appel entrant (stopRinging race condition).
+ *
+ * • answer : envoyé par le receveur → l'appelant est en foreground
+ *   (écran d'appel sortant) et poll activement. Pas besoin de push.
+ *
+ * Ces signaux utilisent un blob aléatoire → aucun push envoyé.
+ * Le Gateway voit un blob de taille identique → pas de side channel.
+ */
+function isCallSignalNoPush(innerPayload: InnerPayload): boolean {
+  return innerPayload.type === 'call_signal'
+    && (innerPayload.callSignalType === 'crypto'
+      || innerPayload.callSignalType === 'answer');
+}
+
+/**
+ * Détermine si un payload est un message "Appel terminé" avec un statut
+ * d'appel manqué ou annulé. Le Push Proxy utilisera ce flag pour afficher
+ * "Appel manqué" au lieu de "Nouveau message" dans la notification.
+ *
+ * SÉCURITÉ: Aucune fuite de métadonnée — le Push Proxy sait déjà qu'un
+ * appel a eu lieu (il a vu is_call pour l'offer et is_call_cancel pour
+ * le hangup). "Appel manqué" est un texte 100% générique sans nom
+ * d'appelant. Le nom n'apparaît qu'après déchiffrement E2E côté client.
+ */
+function isMissedCallMessage(innerPayload: InnerPayload): boolean {
+  return innerPayload.type === 'call'
+    && (innerPayload.callStatus === 'missed' || innerPayload.callStatus === 'cancelled');
+}
 
 export interface Message1to1 {
   id: string;
@@ -391,11 +465,17 @@ const avatarHashCache = new Map<string, string>();
 
 /** Calcule un hash court de l'avatar pour comparaison rapide */
 function computeAvatarHash(avatarBase64: string): string {
-  // Utilise les 32 premiers + 32 derniers chars + longueur comme fingerprint rapide
-  // Pas besoin de SHA-256 complet: c'est juste pour détecter les changements
-  const len = avatarBase64.length;
-  if (len < 64) return avatarBase64;
-  return `${len}:${avatarBase64.slice(0, 32)}:${avatarBase64.slice(-32)}`;
+  // SECURITY FIX P3: Remplace le fingerprint non-cryptographique (longueur + 32 premiers
+  // + 32 derniers chars) par SHA-256 tronqué à 64 bits (16 hex chars).
+  //
+  // L'ancienne implémentation avait des faux-positifs : deux avatars différents mais
+  // de même longueur et mêmes extrémités étaient considérés identiques → l'avatar mis
+  // à jour n'était pas retransmis au contact. Impact : bug UX silencieux.
+  const bytes = new TextEncoder().encode(avatarBase64);
+  const hash = sha256(bytes);
+  return Array.from(hash.slice(0, 8))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 /**
@@ -463,6 +543,16 @@ function clearAvatarHashCache(): void {
   avatarHashCache.clear();
 }
 
+/** Invalide le cache avatar pour forcer la retransmission à TOUS les contacts.
+ *  Appelé quand l'utilisateur change son avatar dans les paramètres.
+ *  Chaque session recevra l'avatar au prochain message envoyé.
+ */
+export function invalidateAvatarCacheForAllSessions(): void {
+  const count = avatarHashCache.size;
+  avatarHashCache.clear();
+  __DEV__ && console.log(`[api1to1] 🖼️ Avatar cache invalidated for ${count} sessions — avatar will be retransmitted`);
+}
+
 // ============================================
 // UTILITAIRES
 // ============================================
@@ -528,12 +618,25 @@ const recentlySentIds = new Set<string>();
 const inFlightOrProcessedIds = new Set<string>();
 
 async function getProcessedIds(sessionId: string): Promise<Set<string>> {
+  // PERF A9: Cache mémoire des processedIds.
+  // Avant: chaque poll lisait AsyncStorage pour CHAQUE session (N reads × 5ms = 50-500ms).
+  // Après: lecture depuis le cache mémoire (0ms), chargement depuis AsyncStorage
+  // uniquement au premier accès par session. Persistance asynchrone debounced.
+  if (_processedIdsCache.has(sessionId)) {
+    const cached = new Set(_processedIdsCache.get(sessionId)!);
+    for (const id of recentlySentIds) cached.add(id);
+    return cached;
+  }
+  
+  // Premier accès : charger depuis AsyncStorage et remplir le cache
   try {
     const key = PROCESSED_IDS_PREFIX + sessionId;
     const stored = await secureGet(key);
     const ids = stored ? new Set(JSON.parse(stored) as string[]) : new Set<string>();
     // Fusionner le cache mémoire synchrone
     for (const id of recentlySentIds) ids.add(id);
+    // Remplir le cache
+    _processedIdsCache.set(sessionId, new Set(ids));
     return ids;
   } catch {
     return new Set(recentlySentIds);
@@ -555,19 +658,63 @@ async function markIdAsProcessed(sessionId: string, messageId: string): Promise<
     if (first) inFlightOrProcessedIds.delete(first);
   }
   
-  try {
-    const key = PROCESSED_IDS_PREFIX + sessionId;
-    const ids = await getProcessedIds(sessionId);
-    ids.add(messageId);
-    
-    const idsArray = Array.from(ids);
-    if (idsArray.length > 1000) {
-      idsArray.splice(0, idsArray.length - 1000);
+  // PERF A9: Mettre à jour le cache mémoire immédiatement
+  if (!_processedIdsCache.has(sessionId)) {
+    _processedIdsCache.set(sessionId, new Set<string>());
+  }
+  _processedIdsCache.get(sessionId)!.add(messageId);
+  
+  // Limiter la taille du cache par session
+  const cachedSet = _processedIdsCache.get(sessionId)!;
+  if (cachedSet.size > 1000) {
+    const iter = cachedSet.values();
+    for (let i = 0; i < cachedSet.size - 1000; i++) {
+      const val = iter.next().value;
+      if (val) cachedSet.delete(val);
     }
-    
-    await secureSet(key, JSON.stringify(idsArray));
-  } catch (error) {
-    console.error('[api1to1] Error marking ID as processed:', error);
+  }
+  
+  // PERF A9: Persister de façon asynchrone avec debounce (500ms).
+  // Sans debounce, un burst de 50 messages causerait 50 écritures AsyncStorage.
+  // Avec debounce, un seul write regroupe tous les IDs ajoutés dans la fenêtre.
+  _scheduleProcessedIdsPersist(sessionId);
+}
+
+// ── PERF A9: Cache mémoire et persistance debounced des processedIds ──
+
+const _processedIdsCache = new Map<string, Set<string>>();
+const _processedIdsPersistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function _scheduleProcessedIdsPersist(sessionId: string): void {
+  // Annuler le timer précédent pour cette session (debounce)
+  const existing = _processedIdsPersistTimers.get(sessionId);
+  if (existing) clearTimeout(existing);
+  
+  _processedIdsPersistTimers.set(sessionId, setTimeout(async () => {
+    _processedIdsPersistTimers.delete(sessionId);
+    try {
+      const cached = _processedIdsCache.get(sessionId);
+      if (!cached) return;
+      const idsArray = Array.from(cached);
+      // Tronquer à 1000 max pour le stockage
+      const toStore = idsArray.length > 1000 ? idsArray.slice(idsArray.length - 1000) : idsArray;
+      const key = PROCESSED_IDS_PREFIX + sessionId;
+      await secureSet(key, JSON.stringify(toStore));
+    } catch (error) {
+      __DEV__ && console.error('[api1to1] Error persisting processed IDs:', error);
+    }
+  }, 500));
+}
+
+/**
+ * PERF A9: Vide le cache des processedIds pour une session (appelé lors de la suppression).
+ */
+function _clearProcessedIdsCache(sessionId: string): void {
+  _processedIdsCache.delete(sessionId);
+  const timer = _processedIdsPersistTimers.get(sessionId);
+  if (timer) {
+    clearTimeout(timer);
+    _processedIdsPersistTimers.delete(sessionId);
   }
 }
 
@@ -604,7 +751,7 @@ async function setMessageStatus(
     
     await secureSet(key, JSON.stringify(entries));
   } catch (error) {
-    console.error('[api1to1] Error setting message status:', error);
+    __DEV__ && console.error('[api1to1] Error setting message status:', error);
   }
 }
 
@@ -623,21 +770,42 @@ async function sendInnerPayload(
     
     // FIX 0.5: Vérifier le cert pinning avant tout envoi réseau
     try { requirePinningOrThrow(); } catch (e: any) {
-      console.error('[api1to1] 🚨 SECURITY:', e.message);
+      __DEV__ && console.error('[api1to1] 🚨 SECURITY:', e.message);
       return { success: false, error: e.message };
     }
     
     const session = sessionService.getSession(sessionId);
     if (!session) {
-      console.error('[api1to1] ❌ Session not found:', sessionId.slice(0, 12) + '...');
+      __DEV__ && console.error('[api1to1] ❌ Session not found:', sessionId.slice(0, 12) + '...');
       return { success: false, error: 'Session not found' };
     }
     __DEV__ && console.log('[api1to1] ✅ Session found');
     
     // v25.1: Strip avatar sauf si changé (économise ~18KB par message)
-    const wirePayload = stripAvatarForWire(sessionId, innerPayload);
-    const payloadJson = JSON.stringify(wirePayload);
+    let wirePayload = stripAvatarForWire(sessionId, innerPayload);
+    let payloadJson = JSON.stringify(wirePayload);
     __DEV__ && console.log('[api1to1] Payload JSON size:', payloadJson.length, 'bytes');
+    
+    // =========================================================
+    // v27.2: AVATAR SIZE GUARD — Empêcher le saut de tier 8KB → 64KB
+    //
+    // Si le payload avec avatar dépasse 7.5KB (seuil du tier 8KB),
+    // on strip l'avatar et on invalide le cache pour cette session.
+    // L'avatar sera retransmis au prochain message léger (texte court).
+    //
+    // SANS CE GUARD: un avatar de 10KB+ fait sauter le message au tier
+    // 64KB → 88KB chiffré → 130KB sealed. Ce message 65× plus gros
+    // qu'un texte normal peut timeout ou échouer silencieusement.
+    // =========================================================
+    const AVATAR_SAFE_THRESHOLD = 7680; // 7.5KB — laisse marge pour le tier 8KB
+    if (payloadJson.length > AVATAR_SAFE_THRESHOLD && wirePayload.senderAvatarBase64) {
+      __DEV__ && console.warn(`[api1to1] ⚠️ Payload with avatar too large (${payloadJson.length}B > ${AVATAR_SAFE_THRESHOLD}B), stripping avatar to stay in 8KB tier`);
+      // Invalider le cache pour cette session → l'avatar sera retransmis au prochain message léger
+      avatarHashCache.delete(sessionId);
+      wirePayload = { ...wirePayload, senderAvatarBase64: undefined };
+      payloadJson = JSON.stringify(wirePayload);
+      __DEV__ && console.log('[api1to1] Payload after avatar strip:', payloadJson.length, 'bytes');
+    }
     
     // =========================================================
     // v26.0: PLUS DE CHUNKING
@@ -655,7 +823,7 @@ async function sendInnerPayload(
     // Guard de sécurité: rejeter les payloads > 32KB (ne devrait pas arriver)
     // =========================================================
     if (payloadJson.length > 32768) {
-      console.error(`[api1to1] ❌ Payload too large for message channel: ${Math.round(payloadJson.length / 1024)}KB. Use blob storage for media.`);
+      __DEV__ && console.error(`[api1to1] ❌ Payload too large for message channel: ${Math.round(payloadJson.length / 1024)}KB. Use blob storage for media.`);
       return { success: false, messageId: innerPayload.messageId, error: 'Payload too large — media should use blob storage' };
     }
     
@@ -666,7 +834,7 @@ async function sendInnerPayload(
     return await sendSingleChunk(sessionId, wirePayload, session, priority);
     
   } catch (error) {
-    console.error('[api1to1] ❌ sendInnerPayload EXCEPTION:', error);
+    __DEV__ && console.error('[api1to1] ❌ sendInnerPayload EXCEPTION:', error);
     // v25.1: Invalider le cache avatar pour cette session
     // Si c'était le premier envoi (avatar inclus), le destinataire ne l'a pas reçu.
     // Le retry doit re-inclure l'avatar.
@@ -736,10 +904,13 @@ async function prepareChunkRpcFunction(
     
     // Retourner la fonction RPC SANS l'exécuter
     return async () => {
+      // Push blob: chiffré pour le Push Proxy, ou aléatoire si pas de token pair
+      const pushBlob = await createPushBlobForPeer(sessionId, false);
       const result = await secureRpc('send_sealed_message', {
         p_tag: envelope.tag,
         p_sealed_content: envelope.sealedContent,
         p_version: envelope.version,
+        p_push_blob: pushBlob,
       });
       if (result.data?.[0]?.id) {
         recentlySentIds.add(result.data[0].id);
@@ -749,7 +920,7 @@ async function prepareChunkRpcFunction(
     };
     
   } catch (error) {
-    console.error('[api1to1] ❌ prepareChunkRpcFunction error:', error);
+    __DEV__ && console.error('[api1to1] ❌ prepareChunkRpcFunction error:', error);
     return null;
   }
 }
@@ -784,6 +955,9 @@ async function sendSingleChunk(
     
     const payloadWithHint = { ...innerPayload, _senderHint };
     const payloadJsonWithHint = JSON.stringify(payloadWithHint);
+    
+    // DIAGNOSTIC: Log the exact send tag + fingerprints to compare with receive tags on other device
+    __DEV__ && console.log(`[api1to1] 🔍 DIAG SEND tag: ${tag.slice(0, 16)}... | myFP: ${session.myIdentityKeyFingerprint} | theirFP: ${session.theirIdentityKeyFingerprint}`);
     
     // ACTION 18: Padding UNIFORME
     const paddedPayload = addUniformPadding(payloadJsonWithHint);
@@ -820,10 +994,40 @@ async function sendSingleChunk(
     const envelope = createSealedSenderEnvelope(tag, sealedPayloadStr);
     
     const wrappedSendRpcFn = async () => {
+      // Push blob: vrai blob seulement pour les messages notification-worthy.
+      // Receipts, reactions, typing, push_token_update → blob aléatoire → pas de push.
+      // Le Gateway voit des blobs de taille identique dans TOUS les cas → pas de side channel.
+      // Le Push Proxy ne peut pas corréler (il ne connaît ni tag, ni IP, ni contenu).
+      const PUSH_WORTHY: Set<MessageType> = new Set([
+        'text', 'image', 'file', 'voice', 'media_ref', 'call', 'media_chunk',
+        'call_signal',  // offer, hangup, decline, busy → push immédiat
+      ]);
+      // ─── Push blob routing (5 cas) ───
+      //
+      // • call offer               → is_call=true         → FCM data-only t:'c' (sonnerie)
+      // • call termination         → is_call_cancel=true   → FCM data-only t:'h' (stop sonnerie)
+      //   (hangup, decline, busy)
+      // • crypto, answer           → blob aléatoire        → AUCUN push (récupérés par polling)
+      //   Crypto est envoyé AVANT offer → si on push t:'h', il peut arriver APRÈS
+      //   le t:'c' de l'offer et tuer la notification. Answer va à l'appelant
+      //   qui est déjà en foreground et poll activement.
+      // • missed call message      → is_missed_call=true   → FCM notif "Appel manqué"
+      // • message normal           → default               → FCM notif "Nouveau message"
+      //
+      // Le blob est chiffré côté client, le Gateway ne voit qu'un blob opaque de taille fixe.
+      const noPush = isCallSignalNoPush(innerPayload);
+      const shouldPush = !noPush
+        && (PUSH_WORTHY.has(innerPayload.type as MessageType) || isCallOffer(innerPayload));
+      const callCancel = isCallTermination(innerPayload);
+      const missedCall = isMissedCallMessage(innerPayload);
+      const pushBlob = shouldPush
+        ? await createPushBlobForPeer(sessionId, isCallOffer(innerPayload), callCancel, missedCall)
+        : generateRandomPushBlob();
       const result = await secureRpc('send_sealed_message', {
         p_tag: envelope.tag,
         p_sealed_content: envelope.sealedContent,
         p_version: envelope.version,
+        p_push_blob: pushBlob,
       });
       if (result.data?.[0]?.id) {
         recentlySentIds.add(result.data[0].id);
@@ -848,8 +1052,15 @@ async function sendSingleChunk(
     return { success: true, messageId: innerPayload.messageId };
     
   } catch (error) {
-    console.error('[api1to1] ❌ sendSingleChunk EXCEPTION:', error);
-    return { success: false, error: String(error) };
+    // ConstantTraffic stop/start during AppState transitions is expected —
+    // non-urgent messages (read receipts) are rejected and retried next cycle.
+    const msg = String(error);
+    if (msg.includes('ConstantTraffic stopped')) {
+      __DEV__ && console.log('[api1to1] ℹ️ Message deferred (traffic restart):', msg);
+    } else {
+      __DEV__ && console.error('[api1to1] ❌ sendSingleChunk EXCEPTION:', error);
+    }
+    return { success: false, error: msg };
   }
 }
 
@@ -918,7 +1129,7 @@ export async function sendMessage1to1(
     __DEV__ && console.log(`[api1to1] ✅ Text message sent: ${messageId.slice(0, 8)}...`);
   } else {
     await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
-    console.error(`[api1to1] ❌ Text message failed: ${messageId.slice(0, 8)}...`, result.error);
+    __DEV__ && console.error(`[api1to1] ❌ Text message failed: ${messageId.slice(0, 8)}...`, result.error);
   }
   
   return { ...result, messageId };
@@ -945,7 +1156,7 @@ export async function sendImage1to1(
   
   const session = sessionService.getSession(sessionId);
   if (!session) {
-    console.error('[api1to1] ❌ Session not found');
+    __DEV__ && console.error('[api1to1] ❌ Session not found');
     return { success: false, error: 'Session not found' };
   }
   
@@ -999,7 +1210,7 @@ export async function sendImage1to1(
     __DEV__ && console.log(`[api1to1] ✅ Image sent: ${messageId.slice(0, 8)}...`);
   } else {
     await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
-    console.error('[api1to1] ❌ Image send failed:', result.error);
+    __DEV__ && console.error('[api1to1] ❌ Image send failed:', result.error);
   }
   
   return { ...result, messageId };
@@ -1023,7 +1234,7 @@ export async function sendFile1to1(
   
   const session = sessionService.getSession(sessionId);
   if (!session) {
-    console.error('[api1to1] ❌ Session not found');
+    __DEV__ && console.error('[api1to1] ❌ Session not found');
     return { success: false, error: 'Session not found' };
   }
   
@@ -1077,7 +1288,7 @@ export async function sendFile1to1(
     __DEV__ && console.log(`[api1to1] ✅ File sent: ${messageId.slice(0, 8)}... (${fileName})`);
   } else {
     await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
-    console.error('[api1to1] ❌ File send failed:', result.error);
+    __DEV__ && console.error('[api1to1] ❌ File send failed:', result.error);
   }
   
   return { ...result, messageId };
@@ -1099,7 +1310,7 @@ export async function sendVoice1to1(
   
   const session = sessionService.getSession(sessionId);
   if (!session) {
-    console.error('[api1to1] ❌ Session not found');
+    __DEV__ && console.error('[api1to1] ❌ Session not found');
     return { success: false, error: 'Session not found' };
   }
   
@@ -1149,7 +1360,7 @@ export async function sendVoice1to1(
     __DEV__ && console.log(`[api1to1] ✅ Voice sent: ${messageId.slice(0, 8)}... (${duration}s)`);
   } else {
     await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
-    console.error('[api1to1] ❌ Voice send failed:', result.error);
+    __DEV__ && console.error('[api1to1] ❌ Voice send failed:', result.error);
   }
   
   return { ...result, messageId };
@@ -1206,7 +1417,7 @@ export async function sendMediaRef1to1(
   
   const session = sessionService.getSession(sessionId);
   if (!session) {
-    console.error('[api1to1] ❌ Session not found');
+    __DEV__ && console.error('[api1to1] ❌ Session not found');
     return { success: false, error: 'Session not found' };
   }
   
@@ -1296,7 +1507,7 @@ export async function sendMediaRef1to1(
     __DEV__ && console.log(`[api1to1] ✅ MediaRef sent: ${messageId.slice(0, 8)}... (blob: ${blobResult.blobId.slice(0, 12)}...)`);
   } else {
     await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
-    console.error('[api1to1] ❌ MediaRef send failed:', result.error);
+    __DEV__ && console.error('[api1to1] ❌ MediaRef send failed:', result.error);
   }
   
   return { ...result, messageId };
@@ -1322,7 +1533,7 @@ export async function sendCallSignal1to1(
   
   const session = sessionService.getSession(sessionId);
   if (!session) {
-    console.error('[api1to1] ❌ Session not found');
+    __DEV__ && console.error('[api1to1] ❌ Session not found');
     return { success: false, error: 'Session not found' };
   }
   
@@ -1348,12 +1559,21 @@ export async function sendCallSignal1to1(
   };
   
   // Les signaux d'appel sont URGENTS — envoi immédiat avec decoys masquants
-  const result = await sendInnerPayload(sessionId, innerPayload, 'urgent');
+  // P0 FIX: Retry automatique si le message est rejeté par un cycle stop/start
+  // du ConstantTraffic (ex: AppState background → foreground pendant l'appel).
+  let result = await sendInnerPayload(sessionId, innerPayload, 'urgent');
+  
+  if (!result.success && result.error?.includes('stopped')) {
+    __DEV__ && console.log(`[api1to1] 🔄 Call signal dropped by traffic stop, retrying: ${callSignalType}`);
+    // Attendre que le ConstantTraffic redémarre
+    await new Promise(r => setTimeout(r, 500));
+    result = await sendInnerPayload(sessionId, innerPayload, 'urgent');
+  }
   
   if (result.success) {
     __DEV__ && console.log(`[api1to1] ✅ Call signal sent: ${callSignalType}`);
   } else {
-    console.error('[api1to1] ❌ Call signal send failed:', result.error);
+    __DEV__ && console.error('[api1to1] ❌ Call signal send failed:', result.error);
   }
   
   // Ne pas sauvegarder les signaux d'appel comme messages locaux
@@ -1431,6 +1651,7 @@ export async function sendCallEndedMessage1to1(
       senderFingerprint: myFingerprint,
       status: 'sent',
       messageType: 'call',
+      callId, // FIX DOUBLON: Indispensable pour la dédup par callId dans saveLocalMessage1to1
     };
     
     await saveLocalMessage1to1(sessionId, localMessage);
@@ -1446,13 +1667,13 @@ export async function sendCallEndedMessage1to1(
       try {
         cb(localMessage);
       } catch (e) {
-        console.error('[api1to1] Callback error:', e);
+        __DEV__ && console.error('[api1to1] Callback error:', e);
       }
     }
     
     __DEV__ && console.log(`[api1to1] ✅ Call ended message sent: ${messageId.slice(0, 12)}...`);
   } else {
-    console.error('[api1to1] ❌ Call ended message send failed:', result.error);
+    __DEV__ && console.error('[api1to1] ❌ Call ended message send failed:', result.error);
   }
   
   return { ...result, messageId };
@@ -1488,7 +1709,8 @@ export async function sendReaction1to1(
     emoji,
   };
   
-  const result = await sendInnerPayload(sessionId, innerPayload);
+  // Reactions should feel instant — use 'urgent' priority (50-200ms)
+  const result = await sendInnerPayload(sessionId, innerPayload, 'urgent');
   
   if (result.success) {
     __DEV__ && console.log(`[api1to1] Reaction sent: ${emoji} on ${targetMessageId.slice(0, 12)}...`);
@@ -1579,6 +1801,76 @@ export async function sendDeliveredReceipt1to1(
 }
 
 // ============================================
+// ENVOI - SESSION RESET (P1-A3)
+// ============================================
+
+/**
+ * P1-A3: Envoie un signal de réinitialisation de session au correspondant.
+ *
+ * Quand le correspondant reçoit ce message :
+ *   1. Son état de session Triple Ratchet est détruit
+ *   2. Un nouveau handshake PQXDH sera nécessaire au prochain message
+ *   3. Un message système est affiché dans la conversation
+ *
+ * Cas d'utilisation :
+ *   - Appareil volé ou compromis → couper l'accès à la session
+ *   - Suspicion de compromission des clés
+ *   - Réinitialisation manuelle par l'utilisateur
+ *
+ * SÉCURITÉ : Le message session_reset transite via le pipeline Triple Ratchet
+ * existant. Il est chiffré et authentifié comme n'importe quel message.
+ * Seul un participant légitime de la session peut envoyer un reset.
+ *
+ * Après l'envoi, la session locale est AUSSI détruite pour garantir
+ * que les deux côtés repartent d'une feuille blanche.
+ *
+ * @param sessionId - ID de la session à réinitialiser
+ * @returns { success, error }
+ */
+export async function sendSessionReset1to1(
+  sessionId: string
+): Promise<{ success: boolean; error?: string }> {
+  const session = sessionService.getSession(sessionId);
+  if (!session) {
+    return { success: false, error: 'Session not found' };
+  }
+
+  const myFingerprint = session.myIdentityKeyFingerprint;
+  const myProfile = sessionService.getMyProfile();
+
+  const innerPayload: InnerPayload = {
+    type: 'session_reset',
+    content: '',
+    senderFingerprint: myFingerprint,
+    displayName: myProfile.displayName,
+    timestamp: Date.now(),
+    messageId: generateMessageId(),
+  };
+
+  // Envoi urgent : le reset doit partir immédiatement, pas en mode deferred
+  const result = await sendInnerPayload(sessionId, innerPayload, 'urgent');
+
+  if (result.success) {
+    __DEV__ && console.log(`[api1to1] 🔄 Session reset sent for ${sessionId.slice(0, 12)}...`);
+
+    // Détruire la session locale aussi
+    try {
+      // BUG FIX #3/#9: Cleanup AVANT deleteSession (expire les invites d'abord,
+      // empêche l'InviteWatcher de re-finaliser l'ancien accept)
+      await clearLocalMessages1to1(sessionId);
+      await sessionService.deleteSession(sessionId);
+      __DEV__ && console.log(`[api1to1] 🔄 Local session & transport data destroyed after reset`);
+    } catch (e) {
+      __DEV__ && console.error(`[api1to1] ⚠️ Failed to destroy local session after reset:`, e);
+    }
+  } else {
+    __DEV__ && console.error(`[api1to1] ❌ Session reset failed:`, result.error);
+  }
+
+  return result;
+}
+
+// ============================================
 // PERSISTANCE DES RÉACTIONS (v21.0)
 // ============================================
 
@@ -1608,7 +1900,7 @@ export async function saveReactions(
     await secureSet(key, JSON.stringify(data));
     __DEV__ && console.log(`[api1to1] 💾 Saved ${Object.keys(data).length} messages with reactions`);
   } catch (error) {
-    console.error('[api1to1] Error saving reactions:', error);
+    __DEV__ && console.error('[api1to1] Error saving reactions:', error);
   }
 }
 
@@ -1632,7 +1924,7 @@ export async function loadReactions(
     __DEV__ && console.log(`[api1to1] 📂 Loaded reactions for ${map.size} messages`);
     return map;
   } catch (error) {
-    console.error('[api1to1] Error loading reactions:', error);
+    __DEV__ && console.error('[api1to1] Error loading reactions:', error);
     return new Map();
   }
 }
@@ -1746,7 +2038,7 @@ async function doFetchMessages1to1(
   try {
     const session = sessionService.getSession(sessionId);
     if (!session) {
-      console.warn('[api1to1] Session not found:', sessionId.slice(0, 12) + '...');
+      __DEV__ && console.warn('[api1to1] Session not found:', sessionId.slice(0, 12) + '...');
       return [];
     }
     
@@ -1764,7 +2056,7 @@ async function doFetchMessages1to1(
     const legacyTag = realTag; // Tag permanent legacy (migration pre-ACTION 3)
     const allRealTags = [...new Set([...directionalTags, legacyTag])];
     const realTagSet = new Set(allRealTags);
-    __DEV__ && console.log(`[api1to1] 🔍 DIAG SESSION POLL directional tags: ${allRealTags.map(t => t.slice(0,16)+'...').join(', ')} | p_since: ${lastPoll?.toISOString() || 'null'}`);
+    __DEV__ && console.log(`[api1to1] 🔍 DIAG SESSION POLL directional tags: ${allRealTags.map(t => t.slice(0,16)+'...').join(', ')} | myFP: ${session.myIdentityKeyFingerprint} | theirFP: ${session.theirIdentityKeyFingerprint} | p_since: ${lastPoll?.toISOString() || 'null'}`);
     
     // ACTION 06: K-ANONYMITY RENFORCÉE — TOUJOURS 50 tags exactement
     // Le serveur ne peut plus déduire le nombre de conversations.
@@ -1790,17 +2082,17 @@ async function doFetchMessages1to1(
     });
     
     if (error) {
-      console.error('[api1to1] Fetch error:', error);
+      __DEV__ && console.error('[api1to1] Fetch error:', error);
       return [];
     }
     
     if (!data || data.length === 0) {
-      console.log(`[api1to1] 🔍 DIAG session poll: server returned 0 msgs for ${allRealTags.length} real tags`);
+      __DEV__ && console.log(`[api1to1] 🔍 DIAG session poll: server returned 0 msgs for ${allRealTags.length} real tags`);
       return [];
     }
     
     const realMessages = (data as ServerMessage[]).filter(row => realTagSet.has(row.tag));
-    console.log(`[api1to1] 🔍 DIAG session poll: ${(data as any[]).length} total rows, ${realMessages.length} matched real tags`);
+    __DEV__ && console.log(`[api1to1] 🔍 DIAG session poll: ${(data as any[]).length} total rows, ${realMessages.length} matched real tags`);
     
     if (realMessages.length === 0) {
       return [];
@@ -1822,16 +2114,19 @@ async function doFetchMessages1to1(
       }
       
       // Ignorer les messages de handshake X3DH/PQXDH
+      // FIX: les marquer comme traités pour ne pas les re-parser à chaque poll
       if (sealedPayload.type === 'ghostr_x3dh_response' || 
           sealedPayload.type === 'ghostr_invite_v1' ||
           sealedPayload.type === 'ghostr_accept_v1' ||
           sealedPayload.type === 'ghostr_invite_pq' ||
           sealedPayload.type === 'ghostr_accept_pq') {
+        await markIdAsProcessed(sessionId, row.id);
         continue;
       }
       
       // Accepter les messages Triple Ratchet v1, v2 et v3
       if (sealedPayload.type !== 'triple_ratchet_v1' && sealedPayload.type !== 'triple_ratchet_v2' && sealedPayload.type !== 'triple_ratchet_v3') {
+        await markIdAsProcessed(sessionId, row.id);
         continue;
       }
       
@@ -1980,7 +2275,7 @@ async function doFetchMessages1to1(
               `[api1to1] ✅ Assembled ${originalInnerPayload.type} message from ${chunkHeader.totalChunks} chunks: ${assembledMessage.id.slice(0, 8)}...`
             );
           } catch (parseError) {
-            console.error('[api1to1] ❌ Failed to parse assembled payload:', parseError);
+            __DEV__ && console.error('[api1to1] ❌ Failed to parse assembled payload:', parseError);
           }
           
           continue; // Chunk traité (assemblé ou buffered), passer au suivant
@@ -1996,7 +2291,7 @@ async function doFetchMessages1to1(
             profileUpdate.avatarBase64 = message.senderAvatarBase64;
           }
           sessionService.updateContactProfile(sessionId, profileUpdate).catch(err => {
-            console.warn('[api1to1] Failed to update contact profile:', err);
+            __DEV__ && console.warn('[api1to1] Failed to update contact profile:', err);
           });
         }
         
@@ -2034,6 +2329,42 @@ async function doFetchMessages1to1(
             callStartedAt: message.callStartedAt, // Timestamp de début pour synchroniser les chronos
             timestamp: message.timestamp,
           }, message.displayName, message.senderAvatarBase64);  // v7.0: Inclure l'avatar
+        } else if (message.messageType === 'session_reset') {
+          // P1-A3: Le pair demande une réinitialisation complète de la session
+          __DEV__ && console.log(`[api1to1] 🔄 Received SESSION_RESET for session ${sessionId.slice(0, 12)}...`);
+          try {
+            // BUG FIX #2/#9: Nettoyer les données de transport AVANT deleteSession.
+            // Ordre critique : clearLocalMessages1to1 expire les invites associées,
+            // ce qui empêche l'InviteWatcher de re-finaliser l'ancien accept PQXDH
+            // dans la fenêtre entre deleteSession et le cleanup.
+            await clearLocalMessages1to1(sessionId);
+            const { SessionService } = await import('./tripleRatchet/sessionService');
+            const sessionService = SessionService.getInstance();
+            await sessionService.deleteSession(sessionId);
+            __DEV__ && console.log(`[api1to1] 🔄 Session & transport data destroyed — new PQXDH required`);
+            // Message système visible (sauvé APRÈS le clear pour repartir proprement)
+            const resetMsg = {
+              ...message,
+              messageType: 'text' as MessageType,
+              content: '\u26a0\ufe0f Session de chiffrement r\u00e9initialis\u00e9e par le correspondant. Un nouveau handshake sera initi\u00e9.',
+              isMine: false,
+            };
+            messages.push(resetMsg);
+            await saveLocalMessage1to1(sessionId, resetMsg);
+          } catch (resetErr) {
+            __DEV__ && console.error(`[api1to1] \u274c Session reset failed:`, resetErr);
+          }
+        } else if (message.messageType === 'push_token_update') {
+          // v2.0: Pair partage son push token via E2E — stocker localement
+          try {
+            const pushData = JSON.parse(message.content);
+            if (pushData.pushToken && pushData.pushPlatform) {
+              await storePeerPushToken(sessionId, pushData.pushToken, pushData.pushPlatform);
+              __DEV__ && console.log(`[api1to1] 🔔 Received push token from ${sessionId.slice(0, 8)}...`);
+            }
+          } catch (pushErr) {
+            __DEV__ && console.warn('[api1to1] Push token update parse error:', pushErr);
+          }
         } else {
           // Message normal
           messages.push(message);
@@ -2076,7 +2407,7 @@ async function doFetchMessages1to1(
     return visibleMessages;
     
   } catch (error) {
-    console.error('[api1to1] Fetch exception:', error);
+    __DEV__ && console.error('[api1to1] Fetch exception:', error);
     return [];
   }
 }
@@ -2096,7 +2427,7 @@ async function decryptServerMessage(
     );
     
     if (!plaintext) {
-      console.warn('[api1to1] ❌ Decryption failed for message:', serverMessage.id);
+      __DEV__ && console.warn('[api1to1] ❌ Decryption failed for message:', serverMessage.id);
       return null;
     }
     
@@ -2207,7 +2538,7 @@ async function decryptServerMessage(
     return message;
     
   } catch (error) {
-    console.error('[api1to1] Decrypt error:', error);
+    __DEV__ && console.error('[api1to1] Decrypt error:', error);
     return null;
   }
 }
@@ -2235,6 +2566,62 @@ const statusCallbacks = new Map<string, StatusCallback[]>();
 const reactionCallbacks = new Map<string, ReactionCallback[]>();
 const messageCallbacks = new Map<string, MessageCallback[]>();
 let globalCallSignalCallback: CallSignalCallback | null = null;
+
+// ============================================
+// PERF A2: Buffer des signaux d'appel reçus en background
+// ============================================
+// Quand l'app est en background, React n'est pas monté et
+// globalCallSignalCallback est null. Les signaux 'offer' étaient
+// silencieusement perdus → l'appel mettait 5-12s à s'afficher
+// car il fallait attendre un nouveau poll après le montage de React.
+//
+// Ce buffer stocke les signaux 'offer' en mémoire (déjà déchiffrés E2E).
+// Au montage de Call1to1Provider, consumePendingCallSignals() les récupère
+// et les traite immédiatement → affichage < 1s.
+//
+// SÉCURITÉ:
+//   - Stockage mémoire uniquement (pas de persistance)
+//   - Les signaux sont déjà déchiffrés (Triple Ratchet) à ce stade
+//   - Le buffer est vidé à la consommation
+//   - Max 5 signaux (protection contre un pair malveillant)
+//   - TTL de 90s (aligné sur le ring timeout)
+
+interface PendingCallSignal {
+  sessionId: string;
+  signal: {
+    type: 'offer' | 'answer' | 'senderkey' | 'hangup' | 'decline' | 'busy' | 'crypto';
+    callId: string;
+    roomTag?: string;
+    authToken?: string;
+    senderKeyDistribution?: string;
+    cryptoSignal?: string;
+    callStartedAt?: number;
+    timestamp: number;
+  };
+  senderName: string;
+  senderAvatarBase64?: string;
+  bufferedAt: number;
+}
+
+const PENDING_CALL_SIGNAL_MAX = 5;
+const PENDING_CALL_SIGNAL_TTL_MS = 90_000; // 90s — aligné sur CALL_RING_TIMEOUT_MS
+
+let _pendingCallSignals: PendingCallSignal[] = [];
+
+/**
+ * Consomme les signaux d'appel reçus pendant que React n'était pas monté.
+ * Appelé par Call1to1Provider au montage. Vide le buffer.
+ */
+export function consumePendingCallSignals(): PendingCallSignal[] {
+  const now = Date.now();
+  // Filtrer les signaux expirés (l'appelant a probablement raccroché)
+  const valid = _pendingCallSignals.filter(s => now - s.bufferedAt < PENDING_CALL_SIGNAL_TTL_MS);
+  _pendingCallSignals = [];
+  if (valid.length > 0) {
+    __DEV__ && console.log(`[api1to1] 📞 consumePendingCallSignals: ${valid.length} signal(s) buffered`);
+  }
+  return valid;
+}
 
 export function onStatusChange(sessionId: string, callback: StatusCallback): () => void {
   const callbacks = statusCallbacks.get(sessionId) || [];
@@ -2266,14 +2653,14 @@ function notifyStatusChange(sessionId: string, messageIds: string[], status: 'de
   
   // v16.0: Mettre à jour le statut dans les messages locaux
   updateLocalMessageStatus(sessionId, messageIds, status).catch(e => {
-    console.error('[api1to1] Error updating local message status:', e);
+    __DEV__ && console.error('[api1to1] Error updating local message status:', e);
   });
   
   for (const cb of callbacks) {
     try {
       cb(messageIds, status);
     } catch (e) {
-      console.error('[api1to1] Status callback error:', e);
+      __DEV__ && console.error('[api1to1] Status callback error:', e);
     }
   }
 }
@@ -2284,7 +2671,7 @@ function notifyReaction(sessionId: string, targetMessageId: string, emoji: strin
     try {
       cb(targetMessageId, emoji, senderFingerprint);
     } catch (e) {
-      console.error('[api1to1] Reaction callback error:', e);
+      __DEV__ && console.error('[api1to1] Reaction callback error:', e);
     }
   }
 }
@@ -2295,7 +2682,7 @@ function notifyNewMessage(sessionId: string, message: Message1to1) {
     try {
       cb(message);
     } catch (e) {
-      console.error('[api1to1] Message callback error:', e);
+      __DEV__ && console.error('[api1to1] Message callback error:', e);
     }
   }
 }
@@ -2311,7 +2698,7 @@ export function onCallSignal(callback: CallSignalCallback): () => void {
 function notifyCallSignal(
   sessionId: string, 
   signal: {
-    type: 'offer' | 'answer' | 'senderkey' | 'hangup' | 'decline' | 'busy';
+    type: 'offer' | 'answer' | 'senderkey' | 'hangup' | 'decline' | 'busy' | 'crypto';
     callId: string;
     roomTag?: string;
     authToken?: string;
@@ -2328,10 +2715,74 @@ function notifyCallSignal(
     try {
       globalCallSignalCallback(sessionId, signal, senderName, senderAvatarBase64);
     } catch (e) {
-      console.error('[api1to1] Call signal callback error:', e);
+      __DEV__ && console.error('[api1to1] Call signal callback error:', e);
     }
   } else {
-    console.warn('[api1to1] ⚠️ No call signal callback registered');
+    __DEV__ && console.warn('[api1to1] ⚠️ No call signal callback (app in background?)');
+    
+    // ════════════════════════════════════════════════════════════════════
+    // FIX BACKGROUND: Quand l'app est en background, React n'est pas
+    // monté → le callback onCallSignal n'est pas enregistré → les signaux
+    // de terminaison (hangup, decline, busy) sont silencieusement ignorés
+    // → la notification native continue de sonner POUR TOUJOURS.
+    //
+    // Solution: Gérer directement les signaux de terminaison ici,
+    // sans passer par le système de callbacks React.
+    //
+    // SÉCURITÉ: Aucun impact — on appelle uniquement stopRinging()
+    // (qui dismiss la notification native) et showMissedCallNotification()
+    // (qui affiche un contenu générique). Aucune donnée E2E n'est exposée.
+    // ════════════════════════════════════════════════════════════════════
+    if (signal.type === 'hangup' || signal.type === 'decline' || signal.type === 'busy') {
+      import('./pushNotificationService').then(({ stopRinging, showMissedCallNotification }) => {
+        // PAS de guard isRinging() — l'état JS ne reflète pas l'état natif
+        // en contexte headless (background task après kill)
+        __DEV__ && console.log(`[api1to1] 📞 Background: handling ${signal.type} → stop ringing`);
+        if (signal.type === 'hangup') {
+          // L'appelant a annulé → appel manqué
+          // Ne montrer la notification que si l'app est VRAIMENT en background.
+          // Quand l'app vient de s'ouvrir mais que React n'est pas encore monté,
+          // globalCallSignalCallback est null MAIS AppState est déjà 'active'.
+          // Dans ce cas, l'UI gérera l'état dès que React monte — pas besoin
+          // d'une notification système qui doublerait avec celle du background task.
+          const appState = AppState.currentState;
+          if (appState !== 'active') {
+            showMissedCallNotification(senderName || 'Inconnu');
+          } else {
+            __DEV__ && console.log('[api1to1] 📞 App is active — skipping missed call notification');
+            stopRinging();
+          }
+        } else {
+          // decline ou busy → juste arrêter la sonnerie
+          stopRinging();
+        }
+      }).catch(() => {});
+    }
+    
+    // ════════════════════════════════════════════════════════════════════
+    // PERF A2: Buffer des signaux 'offer' pour traitement au montage React.
+    // Sans ce buffer, le signal offer est perdu quand le callback est null,
+    // et l'utilisateur doit attendre un nouveau poll (5-12s) pour voir l'appel.
+    // Avec ce buffer, Call1to1Provider consomme le signal au montage (< 1s).
+    //
+    // On buffer aussi 'answer' et 'crypto' car ils peuvent arriver pendant
+    // le bref intervalle entre le push et le montage complet de React.
+    // ════════════════════════════════════════════════════════════════════
+    if (signal.type === 'offer' || signal.type === 'answer' || signal.type === 'crypto') {
+      // Limiter la taille du buffer (protection anti-flood)
+      if (_pendingCallSignals.length < PENDING_CALL_SIGNAL_MAX) {
+        _pendingCallSignals.push({
+          sessionId,
+          signal,
+          senderName,
+          senderAvatarBase64,
+          bufferedAt: Date.now(),
+        });
+        __DEV__ && console.log(`[api1to1] 📞 Buffered ${signal.type} signal for later (${_pendingCallSignals.length} pending)`);
+      } else {
+        __DEV__ && console.warn(`[api1to1] 📞 Pending call signal buffer full — dropping ${signal.type}`);
+      }
+    }
   }
 }
 
@@ -2404,7 +2855,7 @@ function startPolling(): void {
           callback(msg);
         }
       } catch (e) {
-        console.error('[api1to1] Poll error for session:', sessionId.slice(0, 12) + '...');
+        __DEV__ && console.error('[api1to1] Poll error for session:', sessionId.slice(0, 12) + '...');
       }
     }
     
@@ -2528,10 +2979,10 @@ export async function pollAllSessions(): Promise<void> {
     try {
       // DIAGNOSTIC: Log les vrais tags pollés (pas les decoys)
       const realTagsInBatch = batchTags.filter(t => allRealTagsGlobal.includes(t));
-      console.log(`[api1to1] 🔍 DIAG batch poll: ${realTagsInBatch.length} real tags, ${batchTags.length - realTagsInBatch.length} decoys`);
+      __DEV__ && console.log(`[api1to1] 🔍 DIAG batch poll: ${realTagsInBatch.length} real tags, ${batchTags.length - realTagsInBatch.length} decoys`);
       for (const rt of realTagsInBatch) {
         const sid = tagToSessionId.get(rt);
-        console.log(`[api1to1] 🔍   tag: ${rt.slice(0, 16)}... → session: ${sid?.slice(0, 16)}...`);
+        __DEV__ && console.log(`[api1to1] 🔍   tag: ${rt.slice(0, 16)}... → session: ${sid?.slice(0, 16)}...`);
       }
       
       const { data, error } = await secureRpc('get_messages_by_tags', {
@@ -2541,22 +2992,21 @@ export async function pollAllSessions(): Promise<void> {
       });
       
       // DIAGNOSTIC: Log what server returned
-      console.log(`[api1to1] 🔍 DIAG server returned: ${data ? (Array.isArray(data) ? data.length + ' rows' : typeof data) : 'null'}, error: ${error ? error.message : 'none'}`);
+      __DEV__ && console.log(`[api1to1] 🔍 DIAG server returned: ${data ? (Array.isArray(data) ? data.length + ' rows' : typeof data) : 'null'}, error: ${error ? error.message : 'none'}`);
       
       if (error) {
-        console.error('[api1to1] 🔄 Batch fetch error:', error);
+        __DEV__ && console.error('[api1to1] 🔄 Batch fetch error:', error);
         continue;
       }
       
       if (!data || data.length === 0) {
-        console.log('[api1to1] 🔍 DIAG batch: server returned 0 messages');
+        __DEV__ && console.log('[api1to1] 🔍 DIAG batch: server returned 0 messages');
         continue;
       }
       
       // DIAGNOSTIC: Log all returned message tags
       for (const row of (data as ServerMessage[])) {
         const matched = tagToSessionId.has(row.tag);
-        console.log(`[api1to1] 🔍 DIAG msg ${row.id.slice(0,8)} tag=${row.tag.slice(0,16)}... matched=${matched}`);
       }
       
       // 4. Dispatcher les résultats par session
@@ -2572,7 +3022,7 @@ export async function pollAllSessions(): Promise<void> {
         messagesBySession.get(sessionId)!.push(row);
       }
       
-      console.log(`[api1to1] 🔍 DIAG dispatched: ${messagesBySession.size} sessions with messages`);
+      __DEV__ && console.log(`[api1to1] 🔍 DIAG dispatched: ${messagesBySession.size} sessions with messages`);
       
       // 5. Vérifier que la génération n'a pas changé (remount React)
       if (getPollGeneration() !== generation) {
@@ -2627,6 +3077,40 @@ export async function pollAllSessions(): Promise<void> {
                   timestamp: message.timestamp,
                 }, message.displayName, message.senderAvatarBase64);
                 
+              } else if (message.messageType === 'session_reset') {
+                // P1-A3: Session reset reçu via pollAll — même logique que fetchMessages1to1
+                __DEV__ && console.log(`[api1to1] 🔄 Received SESSION_RESET via pollAll for ${sessionId.slice(0, 12)}...`);
+                try {
+                  // BUG FIX #2/#9: Cleanup AVANT deleteSession (expire les invites d'abord)
+                  await clearLocalMessages1to1(sessionId);
+                  const { SessionService } = await import('./tripleRatchet/sessionService');
+                  const ss = SessionService.getInstance();
+                  await ss.deleteSession(sessionId);
+                  __DEV__ && console.log(`[api1to1] 🔄 Session & transport data destroyed via pollAll — new PQXDH required`);
+                  // Message système visible (sauvé APRÈS le clear)
+                  const resetMsg = {
+                    ...message,
+                    messageType: 'text' as MessageType,
+                    content: '\u26a0\ufe0f Session de chiffrement r\u00e9initialis\u00e9e par le correspondant. Un nouveau handshake sera initi\u00e9.',
+                    isMine: false,
+                  };
+                  await saveLocalMessage1to1(sessionId, resetMsg);
+                } catch (resetErr) {
+                  __DEV__ && console.error(`[api1to1] \u274c Session reset failed in pollAll:`, resetErr);
+                }
+
+              } else if (message.messageType === 'push_token_update') {
+                // v2.0: Pair partage son push token via E2E
+                try {
+                  const pushData = JSON.parse(message.content);
+                  if (pushData.pushToken && pushData.pushPlatform) {
+                    await storePeerPushToken(sessionId, pushData.pushToken, pushData.pushPlatform);
+                    __DEV__ && console.log(`[api1to1] 🔔 Received push token via pollAll from ${sessionId.slice(0, 8)}...`);
+                  }
+                } catch (pushErr) {
+                  __DEV__ && console.warn('[api1to1] Push token update parse error in pollAll:', pushErr);
+                }
+
               } else {
                 // Message normal (texte, image, fichier, vocal)
                 await saveLocalMessage1to1(sessionId, message);
@@ -2647,7 +3131,7 @@ export async function pollAllSessions(): Promise<void> {
                 try {
                   callback(sessionId, message);
                 } catch (e) {
-                  console.error('[api1to1] Global callback error in pollAll:', e);
+                  __DEV__ && console.error('[api1to1] Global callback error in pollAll:', e);
                 }
               }
             }
@@ -2658,11 +3142,11 @@ export async function pollAllSessions(): Promise<void> {
             }
           }
         } catch (error) {
-          console.error('[api1to1] 🔄 Process error for session:', sessionId.slice(0, 12) + '...', error);
+          __DEV__ && console.error('[api1to1] 🔄 Process error for session:', sessionId.slice(0, 12) + '...', error);
         }
       }
     } catch (error) {
-      console.error('[api1to1] 🔄 Batch poll RPC error:', error);
+      __DEV__ && console.error('[api1to1] 🔄 Batch poll RPC error:', error);
     }
   }
   
@@ -2685,12 +3169,27 @@ async function processServerMessages(
 ): Promise<Message1to1[]> {
   const messages: Message1to1[] = [];
   
+  // BUG FIX #4: Guard race condition — si la session a été supprimée pendant le polling
+  // (par l'utilisateur ou par un session_reset), on ne tente pas de déchiffrer.
+  const currentSession = sessionService.getSession(sessionId);
+  if (!currentSession) {
+    __DEV__ && console.warn(`[api1to1] ⚠️ processServerMessages: Session ${sessionId.slice(0, 12)}... disappeared during poll, skipping`);
+    return messages;
+  }
+  
   const realMessages = rows.filter(row => ctx.realTagSet.has(row.tag));
   if (realMessages.length === 0) return messages;
   
+  // DIAGNOSTIC: Track why messages are being filtered
+  let _diagSkippedProcessed = 0;
+  let _diagSkippedHandshake = 0;
+  let _diagSkippedUnknownType = 0;
+  let _diagSkippedOwnMsg = 0;
+  let _diagDecrypted = 0;
+  
   for (const row of realMessages) {
     if (ctx.processedIds.has(row.id) || recentlySentIds.has(row.id) || inFlightOrProcessedIds.has(row.id)) {
-      console.log(`[api1to1] 🔍 DIAG skip msg ${row.id.slice(0,8)}: processed=${ctx.processedIds.has(row.id)} sent=${recentlySentIds.has(row.id)} inflight=${inFlightOrProcessedIds.has(row.id)}`);
+      _diagSkippedProcessed++;
       continue;
     }
     
@@ -2702,17 +3201,22 @@ async function processServerMessages(
     }
     
     // Ignorer les messages de handshake
+    // FIX: les marquer comme traités pour ne pas les re-parser à chaque poll
     if (sealedPayload.type === 'ghostr_x3dh_response' || 
         sealedPayload.type === 'ghostr_invite_v1' ||
         sealedPayload.type === 'ghostr_accept_v1' ||
         sealedPayload.type === 'ghostr_invite_pq' ||
         sealedPayload.type === 'ghostr_accept_pq') {
+      await markIdAsProcessed(sessionId, row.id);
+      _diagSkippedHandshake++;
       continue;
     }
     
     if (sealedPayload.type !== 'triple_ratchet_v1' && 
         sealedPayload.type !== 'triple_ratchet_v2' && 
         sealedPayload.type !== 'triple_ratchet_v3') {
+      await markIdAsProcessed(sessionId, row.id);
+      _diagSkippedUnknownType++;
       continue;
     }
     
@@ -2727,17 +3231,20 @@ async function processServerMessages(
     if (sealedPayload.version !== 3) {
       if (sealedPayload.senderHint && sealedPayload.senderHint === myHint) {
         await markIdAsProcessed(sessionId, row.id);
+        _diagSkippedOwnMsg++;
         continue;
       }
     }
     if (sealedPayload.senderFingerprint && sealedPayload.senderFingerprint === ctx.myFingerprint) {
       await markIdAsProcessed(sessionId, row.id);
+      _diagSkippedOwnMsg++;
       continue;
     }
     
     // Réclamer ce message AVANT le déchiffrement pour empêcher
     // le session poll de le traiter en parallèle
     inFlightOrProcessedIds.add(row.id);
+    _diagDecrypted++;
     
     // Déchiffrer
     const message = await decryptServerMessage(sessionId, row, sealedPayload, ctx.myFingerprint);
@@ -2765,7 +3272,7 @@ async function processServerMessages(
           profileUpdate.avatarBase64 = message.senderAvatarBase64;
         }
         sessionService.updateContactProfile(sessionId, profileUpdate).catch(err => {
-          console.warn('[api1to1] Failed to update contact profile:', err);
+          __DEV__ && console.warn('[api1to1] Failed to update contact profile:', err);
         });
       }
       
@@ -2826,13 +3333,18 @@ async function processServerMessages(
           };
           messages.push(assembledMessage);
         } catch (parseError) {
-          console.error('[api1to1] ❌ Failed to parse assembled payload in batch:', parseError);
+          __DEV__ && console.error('[api1to1] ❌ Failed to parse assembled payload in batch:', parseError);
         }
         continue;
       }
       
       messages.push(message);
     }
+  }
+  
+  // DIAGNOSTIC: Log summary of message filtering
+  if (realMessages.length > 0) {
+    __DEV__ && console.log(`[api1to1] 🔍 DIAG processServerMessages: ${realMessages.length} real msgs → ${_diagSkippedProcessed} already-processed, ${_diagSkippedHandshake} handshake, ${_diagSkippedUnknownType} unknown-type, ${_diagSkippedOwnMsg} own-msg, ${_diagDecrypted} decrypted → ${messages.length} new messages`);
   }
   
   return messages;
@@ -2842,6 +3354,49 @@ async function processServerMessages(
 // ============================================
 // STOCKAGE LOCAL
 // ============================================
+
+// ═══════════════════════════════════════════════════════════════
+// P6 FIX: MUTEX PAR SESSION POUR LES ÉCRITURES LOCALES
+//
+// PROBLÈME: saveLocalMessage1to1 fait un read-modify-write non-atomique.
+// Si deux appels concurrents lisent le même état (ex: envoi utilisateur
+// + réception poll en même temps pour la même session), le dernier
+// à écrire écrase l'ajout de l'autre → perte de message irréversible.
+//
+// SOLUTION: Chaîne de promesses par sessionId. Chaque opération d'écriture
+// attend la fin de la précédente avant de commencer. JavaScript étant
+// single-threaded, le chainage est sans gap : la promesse est enregistrée
+// dans la Map AVANT tout await, donc aucun concurrent ne peut s'intercaler.
+//
+// SCOPE: saveLocalMessage1to1, updateLocalMessageStatus,
+//        updateSingleMessageStatus1to1, deleteFailedMessage1to1
+// ═══════════════════════════════════════════════════════════════
+
+const _storageLocks = new Map<string, Promise<void>>();
+
+/**
+ * Sérialise les opérations d'écriture sur le stockage local d'une session.
+ * Chaque appel attend que le précédent soit terminé (FIFO strict).
+ */
+function withStorageLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = _storageLocks.get(sessionId) ?? Promise.resolve();
+  
+  // Créer la promesse chaînée SYNCHRONIQUEMENT (pas de gap pour un concurrent)
+  const next = prev.then(fn, fn); // fn() même si prev a rejeté (le lock doit avancer)
+  
+  // Stocker la version void (pour le chainage, on ne propage pas le résultat)
+  const voidNext = next.then(() => {}, () => {});
+  _storageLocks.set(sessionId, voidNext);
+  
+  // Nettoyer la Map quand CETTE promesse est la dernière de la chaîne
+  voidNext.then(() => {
+    if (_storageLocks.get(sessionId) === voidNext) {
+      _storageLocks.delete(sessionId);
+    }
+  });
+  
+  return next;
+}
 
 /**
  * Récupère TOUS les messages locaux (y compris protocole) - usage interne uniquement
@@ -2856,7 +3411,7 @@ async function getAllLocalMessages1to1Internal(sessionId: string): Promise<Messa
     const messages: Message1to1[] = JSON.parse(stored);
     return messages.sort((a, b) => a.timestamp - b.timestamp);
   } catch (error) {
-    console.error('[api1to1] Error loading local messages:', error);
+    __DEV__ && console.error('[api1to1] Error loading local messages:', error);
     return [];
   }
 }
@@ -2884,7 +3439,7 @@ export async function getLocalMessages1to1(sessionId: string): Promise<Message1t
         // Re-save en arrière-plan (sans bloquer l'affichage)
         const key = MESSAGES_1TO1_PREFIX + sessionId;
         secureSet(key, JSON.stringify(messages)).catch(e =>
-          console.warn('[api1to1] Background avatar migration save failed:', e)
+          __DEV__ && console.warn('[api1to1] Background avatar migration save failed:', e)
         );
         __DEV__ && console.log(`[api1to1] 🧹 Stripped own avatars from messages for ${sessionId.slice(0, 12)}...`);
       }
@@ -2898,18 +3453,24 @@ export async function getLocalMessages1to1(sessionId: string): Promise<Message1t
     
     return visibleMessages;
   } catch (error) {
-    console.error('[api1to1] Error loading local messages:', error);
+    __DEV__ && console.error('[api1to1] Error loading local messages:', error);
     return [];
   }
 }
 
 export async function saveLocalMessage1to1(sessionId: string, message: Message1to1): Promise<void> {
+  // P6 FIX: Filtrage protocole HORS du lock (pas d'I/O, retour immédiat)
+  if (PROTOCOL_MESSAGE_TYPES.includes(message.messageType as MessageType)) {
+    __DEV__ && console.log(`[api1to1] Skipping save of protocol message: ${message.messageType}`);
+    return;
+  }
+  
+  // P6 FIX: Tout le read-modify-write est sérialisé par session
+  return withStorageLock(sessionId, () => _doSaveLocalMessage1to1(sessionId, message));
+}
+
+async function _doSaveLocalMessage1to1(sessionId: string, message: Message1to1): Promise<void> {
   try {
-    // v20.0: Ne jamais sauvegarder les messages de protocole
-    if (PROTOCOL_MESSAGE_TYPES.includes(message.messageType as MessageType)) {
-      __DEV__ && console.log(`[api1to1] Skipping save of protocol message: ${message.messageType}`);
-      return;
-    }
     
     // v27.1: PERF — Ne pas stocker senderAvatarBase64 dans MES messages.
     // Mon avatar est résolu à l'affichage depuis myProfile.
@@ -2964,6 +3525,35 @@ export async function saveLocalMessage1to1(sessionId: string, message: Message1t
       return;
     }
     
+    // ═══════════════════════════════════════════════════════════════
+    // FIX DOUBLON APPEL: Dédup supplémentaire par callId pour les messages de type 'call'.
+    //
+    // PROBLÈME RÉSOLU:
+    // Quand les deux parties raccrochent presque en même temps, la logique
+    // d'anti-doublon (initiateur envoie, callee attend) peut échouer si:
+    //   1. Le CT de l'initiateur est en cycle stop/start → message retardé
+    //   2. Le fallback du callee (15s) se déclenche → le callee envoie aussi
+    //   3. Le message de l'initiateur arrive finalement → DOUBLON
+    //
+    // Les deux messages ont des messageId différents (générés indépendamment)
+    // donc la dédup par id ne les attrape pas. Mais ils partagent le même callId.
+    //
+    // Ce guard rejette tout message 'call' si un message avec le même callId
+    // existe déjà dans le stockage local. Le premier arrivé gagne.
+    // ═══════════════════════════════════════════════════════════════
+    if (strippedMessage.messageType === 'call' && (strippedMessage as any).callId) {
+      const incomingCallId = (strippedMessage as any).callId;
+      const callDuplicateIdx = existing.findIndex((m: any) => 
+        m.messageType === 'call' && m.callId === incomingCallId
+      );
+      if (callDuplicateIdx >= 0) {
+        __DEV__ && console.log(
+          `[api1to1] ⚠️ Call message already exists for callId ${incomingCallId.slice(0, 16)}... — rejecting duplicate`
+        );
+        return;
+      }
+    }
+
     // v25.2: MEDIA FILE STORE — Externaliser les données média vers le filesystem
     // Résout SQLITE_FULL: les base64 volumineux (images 500KB+, voix, fichiers)
     // sont écrits sur le filesystem, seule une ref ~80 bytes reste en SQLite.
@@ -2989,7 +3579,7 @@ export async function saveLocalMessage1to1(sessionId: string, message: Message1t
     
     await secureSet(key, JSON.stringify(existing));
   } catch (error) {
-    console.error('[api1to1] Error saving local message:', error);
+    __DEV__ && console.error('[api1to1] Error saving local message:', error);
   }
 }
 
@@ -2997,59 +3587,64 @@ export async function saveLocalMessage1to1(sessionId: string, message: Message1t
 const _migratedSessions = new Set<string>();
 
 // v16.0: Mettre à jour le statut des messages locaux
-export async function updateLocalMessageStatus(
+export function updateLocalMessageStatus(
   sessionId: string, 
   messageIds: string[], 
   status: 'delivered' | 'read'
 ): Promise<void> {
-  try {
-    const key = MESSAGES_1TO1_PREFIX + sessionId;
-    const messages = await getLocalMessages1to1(sessionId);
-    
-    let updated = false;
-    for (const msg of messages) {
-      if (messageIds.includes(msg.id) && msg.isMine) {
-        // Ne mettre à jour que si le nouveau statut est "supérieur"
-        if (status === 'read' || (status === 'delivered' && msg.status !== 'read')) {
-          msg.status = status;
-          updated = true;
+  // P6 FIX: Sérialisé par session
+  return withStorageLock(sessionId, async () => {
+    try {
+      const key = MESSAGES_1TO1_PREFIX + sessionId;
+      const messages = await getLocalMessages1to1(sessionId);
+      
+      let updated = false;
+      for (const msg of messages) {
+        if (messageIds.includes(msg.id) && msg.isMine) {
+          if (status === 'read' || (status === 'delivered' && msg.status !== 'read')) {
+            msg.status = status;
+            updated = true;
+          }
         }
       }
+      
+      if (updated) {
+        await secureSet(key, JSON.stringify(messages));
+        __DEV__ && console.log(`[api1to1] Updated ${messageIds.length} messages to status: ${status}`);
+      }
+    } catch (error) {
+      __DEV__ && console.error('[api1to1] Error updating local message status:', error);
     }
-    
-    if (updated) {
-      await secureSet(key, JSON.stringify(messages));
-      __DEV__ && console.log(`[api1to1] Updated ${messageIds.length} messages to status: ${status}`);
-    }
-  } catch (error) {
-    console.error('[api1to1] Error updating local message status:', error);
-  }
+  });
 }
 
 /**
  * v23.0: Met à jour le statut d'un seul message (pour le flux sending -> sent/failed)
  */
-export async function updateSingleMessageStatus1to1(
+export function updateSingleMessageStatus1to1(
   sessionId: string,
   messageId: string,
   status: 'sending' | 'sent' | 'delivered' | 'read' | 'failed'
 ): Promise<void> {
-  try {
-    const key = MESSAGES_1TO1_PREFIX + sessionId;
-    const messages = await getAllLocalMessages1to1Internal(sessionId);
-    
-    const msg = messages.find(m => m.id === messageId);
-    if (msg) {
-      msg.status = status;
-      await secureSet(key, JSON.stringify(messages));
-      __DEV__ && console.log(`[api1to1] Message ${messageId.slice(0, 8)}... status updated to: ${status}`);
+  // P6 FIX: Sérialisé par session
+  return withStorageLock(sessionId, async () => {
+    try {
+      const key = MESSAGES_1TO1_PREFIX + sessionId;
+      const messages = await getAllLocalMessages1to1Internal(sessionId);
       
-      // Notifier les listeners du changement de statut
-      notifyMessageStatusChange(sessionId, messageId, status);
+      const msg = messages.find(m => m.id === messageId);
+      if (msg) {
+        msg.status = status;
+        await secureSet(key, JSON.stringify(messages));
+        __DEV__ && console.log(`[api1to1] Message ${messageId.slice(0, 8)}... status updated to: ${status}`);
+        
+        // Notifier les listeners du changement de statut
+        notifyMessageStatusChange(sessionId, messageId, status);
+      }
+    } catch (error) {
+      __DEV__ && console.error('[api1to1] Error updating single message status:', error);
     }
-  } catch (error) {
-    console.error('[api1to1] Error updating single message status:', error);
-  }
+  });
 }
 
 // v23.0: Listeners pour les changements de statut de message
@@ -3066,7 +3661,7 @@ function notifyMessageStatusChange(sessionId: string, messageId: string, status:
     try {
       listener(sessionId, messageId, status);
     } catch (e) {
-      console.error('[api1to1] Message status listener error:', e);
+      __DEV__ && console.error('[api1to1] Message status listener error:', e);
     }
   });
 }
@@ -3107,7 +3702,31 @@ export async function retryFailedMessage1to1(
     const myFingerprint = session.myIdentityKeyFingerprint;
     const myProfile = sessionService.getMyProfile();
     
-    // Construire le payload selon le type de message
+    // ═══════════════════════════════════════════════════════════════
+    // P7 FIX: RETRY MÉDIA VIA BLOB STORAGE (v26.0+)
+    //
+    // Les médias (image, file, voice) passent par le blob storage:
+    //   1. Résoudre les données locales (mfs:// → base64 → Uint8Array)
+    //   2. Re-chiffrer + re-uploader le blob
+    //   3. Envoyer la référence E2E via sendMediaRef1to1
+    //
+    // Les anciennes branches inline (image/voice/file → sendInnerPayload)
+    // sont conservées comme fallback pour les messages pré-v26.0 qui
+    // n'ont pas de blobMediaType mais ont des données inline.
+    // ═══════════════════════════════════════════════════════════════
+    
+    // Déterminer si c'est un média v26.0+ (blob storage)
+    const isBlobMedia = (message.messageType === 'image' || 
+                         message.messageType === 'file' || 
+                         message.messageType === 'voice' ||
+                         message.messageType === 'media_ref') &&
+                        (message.blobMediaType || message.blobId);
+    
+    if (isBlobMedia) {
+      return await _retryBlobMedia(sessionId, message, messageId);
+    }
+    
+    // ─── Fallback: messages texte ou médias inline pré-v26.0 ───
     let innerPayload: InnerPayload;
     
     switch (message.messageType) {
@@ -3128,70 +3747,102 @@ export async function retryFailedMessage1to1(
         };
         break;
         
-      case 'image':
-        if (!message.imageData || !message.thumbnailData) {
+      // P7 FIX: Legacy inline media — résoudre mfs:// avant envoi
+      case 'image': {
+        let imgData = message.imageData;
+        if (imgData && isMediaRef(imgData)) {
+          imgData = await resolveMediaToBase64(imgData);
+        }
+        if (!imgData) {
           await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
           return { success: false, error: 'Missing image data' };
         }
-        innerPayload = {
-          type: 'image',
-          content: message.content || '',
-          senderFingerprint: myFingerprint,
-          displayName: myProfile.displayName,
-          senderAvatarBase64: myProfile.avatarBase64,
-          timestamp: message.timestamp,
-          messageId: message.id,
-          imageData: message.imageData,
-          thumbnailData: message.thumbnailData,
-          imageWidth: message.imageWidth,
-          imageHeight: message.imageHeight,
-        };
-        break;
+        // Legacy: re-upload via blob storage (meilleur que inline)
+        try {
+          const imgBytes = base64ToUint8Array(imgData);
+          const blobResult = await encryptAndUploadBlob(imgBytes);
+          const result = await sendMediaRef1to1(sessionId, blobResult, 'image', {
+            imageWidth: message.imageWidth,
+            imageHeight: message.imageHeight,
+          });
+          if (result.success) {
+            await updateSingleMessageStatus1to1(sessionId, messageId, 'sent');
+            return { success: true };
+          } else {
+            await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
+            return { success: false, error: result.error };
+          }
+        } catch (blobErr) {
+          __DEV__ && console.error('[api1to1] ❌ Retry image blob upload failed:', blobErr);
+          await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
+          return { success: false, error: String(blobErr) };
+        }
+      }
         
-      case 'voice':
-        if (!message.voiceData) {
+      case 'voice': {
+        let vData = message.voiceData;
+        if (vData && isMediaRef(vData)) {
+          vData = await resolveMediaToBase64(vData);
+        }
+        if (!vData) {
           await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
           return { success: false, error: 'Missing voice data' };
         }
-        innerPayload = {
-          type: 'voice',
-          content: message.content,
-          senderFingerprint: myFingerprint,
-          displayName: myProfile.displayName,
-          senderAvatarBase64: myProfile.avatarBase64,
-          timestamp: message.timestamp,
-          messageId: message.id,
-          voiceData: message.voiceData,
-          voiceDuration: message.voiceDuration,
-        };
-        break;
+        try {
+          const voiceBytes = base64ToUint8Array(vData);
+          const blobResult = await encryptAndUploadBlob(voiceBytes);
+          const result = await sendMediaRef1to1(sessionId, blobResult, 'voice', {
+            voiceDuration: message.voiceDuration,
+          });
+          if (result.success) {
+            await updateSingleMessageStatus1to1(sessionId, messageId, 'sent');
+            return { success: true };
+          } else {
+            await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
+            return { success: false, error: result.error };
+          }
+        } catch (blobErr) {
+          await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
+          return { success: false, error: String(blobErr) };
+        }
+      }
         
-      case 'file':
-        if (!message.fileData || !message.fileName) {
+      case 'file': {
+        let fData = message.fileData;
+        if (fData && isMediaRef(fData)) {
+          fData = await resolveMediaToBase64(fData);
+        }
+        if (!fData || !message.fileName) {
           await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
           return { success: false, error: 'Missing file data' };
         }
-        innerPayload = {
-          type: 'file',
-          content: message.fileName,
-          senderFingerprint: myFingerprint,
-          displayName: myProfile.displayName,
-          senderAvatarBase64: myProfile.avatarBase64,
-          timestamp: message.timestamp,
-          messageId: message.id,
-          fileData: message.fileData,
-          fileName: message.fileName,
-          fileSize: message.fileSize,
-          fileMimeType: message.fileMimeType,
-        };
-        break;
+        try {
+          const fileBytes = base64ToUint8Array(fData);
+          const blobResult = await encryptAndUploadBlob(fileBytes);
+          const result = await sendMediaRef1to1(sessionId, blobResult, 'file', {
+            content: message.fileName,
+            fileName: message.fileName,
+            fileSize: message.fileSize,
+            fileMimeType: message.fileMimeType,
+          });
+          if (result.success) {
+            await updateSingleMessageStatus1to1(sessionId, messageId, 'sent');
+            return { success: true };
+          } else {
+            await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
+            return { success: false, error: result.error };
+          }
+        } catch (blobErr) {
+          await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
+          return { success: false, error: String(blobErr) };
+        }
+      }
         
       default:
         await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
         return { success: false, error: `Unsupported message type: ${message.messageType}` };
     }
     
-    // v25.0: sendInnerPayload gère automatiquement le chunking si nécessaire
     const result = await sendInnerPayload(sessionId, innerPayload);
     
     if (result.success) {
@@ -3200,12 +3851,88 @@ export async function retryFailedMessage1to1(
       return { success: true };
     } else {
       await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
-      console.error(`[api1to1] ❌ Retry failed for: ${messageId.slice(0, 8)}...`, result.error);
+      __DEV__ && console.error(`[api1to1] ❌ Retry failed for: ${messageId.slice(0, 8)}...`, result.error);
       return { success: false, error: result.error };
     }
   } catch (error) {
     await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
-    console.error('[api1to1] Error retrying message:', error);
+    __DEV__ && console.error('[api1to1] Error retrying message:', error);
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * P7 FIX: Retry un média v26.0+ (blob storage).
+ * Le message local a les données complètes (éventuellement externalisées mfs://).
+ * On résout → re-upload blob → envoie la référence E2E.
+ */
+async function _retryBlobMedia(
+  sessionId: string,
+  message: Message1to1,
+  messageId: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    // Déterminer le type de média effectif
+    const mediaType: 'image' | 'file' | 'voice' = 
+      message.blobMediaType || 
+      (message.messageType as 'image' | 'file' | 'voice');
+    
+    // Résoudre les données locales (mfs:// → base64)
+    let rawBase64: string | undefined;
+    
+    switch (mediaType) {
+      case 'image':
+        rawBase64 = message.imageData;
+        break;
+      case 'file':
+        rawBase64 = message.fileData;
+        break;
+      case 'voice':
+        rawBase64 = message.voiceData;
+        break;
+    }
+    
+    // Résoudre les refs externalisées (mfs://path → base64)
+    if (rawBase64 && isMediaRef(rawBase64)) {
+      rawBase64 = await resolveMediaToBase64(rawBase64);
+    }
+    
+    if (!rawBase64) {
+      __DEV__ && console.error(`[api1to1] ❌ Retry: no local data for ${mediaType} message`);
+      await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
+      return { success: false, error: `Données ${mediaType} introuvables localement` };
+    }
+    
+    __DEV__ && console.log(`[api1to1] 🔄 Re-uploading ${mediaType} blob (${Math.round(rawBase64.length / 1024)}KB)...`);
+    
+    // Re-chiffrer + re-uploader le blob
+    const dataBytes = base64ToUint8Array(rawBase64);
+    const blobResult = await encryptAndUploadBlob(dataBytes);
+    
+    __DEV__ && console.log(`[api1to1] ✅ Blob re-uploaded: ${blobResult.blobId.slice(0, 12)}...`);
+    
+    // Envoyer la référence E2E
+    const result = await sendMediaRef1to1(sessionId, blobResult, mediaType, {
+      content: message.content,
+      imageWidth: message.imageWidth,
+      imageHeight: message.imageHeight,
+      fileName: message.fileName,
+      fileSize: message.fileSize,
+      fileMimeType: message.fileMimeType,
+      voiceDuration: message.voiceDuration,
+    });
+    
+    if (result.success) {
+      await updateSingleMessageStatus1to1(sessionId, messageId, 'sent');
+      __DEV__ && console.log(`[api1to1] ✅ Retry blob media successful: ${messageId.slice(0, 8)}...`);
+      return { success: true };
+    } else {
+      await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
+      return { success: false, error: result.error };
+    }
+  } catch (error) {
+    __DEV__ && console.error('[api1to1] ❌ Retry blob media error:', error);
+    await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
     return { success: false, error: String(error) };
   }
 }
@@ -3213,28 +3940,31 @@ export async function retryFailedMessage1to1(
 /**
  * v23.0: Supprime un message échoué du cache local
  */
-export async function deleteFailedMessage1to1(
+export function deleteFailedMessage1to1(
   sessionId: string,
   messageId: string
 ): Promise<boolean> {
-  try {
-    const key = MESSAGES_1TO1_PREFIX + sessionId;
-    const messages = await getAllLocalMessages1to1Internal(sessionId);
-    
-    const index = messages.findIndex(m => m.id === messageId && m.status === 'failed');
-    if (index === -1) {
-      __DEV__ && console.log(`[api1to1] Message ${messageId.slice(0, 8)}... not found or not failed`);
+  // P6 FIX: Sérialisé par session
+  return withStorageLock(sessionId, async () => {
+    try {
+      const key = MESSAGES_1TO1_PREFIX + sessionId;
+      const messages = await getAllLocalMessages1to1Internal(sessionId);
+      
+      const index = messages.findIndex(m => m.id === messageId && m.status === 'failed');
+      if (index === -1) {
+        __DEV__ && console.log(`[api1to1] Message ${messageId.slice(0, 8)}... not found or not failed`);
+        return false;
+      }
+      
+      messages.splice(index, 1);
+      await secureSet(key, JSON.stringify(messages));
+      __DEV__ && console.log(`[api1to1] 🗑️ Deleted failed message: ${messageId.slice(0, 8)}...`);
+      return true;
+    } catch (error) {
+      __DEV__ && console.error('[api1to1] Error deleting failed message:', error);
       return false;
     }
-    
-    messages.splice(index, 1);
-    await secureSet(key, JSON.stringify(messages));
-    __DEV__ && console.log(`[api1to1] 🗑️ Deleted failed message: ${messageId.slice(0, 8)}...`);
-    return true;
-  } catch (error) {
-    console.error('[api1to1] Error deleting failed message:', error);
-    return false;
-  }
+  });
 }
 
 export async function clearLocalMessages1to1(sessionId: string): Promise<void> {
@@ -3244,14 +3974,43 @@ export async function clearLocalMessages1to1(sessionId: string): Promise<void> {
     
     const processedKey = PROCESSED_IDS_PREFIX + sessionId;
     await AsyncStorage.removeItem(processedKey);
+    // PERF A9: Nettoyer aussi le cache mémoire
+    _clearProcessedIdsCache(sessionId);
     
     const pollKey = LAST_POLL_PREFIX + sessionId;
     await AsyncStorage.removeItem(pollKey);
     
     const statusKey = STATUS_PREFIX + sessionId;
     await AsyncStorage.removeItem(statusKey);
+    
+    // BUG FIX #1/#2/#3: Nettoyer AUSSI le compteur non-lus et les réactions
+    // pour garantir un état propre lors d'une reconnexion (sessionId déterministe)
+    const unreadKey = UNREAD_COUNT_PREFIX + sessionId;
+    await AsyncStorage.removeItem(unreadKey);
+    
+    const reactionsKey = `${REACTIONS_STORAGE_KEY}${sessionId}`;
+    await AsyncStorage.removeItem(reactionsKey);
+    
+    // Nettoyer le cache de migration mémoire pour cette session
+    _migratedSessions.delete(sessionId);
+    
+    // Nettoyer les fichiers médias locaux (images, vocaux, fichiers téléchargés)
+    await deleteSessionMedia(sessionId);
+    
+    // BUG FIX #9: Expirer les invitations associées à cette session.
+    // CRITIQUE: Sans cela, l'InviteWatcher détecte l'invite comme "orpheline"
+    // et re-finalise l'ancien accept PQXDH → session zombie avec ratchet périmé,
+    // tous les messages échouent au déchiffrement.
+    try {
+      const { pendingInviteStore } = await import('./pendingInvites');
+      await pendingInviteStore.markExpiredBySessionId(sessionId);
+    } catch (e) {
+      __DEV__ && console.error('[api1to1] Error expiring invites for session:', e);
+    }
+    
+    __DEV__ && console.log(`[api1to1] 🧹 Full transport cleanup done for session ${sessionId.slice(0, 12)}...`);
   } catch (error) {
-    console.error('[api1to1] Error clearing local messages:', error);
+    __DEV__ && console.error('[api1to1] Error clearing local messages:', error);
   }
 }
 
@@ -3271,8 +4030,73 @@ async function setLastPollTime(sessionId: string, time: Date): Promise<void> {
     const key = LAST_POLL_PREFIX + sessionId;
     await secureSet(key, time.toISOString());
   } catch (error) {
-    console.error('[api1to1] Error setting poll time:', error);
+    __DEV__ && console.error('[api1to1] Error setting poll time:', error);
   }
+}
+
+// ============================================
+// P3 FIX: RÉCUPÉRATION DES MESSAGES ORPHELINS 'sending'
+// ============================================
+//
+// PROBLÈME: Si l'app est tuée ou verrouillée entre saveLocalMessage(status:'sending')
+// et updateSingleMessageStatus('sent'|'failed'), le message reste en 'sending' pour
+// toujours. L'utilisateur ne peut ni le renvoyer ni le supprimer.
+//
+// SOLUTION: Au démarrage, scanner toutes les sessions et passer les messages
+// 'sending' en 'failed'. L'utilisateur voit un indicateur d'échec et peut
+// retenter ou supprimer via l'UI.
+//
+// QUAND APPELER: Après sessionService.initialize() et initHardwareEncryptionAll(),
+// avant startGlobalPolling1to1(). Le chiffrement local doit être opérationnel
+// pour pouvoir lire et réécrire les messages.
+
+export async function recoverOrphanedSendingMessages(): Promise<number> {
+  let totalRecovered = 0;
+  
+  try {
+    const sessions = sessionService.getAllSessions();
+    if (sessions.length === 0) return 0;
+    
+    for (const session of sessions) {
+      try {
+        const key = MESSAGES_1TO1_PREFIX + session.id;
+        const stored = await secureGet(key);
+        if (!stored) continue;
+        
+        const messages: Message1to1[] = JSON.parse(stored);
+        let changed = false;
+        
+        for (const msg of messages) {
+          if (msg.isMine && msg.status === 'sending') {
+            msg.status = 'failed';
+            changed = true;
+            totalRecovered++;
+            __DEV__ && console.log(
+              `[api1to1] 🔄 P3: Recovered orphaned message ${msg.id.slice(0, 8)}... ` +
+              `(type: ${msg.messageType || 'text'}) → status: failed`
+            );
+          }
+        }
+        
+        if (changed) {
+          await secureSet(key, JSON.stringify(messages));
+        }
+      } catch (sessionErr) {
+        // Session illisible (clé de chiffrement pas encore dispo, etc.) — skip
+        __DEV__ && console.warn(
+          `[api1to1] ⚠️ P3: Could not check session ${session.id.slice(0, 12)}...`, sessionErr
+        );
+      }
+    }
+    
+    if (totalRecovered > 0) {
+      __DEV__ && console.log(`[api1to1] 🔄 P3: Recovered ${totalRecovered} orphaned 'sending' message(s) → 'failed'`);
+    }
+  } catch (error) {
+    __DEV__ && console.error('[api1to1] ❌ P3: recoverOrphanedSendingMessages error:', error);
+  }
+  
+  return totalRecovered;
 }
 
 // ============================================
@@ -3290,6 +4114,20 @@ export async function clearAll1to1Data(): Promise<void> {
     clearAvatarHashCache();
     clearAllMediaFiles();
     
+    // BUG FIX #7: Vider les sets mémoire globaux qui survivent entre sessions
+    // Sans cela, les IDs de messages de l'ancienne session filtrent les nouveaux messages
+    recentlySentIds.clear();
+    inFlightOrProcessedIds.clear();
+    _migratedSessions.clear();
+    
+    // BUG FIX #9: Vider le cache de l'InviteWatcher et les invitations
+    try {
+      const { inviteWatcher } = await import('./inviteWatcher');
+      inviteWatcher.clearProcessedCache();
+      const { pendingInviteStore } = await import('./pendingInvites');
+      await pendingInviteStore.removeAll();
+    } catch {}
+    
     // Vider les callbacks
     statusCallbacks.clear();
     reactionCallbacks.clear();
@@ -3302,7 +4140,9 @@ export async function clearAll1to1Data(): Promise<void> {
       key.startsWith(MESSAGES_1TO1_PREFIX) ||
       key.startsWith(LAST_POLL_PREFIX) ||
       key.startsWith(PROCESSED_IDS_PREFIX) ||
-      key.startsWith(STATUS_PREFIX)
+      key.startsWith(STATUS_PREFIX) ||
+      key.startsWith(UNREAD_COUNT_PREFIX) ||
+      key.startsWith(REACTIONS_STORAGE_KEY)
     );
     
     if (keysToDelete.length > 0) {
@@ -3312,7 +4152,7 @@ export async function clearAll1to1Data(): Promise<void> {
     
     __DEV__ && console.log('[api1to1] ✅ All 1-to-1 data cleared');
   } catch (error) {
-    console.error('[api1to1] Error clearing data:', error);
+    __DEV__ && console.error('[api1to1] Error clearing data:', error);
     throw error;
   }
 }
@@ -3330,7 +4170,7 @@ export async function getUnreadCount(sessionId: string): Promise<number> {
     const stored = await secureGet(key);
     return stored ? parseInt(stored, 10) : 0;
   } catch (error) {
-    console.error('[api1to1] Error getting unread count:', error);
+    __DEV__ && console.error('[api1to1] Error getting unread count:', error);
     return 0;
   }
 }
@@ -3344,7 +4184,7 @@ export async function incrementUnreadCount(sessionId: string): Promise<void> {
     const key = UNREAD_COUNT_PREFIX + sessionId;
     await secureSet(key, (current + 1).toString());
   } catch (error) {
-    console.error('[api1to1] Error incrementing unread count:', error);
+    __DEV__ && console.error('[api1to1] Error incrementing unread count:', error);
   }
 }
 
@@ -3356,7 +4196,7 @@ export async function clearUnreadCount(sessionId: string): Promise<void> {
     const key = UNREAD_COUNT_PREFIX + sessionId;
     await secureSet(key, '0');
   } catch (error) {
-    console.error('[api1to1] Error clearing unread count:', error);
+    __DEV__ && console.error('[api1to1] Error clearing unread count:', error);
   }
 }
 
@@ -3382,7 +4222,7 @@ export async function getAllUnreadCounts(): Promise<Map<string, number>> {
     
     return result;
   } catch (error) {
-    console.error('[api1to1] Error getting all unread counts:', error);
+    __DEV__ && console.error('[api1to1] Error getting all unread counts:', error);
     return new Map();
   }
 }
@@ -3475,15 +4315,39 @@ export function ensureSealedSenderBootstrap(): Promise<boolean> {
     }
     
     let { pow, difficulty } = await _precomputedPowPromise!;
+    
+    // FIX REPLAY: Invalider le PoW pré-calculé après consommation.
+    // Sans ça, _precomputedPowPromise reste une promesse résolue avec le même PoW.
+    // Si un second bootstrap (ou sendSingleChunk → ensureSealedSenderBootstrap)
+    // lit cette promesse avant que resetSealedSenderBootstrap() ne la nullifie,
+    // le même PoW est soumis deux fois → gateway 403 replay_detected.
+    _precomputedPowPromise = null;
+    
+    // FIX: Check PoW freshness — if computed >3 min ago, recompute.
+    // The gateway rejects PoW older than 5 min (POW_TIMESTAMP_WINDOW_MS).
+    // The pre-computed PoW can become stale because:
+    //   - PoW computation competes with OTPK generation for CPU
+    //   - sessionService.initialize() and relay bootstrap add delay
+    //   - Total time from PoW.timestamp to submission can exceed 5 min
+    const POW_MAX_AGE_MS = 3 * 60 * 1000; // 3 min (safe margin before 5 min server window)
+    if (Date.now() - pow.timestamp > POW_MAX_AGE_MS) {
+      __DEV__ && console.log(`[api1to1] ⛏️ Pre-computed PoW is stale (${Math.round((Date.now() - pow.timestamp) / 1000)}s old), recomputing...`);
+      const { computeProofOfWork } = await import('./proofOfWork');
+      pow = await computeProofOfWork(difficulty);
+      __DEV__ && console.log(`[api1to1] ⛏️ Fresh PoW computed: nonce=${pow.nonce}, age=0s`);
+    }
+    
     const MAX_RETRIES = 2;
     
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
-        // Retry avec une difficulté plus haute — recalcul nécessaire
+        // Retry: always recompute fresh PoW (previous one was submitted and is now replay-marked)
         const { computeProofOfWork } = await import('./proofOfWork');
         pow = await computeProofOfWork(difficulty);
         __DEV__ && console.log(`[api1to1] ⛏️ PoW re-computed: nonce=${pow.nonce}, difficulty=${difficulty} (retry #${attempt})`);
       }
+      
+      __DEV__ && console.log(`[api1to1] 🔐 Submitting PoW: ts=${pow.timestamp}, age=${Math.round((Date.now() - pow.timestamp) / 1000)}s, nonce=${pow.nonce}, difficulty=${pow.difficulty}`);
 
       // Obtenir le certificat anonyme via le relay OHTTP (with PoW)
       const { data, error } = await secureRpc('get_sealed_certificate', { pow });
@@ -3510,7 +4374,7 @@ export function ensureSealedSenderBootstrap(): Promise<boolean> {
     if (ready) {
       __DEV__ && console.log('[api1to1] 🛡️ Sealed sender ACTIVE — messages are anonymous');
     } else {
-      console.error('[api1to1] ❌ Sealed sender FAILED — all sends BLOCKED until bootstrap succeeds');
+      __DEV__ && console.error('[api1to1] ❌ Sealed sender FAILED — all sends BLOCKED until bootstrap succeeds');
     }
     return ready;
   }).catch(() => false);
@@ -3568,7 +4432,7 @@ export async function waitForSealedSender(
     }
   }
   
-  console.error(`[api1to1] ❌ Sealed sender bootstrap FAILED after ${maxRetries} attempts`);
+  __DEV__ && console.error(`[api1to1] ❌ Sealed sender bootstrap FAILED after ${maxRetries} attempts`);
   return false;
 }
 
@@ -3607,6 +4471,7 @@ async function sendSessionDecoy(sessionId: string): Promise<void> {
       p_tag: envelope.tag,
       p_sealed_content: envelope.sealedContent,
       p_version: envelope.version,
+      p_push_blob: generateRandomPushBlob(),
     });
     
     __DEV__ && console.log('[api1to1] 👻🎯 Session-targeted decoy sent to', sessionId.slice(0, 8) + '...');
@@ -3622,9 +4487,16 @@ export function startGlobalPolling1to1(): void {
   globalPollState.isRunning = true;
   __DEV__ && console.log('[api1to1] 🌍 Starting global polling + constant-rate traffic');
   
-  // Audit Fix C-01: Bootstrap du sealed sender (async, non-bloquant).
-  // ACTION 01: Sealed sender est OBLIGATOIRE.
-  ensureSealedSenderBootstrap();
+  // PERF A1: Ne re-bootstrapper que si le certificat est expiré ou absent.
+  // Au retour de background, le certificat peut encore être valide (conservé en mémoire
+  // par la suppression du resetSealedSenderBootstrap dans stop). Cela économise 2-5s
+  // de PoW + RPC OHTTP à chaque retour d'app.
+  if (!isSealedSenderReady()) {
+    __DEV__ && console.log('[api1to1] 🛡️ Sealed sender expired/absent — bootstrapping...');
+    ensureSealedSenderBootstrap();
+  } else {
+    __DEV__ && console.log('[api1to1] 🛡️ Sealed sender still valid — skipping bootstrap');
+  }
   
   // Démarrer le constant-rate traffic en arrière-plan
   // 1 decoy par slot (~30s), poll toutes les ~45s
@@ -3638,6 +4510,9 @@ export function startGlobalPolling1to1(): void {
   
   // Premier poll immédiat
   performGlobalPoll();
+  
+  // Push notifications: envoyer notre token aux pairs via E2E
+  sendPushTokenToAllPeers().catch(() => {});
 }
 
 /**
@@ -3645,7 +4520,15 @@ export function startGlobalPolling1to1(): void {
  */
 export function stopGlobalPolling1to1(): void {
   globalPollState.isRunning = false;
-  resetSealedSenderBootstrap(); // FIX: Reset pour permettre un re-bootstrap au resume
+  // PERF A1: NE PLUS détruire le sealed sender au simple passage en background.
+  // Le certificat anonyme (nonce aléatoire + HMAC, aucune identité) est safe en mémoire
+  // tant que le process n'est pas exposé. Cela évite un re-bootstrap coûteux (PoW 1-2s
+  // + RPC OHTTP) à chaque retour de foreground.
+  //
+  // Le certificat est toujours détruit dans deux cas :
+  //   1. Verrouillage PIN timeout → clearSealedSenderState() (App.tsx)
+  //   2. Expiration naturelle → getSenderCertificate() retourne null (sealedSender.ts:92)
+  // resetSealedSenderBootstrap() — supprimé intentionnellement
   
   if (globalPollState.intervalId) {
     clearTimeout(globalPollState.intervalId);
@@ -3711,16 +4594,16 @@ async function performGlobalPoll(): Promise<void> {
             try {
               callback(session.id, message);
             } catch (e) {
-              console.error('[api1to1] Global callback error:', e);
+              __DEV__ && console.error('[api1to1] Global callback error:', e);
             }
           }
         }
       } catch (e) {
-        console.error('[api1to1] Global poll error for session:', session.id, e);
+        __DEV__ && console.error('[api1to1] Global poll error for session:', session.id, e);
       }
     }
   } catch (error) {
-    console.error('[api1to1] Global poll exception:', error);
+    __DEV__ && console.error('[api1to1] Global poll exception:', error);
   }
 }
 
@@ -3760,14 +4643,91 @@ export async function forceFetchAndNotify1to1(sessionId: string): Promise<void> 
           try {
             cb(msg);
           } catch (e) {
-            console.error('[api1to1] Force fetch callback error:', e);
+            __DEV__ && console.error('[api1to1] Force fetch callback error:', e);
           }
         }
       }
     }
   } catch (error) {
-    console.error('[api1to1] Force fetch error:', error);
+    __DEV__ && console.error('[api1to1] Force fetch error:', error);
   }
+}
+
+// ============================================
+// PUSH NOTIFICATIONS — Token Registration
+// ============================================
+
+/**
+ * Envoie notre push token à tous les pairs via message E2E.
+ * Appelé au démarrage et quand le token change.
+ * Le pair stocke le token localement pour l'inclure dans ses envois.
+ */
+export async function sendPushTokenToAllPeers(): Promise<void> {
+  const tokenInfo = getOwnPushTokenInfo();
+  if (!tokenInfo) return;
+  
+  await sessionService.initialize();
+  const sessions = sessionService.getAllSessions();
+  
+  __DEV__ && console.log(`[api1to1] 🔔 Sending push token to ${sessions.length} peers`);
+  
+  for (const session of sessions) {
+    try {
+      await sendPushTokenToPeer(session.id);
+    } catch (err) {
+      __DEV__ && console.warn(`[api1to1] Push token send failed for ${session.id.slice(0, 8)}:`, err);
+    }
+  }
+}
+
+/**
+ * Envoie notre push token à un pair spécifique via message E2E.
+ * Appelé quand une nouvelle session est établie (PQXDH handshake complet).
+ * Le pair stocke le token localement pour l'inclure dans ses envois.
+ */
+export async function sendPushTokenToPeer(sessionId: string): Promise<void> {
+  // Retry si push pas encore initialisé (arrive quand la session est créée
+  // immédiatement après le lancement de l'app — push init est async).
+  let tokenInfo = getOwnPushTokenInfo();
+  if (!tokenInfo) {
+    // Attendre un peu que l'init push se termine, puis réessayer
+    for (let i = 0; i < 3; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      tokenInfo = getOwnPushTokenInfo();
+      if (tokenInfo) break;
+    }
+    if (!tokenInfo) {
+      __DEV__ && console.warn('[api1to1] ⚠️ Push token not available after retries — skipping');
+      return;
+    }
+  }
+  
+  await sessionService.initialize();
+  const session = sessionService.getSession(sessionId);
+  if (!session) return;
+  
+  const messageId = generateMessageId();
+  const myProfile = sessionService.getMyProfile();
+  
+  const innerPayload: InnerPayload = {
+    type: 'push_token_update',
+    content: JSON.stringify({
+      pushToken: tokenInfo.token,
+      pushPlatform: tokenInfo.platform,
+    }),
+    senderFingerprint: session.myIdentityKeyFingerprint,
+    displayName: myProfile.displayName,
+    timestamp: Date.now(),
+    messageId,
+  };
+  
+  // 'urgent' au lieu de 'deferred' : le push token doit partir immédiatement
+  // après la création de session. Pas de risque de side-channel car la création
+  // de session est déjà un événement visible (l'utilisateur scanne un QR code).
+  // Avec 'deferred', le token restait bloqué dans la queue car le cycle de
+  // constant traffic est souvent reset lors des transitions d'écran post-onboarding.
+  await sendSingleChunk(sessionId, innerPayload, session, 'urgent');
+  __DEV__ && console.log(`[api1to1] 🔔 Push token sent to ${sessionId.slice(0, 8)}...`);
 }
 
 // ============================================

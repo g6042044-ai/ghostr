@@ -103,7 +103,7 @@ async function _doInit(): Promise<boolean> {
 
     // Vérifier que memzero existe
     if (typeof sodium.memzero !== 'function') {
-      console.warn('[SodiumZeroize] ⚠️ sodium.memzero not found — using JS fallback');
+      __DEV__ && console.warn('[SodiumZeroize] ⚠️ sodium.memzero not found — using JS fallback');
       return false;
     }
 
@@ -113,7 +113,7 @@ async function _doInit(): Promise<boolean> {
     const allZero = testBuf[0] === 0 && testBuf[1] === 0 && testBuf[2] === 0 && testBuf[3] === 0;
 
     if (!allZero) {
-      console.warn('[SodiumZeroize] ⚠️ sodium.memzero self-test FAILED — using JS fallback');
+      __DEV__ && console.warn('[SodiumZeroize] ⚠️ sodium.memzero self-test FAILED — using JS fallback');
       return false;
     }
 
@@ -121,7 +121,7 @@ async function _doInit(): Promise<boolean> {
     _ready = true;
 
     if (__DEV__) {
-      console.log('[SodiumZeroize] ✅ libsodium memzero ready (guaranteed zeroization)');
+      __DEV__ && console.log('[SodiumZeroize] ✅ libsodium memzero ready (guaranteed zeroization)');
     }
 
     return true;
@@ -131,7 +131,7 @@ async function _doInit(): Promise<boolean> {
     // Pas de dépendance libsodium installée, ou erreur d'init.
     // Pas grave — le fallback JS dans primitives.ts prend le relais.
     if (__DEV__) {
-      console.log(
+      __DEV__ && console.log(
         '[SodiumZeroize] ℹ️ libsodium-wrappers not available, using JS fallback.',
         (err as Error)?.message ?? err,
       );

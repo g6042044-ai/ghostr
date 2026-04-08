@@ -182,7 +182,9 @@ export function getDirectionalSendTag(
  * Inclut:
  * 1. Tag directionnel de réception (jour courant) — messages envoyés aujourd'hui
  * 2. Tag directionnel de réception (jour précédent) — overlap pour messages en transit
- * 3. Tag permanent legacy — backward compat avec messages envoyés avant cette migration
+ * 
+ * P0-A3: Le tag permanent legacy a été SUPPRIMÉ. Ce tag fixe permettait au serveur
+ * de corréler une conversation indéfiniment, annulant la protection des tags rotatifs.
  * 
  * L'overlap de 48h garantit qu'aucun message n'est perdu lors de la rotation.
  * 
@@ -200,26 +202,12 @@ export function getDirectionalReceiveTags(
   const currentDay = getTagDayNumber();
   const previousDay = currentDay - 1;
   
-  // Tags directionnels (jour courant + précédent)
+  // Tags directionnels (jour courant + précédent pour overlap)
   const currentDayTag = deriveDirectionalTag(seed, receiveDirection, currentDay);
   const previousDayTag = deriveDirectionalTag(seed, receiveDirection, previousDay);
   
-  // Tag permanent legacy pour backward compat (messages envoyés avant la migration)
-  const legacyPermanentTag = getLegacyPermanentTag(seed);
-  
-  return [...new Set([currentDayTag, previousDayTag, legacyPermanentTag])];
-}
-
-/**
- * Tag permanent legacy — utilisé avant ACTION 3.
- * Conservé UNIQUEMENT pour le polling des anciens messages.
- * NE PLUS UTILISER pour l'envoi.
- */
-function getLegacyPermanentTag(seed: Uint8Array): string {
-  const tagBytes = hkdf(sha256, seed, new Uint8Array(32), 'ghostr-permanent-tag-v1', 32);
-  return Array.from(tagBytes)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+  // P0-A3: Plus de tag permanent legacy — uniquement des tags rotatifs
+  return [...new Set([currentDayTag, previousDayTag])];
 }
 
 // ============================================
@@ -256,41 +244,7 @@ export function getCurrentEpochTag(seed: Uint8Array): string {
 // POLLING TAGS
 // ============================================
 
-/**
- * @deprecated ACTION 3: Remplacé par getDirectionalReceiveTags().
- * Conservé UNIQUEMENT pour backward compatibility.
- * 
- * Retourne les tags à poller (permanent + epoch courant + précédent).
- */
-export function getPollingTags(seed: Uint8Array, timestampMs: number = Date.now()): string[] {
-  const currentEpoch = getEpochNumber(timestampMs);
-  const previousEpoch = currentEpoch - 1;
-  
-  // Tag permanent (identique à getSendTag)
-  const permanentTag = getSendTag(seed);
-  
-  // Epoch tags pour backward compatibility
-  const currentTag = deriveEpochTag(seed, currentEpoch);
-  const previousTag = deriveEpochTag(seed, previousEpoch);
-  
-  // Dédupliquer
-  return [...new Set([permanentTag, currentTag, previousTag])];
-}
 
-// ============================================
-// SEND TAG
-// ============================================
-
-/**
- * @deprecated ACTION 3: Remplacé par getDirectionalSendTag().
- * Conservé UNIQUEMENT pour backward compatibility.
- * 
- * Retourne le tag PERMANENT (non-directionnel, non-rotatif).
- * Le serveur voit le même tag pour toute la durée de la conversation.
- */
-export function getSendTag(seed: Uint8Array): string {
-  return getLegacyPermanentTag(seed);
-}
 
 // ============================================
 // DECOY TAGS — MIXED (Audit Fix L-03)
@@ -368,7 +322,9 @@ export function getPollingTagsWithDecoys(
   timestampMs: number = Date.now()
 ): string[] {
   const epochNumber = getEpochNumber(timestampMs);
-  const realTags = getPollingTags(realSeed, timestampMs);
+  const currentTag = deriveEpochTag(realSeed, epochNumber);
+  const previousTag = deriveEpochTag(realSeed, epochNumber - 1);
+  const realTags = [...new Set([currentTag, previousTag])];
   
   // Audit Fix L-03: 50% HKDF-persistants + 50% aléatoires
   const hkdfCount = Math.ceil(decoyCount / 2);

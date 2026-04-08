@@ -22,6 +22,8 @@ import {
   loadReactions,
   toggleReactionStorage,
   StoredReaction,
+  retryFailedMessage1to1,
+  deleteFailedMessage1to1,
 } from '../services/api1to1';
 import {
   sendImageMessage1to1,
@@ -129,6 +131,10 @@ export interface UseUnifiedMessagesResult {
   deleteAllMessages: () => Promise<boolean>;
   addMessage: (message: UnifiedMessage) => void;
   updateMessage: (messageId: string, updates: Partial<UnifiedMessage>) => void;
+  
+  // P7 FIX: Actions - Messages échoués
+  retryMessage: (messageId: string) => Promise<boolean>;
+  deleteFailedMessage: (messageId: string) => Promise<boolean>;
   
   // Info
   conversationInfo: ConversationInfo;
@@ -684,6 +690,53 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
     ));
   }, []);
 
+  // ==========================================
+  // P7 FIX: RETRY / DELETE FAILED MESSAGES
+  // ==========================================
+  
+  const retryMessage = React.useCallback(async (messageId: string): Promise<boolean> => {
+    try {
+      // Mettre à jour l'UI immédiatement (optimiste)
+      setMessages(prev => prev.map(m => 
+        m.id === messageId ? { ...m, status: 'sending' as any } : m
+      ));
+      
+      const result = await retryFailedMessage1to1(conversationId, messageId);
+      
+      if (result.success) {
+        setMessages(prev => prev.map(m => 
+          m.id === messageId ? { ...m, status: 'sent' as any } : m
+        ));
+        return true;
+      } else {
+        setMessages(prev => prev.map(m => 
+          m.id === messageId ? { ...m, status: 'failed' as any } : m
+        ));
+        setError(result.error || 'Échec du renvoi');
+        return false;
+      }
+    } catch (e) {
+      console.error('[useUnifiedMessages] Retry error:', e);
+      setMessages(prev => prev.map(m => 
+        m.id === messageId ? { ...m, status: 'failed' as any } : m
+      ));
+      return false;
+    }
+  }, [conversationId]);
+  
+  const deleteFailedMessage = React.useCallback(async (messageId: string): Promise<boolean> => {
+    try {
+      const result = await deleteFailedMessage1to1(conversationId, messageId);
+      if (result) {
+        setMessages(prev => prev.filter(m => m.id !== messageId));
+      }
+      return result;
+    } catch (e) {
+      console.error('[useUnifiedMessages] Delete failed message error:', e);
+      return false;
+    }
+  }, [conversationId]);
+
   // Accept/decline are no-ops for 1:1
 
   // ==========================================
@@ -773,6 +826,8 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
     deleteAllMessages,
     addMessage,
     updateMessage,
+    retryMessage,
+    deleteFailedMessage,
     conversationInfo,
   };
 }

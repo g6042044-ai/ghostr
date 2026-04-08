@@ -51,7 +51,7 @@ function notifyStateChange(conversationId: string, callInfo: ActiveCallInfo | nu
     try {
       listener(conversationId, callInfo);
     } catch (error) {
-      console.error('💓 Listener error:', error);
+      __DEV__ && console.error('💓 Listener error:', error);
     }
   });
 }

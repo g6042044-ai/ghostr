@@ -237,7 +237,7 @@ export function generatePQProtectedSenderKey(
   // signatureKey reste aléatoire pour l'authentification
   const signatureKey = nacl.randomBytes(32);
   
-  console.log(`[SenderKeys] 🔐 PQ-protected SenderKey generated (gen ${generation}, reason: ${reason})`);
+  __DEV__ && console.log(`[SenderKeys] 🔐 PQ-protected SenderKey generated (gen ${generation}, reason: ${reason})`);
   
   return {
     keyId: encodeBase64(keyIdSeed),
@@ -315,7 +315,7 @@ export async function rotateSenderKeyPCS(
   const oldKey = state.currentKey;
   const newGeneration = oldKey.generation + 1;
   
-  console.log(`[SenderKeys] 🔄 PCS Rotation (gen ${oldKey.generation} → ${newGeneration}, reason: ${reason})`);
+  __DEV__ && console.log(`[SenderKeys] 🔄 PCS Rotation (gen ${oldKey.generation} → ${newGeneration}, reason: ${reason})`);
   
   // ============================================
   // ÉTAPE 1: GÉNÉRER DE L'ENTROPIE FRAÎCHE
@@ -367,11 +367,11 @@ export async function rotateSenderKeyPCS(
     try {
       await state.onRotationNeeded(newKey, reason);
     } catch (error) {
-      console.error('[SenderKeys] Error notifying rotation:', error);
+      __DEV__ && console.error('[SenderKeys] Error notifying rotation:', error);
     }
   }
   
-  console.log(`[SenderKeys] ✅ PCS Rotation complete - fresh entropy injected`);
+  __DEV__ && console.log(`[SenderKeys] ✅ PCS Rotation complete - fresh entropy injected`);
   
   return { newKey, freshEntropy };
 }
@@ -411,7 +411,7 @@ function generateSenderKeyWithFreshEntropy(
   const chainKey = new Uint8Array(derived.slice(16, 48));
   const signatureKey = nacl.randomBytes(32);
   
-  console.log(`[SenderKeys] 🔐 Generated PCS-protected SenderKey (gen ${generation}, with fresh entropy)`);
+  __DEV__ && console.log(`[SenderKeys] 🔐 Generated PCS-protected SenderKey (gen ${generation}, with fresh entropy)`);
   
   return {
     keyId: encodeBase64(keyIdSeed),
@@ -460,7 +460,7 @@ export function applyReceivedRotation(
 ): SenderKey {
   const oldKey = state.currentKey;
   
-  console.log(`[SenderKeys] 📥 Applying received rotation (gen ${oldKey.generation} → ${newGeneration})`);
+  __DEV__ && console.log(`[SenderKeys] 📥 Applying received rotation (gen ${oldKey.generation} → ${newGeneration})`);
   
   // Archiver l'ancienne clé
   state.previousKeys.set(oldKey.keyId, {
@@ -527,7 +527,7 @@ function cleanupExpiredKeys(state: SenderKeyState): void {
   }
   
   if (toDelete.length > 0) {
-    console.log(`[SenderKeys] 🧹 Cleaned up ${toDelete.length} expired previous keys`);
+    __DEV__ && console.log(`[SenderKeys] 🧹 Cleaned up ${toDelete.length} expired previous keys`);
   }
 }
 
@@ -567,7 +567,7 @@ export function getKeyById(state: SenderKeyState, keyId: string): SenderKey | nu
 export async function rotateOnMemberLeft(
   state: SenderKeyState
 ): Promise<{ newKey: SenderKey; freshEntropy: Uint8Array }> {
-  console.log('[SenderKeys] 🚪 Member left - forcing PCS rotation with fresh entropy');
+  __DEV__ && console.log('[SenderKeys] 🚪 Member left - forcing PCS rotation with fresh entropy');
   return rotateSenderKeyPCS(state, 'member_left');
 }
 
@@ -583,11 +583,11 @@ export async function onMemberJoined(
   forceRotation: boolean = false
 ): Promise<{ newKey: SenderKey; freshEntropy: Uint8Array | null }> {
   if (forceRotation) {
-    console.log('[SenderKeys] 👋 Member joined - rotating with fresh entropy for extra security');
+    __DEV__ && console.log('[SenderKeys] 👋 Member joined - rotating with fresh entropy for extra security');
     return rotateSenderKeyPCS(state, 'member_joined');
   }
   
-  console.log('[SenderKeys] 👋 Member joined - distributing current key (no rotation)');
+  __DEV__ && console.log('[SenderKeys] 👋 Member joined - distributing current key (no rotation)');
   return { newKey: state.currentKey, freshEntropy: null };
 }
 
@@ -640,7 +640,7 @@ export function prepareSenderKeyDistribution(
     entropyPacket.set(encryptedEntropy, entropyNonce.length);
     distribution.freshEntropy = encodeBase64(entropyPacket);
     
-    console.log(`[SenderKeys] 📤 Distribution includes fresh entropy for PCS (gen ${senderKey.generation})`);
+    __DEV__ && console.log(`[SenderKeys] 📤 Distribution includes fresh entropy for PCS (gen ${senderKey.generation})`);
   }
   
   return distribution;
@@ -687,13 +687,13 @@ export function receiveSenderKeyDistribution(
     const decryptedEntropy = nacl.secretbox.open(encryptedEntropy, entropyNonce, decryptionKey);
     if (decryptedEntropy) {
       freshEntropy = new Uint8Array(decryptedEntropy);
-      console.log(`[SenderKeys] 📥 Received fresh entropy for PCS (gen ${distribution.generation})`);
+      __DEV__ && console.log(`[SenderKeys] 📥 Received fresh entropy for PCS (gen ${distribution.generation})`);
     } else {
-      console.warn('[SenderKeys] ⚠️ Failed to decrypt fresh entropy');
+      __DEV__ && console.warn('[SenderKeys] ⚠️ Failed to decrypt fresh entropy');
     }
   }
   
-  console.log(`[SenderKeys] 📥 Received SenderKey distribution (gen ${distribution.generation}, reason: ${distribution.reason})`);
+  __DEV__ && console.log(`[SenderKeys] 📥 Received SenderKey distribution (gen ${distribution.generation}, reason: ${distribution.reason})`);
   
   const senderKey: SenderKey = {
     keyId: distribution.keyId,
@@ -842,7 +842,7 @@ export function decryptAudioPacketWithState(
     }
     
     if (!encryptedPacket || encryptedPacket.length < 48) { // 16 + 4 + 4 + 24 minimum
-      console.warn('[SenderKeys] Packet too short or missing');
+      __DEV__ && console.warn('[SenderKeys] Packet too short or missing');
       return null;
     }
     
@@ -881,7 +881,7 @@ export function decryptAudioPacketWithState(
     return new Uint8Array(decrypted);
     
   } catch (error) {
-    console.error('[SenderKeys] decryptAudioPacket error:', error);
+    __DEV__ && console.error('[SenderKeys] decryptAudioPacket error:', error);
     return null;
   }
 }
@@ -938,7 +938,7 @@ export function decryptAudioPacket(senderKey: SenderKey, encryptedPacket: Uint8A
     }
     
     if (!encryptedPacket || encryptedPacket.length < 44) { // 16 + 4 + 24 minimum
-      console.warn('[SenderKeys] Packet too short or missing');
+      __DEV__ && console.warn('[SenderKeys] Packet too short or missing');
       return null;
     }
     
@@ -965,7 +965,7 @@ export function decryptAudioPacket(senderKey: SenderKey, encryptedPacket: Uint8A
     return new Uint8Array(decrypted);
     
   } catch (error) {
-    console.error('[SenderKeys] decryptAudioPacket error:', error);
+    __DEV__ && console.error('[SenderKeys] decryptAudioPacket error:', error);
     return null;
   }
 }
@@ -1007,7 +1007,7 @@ function deriveMessageKey(chainKey: Uint8Array, index: number): Uint8Array {
 function advanceChainKey(senderKey: SenderKey): void {
   // v19.0: Validation robuste
   if (!senderKey || !senderKey.chainKey || senderKey.chainKey.length !== 32) {
-    console.warn('[SenderKeys] Cannot advance invalid chainKey');
+    __DEV__ && console.warn('[SenderKeys] Cannot advance invalid chainKey');
     return;
   }
   

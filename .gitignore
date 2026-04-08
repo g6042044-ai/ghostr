@@ -1,0 +1,49 @@
+# ============================================
+# GHOSTR — .gitignore
+# ============================================
+
+# Credentials — NEVER commit these
+push-proxy/fcm-service-account.json
+push-proxy/apns-key.p8
+google-services.json
+*.p8
+*.p12
+*.keystore
+*.jks
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Expo / React Native
+.expo/
+dist/
+*.hbc
+*.jsbundle
+web-build/
+
+# Build outputs
+android/
+ios/
+*.apk
+*.aab
+*.ipa
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Backups
+*.bak

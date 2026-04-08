@@ -105,24 +105,18 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
  * @param b - Second array to compare
  * @returns true if arrays are equal, false otherwise
  */
-// Utilisé en interne uniquement (les consommateurs externes sont supprimés)
+/**
+ * Constant-time comparison of two Uint8Arrays
+ * GH-06 fix: Always iterates over max(a.length, b.length) to prevent
+ * timing side-channel on relative lengths. Returns false if lengths differ,
+ * but the execution time is independent of where/whether bytes differ.
+ */
 function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) {
-    // Length mismatch - but still do a dummy comparison to avoid
-    // timing differences based on length checking alone
-    let result = a.length ^ b.length;
-    const minLen = Math.min(a.length, b.length);
-    for (let i = 0; i < minLen; i++) {
-      result |= a[i] ^ b[i];
-    }
-    return false;
+  const maxLen = Math.max(a.length, b.length);
+  let result = a.length ^ b.length; // Non-zero if lengths differ
+  for (let i = 0; i < maxLen; i++) {
+    result |= (a[i] || 0) ^ (b[i] || 0);
   }
-  
-  let result = 0;
-  for (let i = 0; i < a.length; i++) {
-    result |= a[i] ^ b[i];
-  }
-  
   return result === 0;
 }
 
@@ -180,12 +174,16 @@ export async function generateMasterKey(): Promise<Uint8Array> {
 // ============================================
 
 export async function deriveAllKeys(masterKey: Uint8Array): Promise<DerivedKeys> {
-  const salt = new Uint8Array(32);
+  // P2-A5: Salt contextuel dérivé du masterKey au lieu d'un salt vide.
+  // Utilise HMAC-SHA256(fixedKey, masterKey) pour créer un salt unique par conversation
+  // tout en gardant la dérivation déterministe (même masterKey = mêmes clés).
+  const saltInput = new TextEncoder().encode('ghostr-derive-salt-v3');
+  const salt = nobleHmac(nobleSha256, saltInput, masterKey);
   
-  const idBytes = await hkdf(masterKey, salt, 'whisper-id-v2', 16);
+  const idBytes = await hkdf(masterKey, salt, 'whisper-id-v3', 16);
   const conversationId = bytesToHex(idBytes);
   
-  const e2eKey = await hkdf(masterKey, salt, 'whisper-e2e-v2', 32);
+  const e2eKey = await hkdf(masterKey, salt, 'whisper-e2e-v3', 32);
   
   return {
     conversationId,
@@ -587,8 +585,7 @@ export const keyToReadableCode = masterKeyToCode;
 // PIN & LIENS SÉCURISÉS - v5.3 KDF RENFORCÉ
 // ============================================
 
-// CORRECTION v5.3: 100 000 itérations (recommandation OWASP 2023)
-const PBKDF2_ITERATIONS = 100000;
+// GH-11: PBKDF2_ITERATIONS constant removed (legacy v2 KDF removed)
 
 export function generatePIN(length: number = 8): string {
   let pin = '';
@@ -627,59 +624,9 @@ async function derivePINKeyV3(pin: string, salt: Uint8Array): Promise<Uint8Array
   return derived;
 }
 
-/**
- * Dérive une clé à partir d'un PIN - VERSION 2 (legacy, conservée pour rétrocompatibilité)
- * 
- * ⚠️ Non-standard : boucle SHA-256 sur strings hex, pas un vrai PBKDF2.
- * Conservée uniquement pour déchiffrer les anciennes clés.
- */
-async function derivePINKey(pin: string, salt: Uint8Array): Promise<Uint8Array> {
-  // Étape 1: Préparer le matériel d'entrée avec contexte
-  const context = 'whisper-pin-v2';
-  let key = pin + context + encodeBase64(salt);
-  
-  // Étape 2: Itérations PBKDF2-like avec HMAC-SHA256
-  for (let i = 0; i < PBKDF2_ITERATIONS; i++) {
-    // Ajouter le compteur pour éviter les collisions
-    const input = key + i.toString(16);
-    key = await Crypto.digestStringAsync(
-      Crypto.CryptoDigestAlgorithm.SHA256,
-      input
-    );
-  }
-  
-  // Étape 3: Dérivation finale avec HKDF pour 32 bytes de sortie
-  const keyBytes = hexToBytes(key);
-  const finalKey = await hkdf(
-    keyBytes,
-    salt,
-    'whisper-pin-final-v2',
-    32
-  );
-  
-  return finalKey;
-}
+// GH-11: Legacy derivePINKey v2 REMOVED (non-standard PBKDF2, not production-grade)
 
-/**
- * Version legacy pour rétrocompatibilité (10k itérations)
- */
-async function derivePINKeyLegacy(pin: string, salt: Uint8Array): Promise<Uint8Array> {
-  let key = pin + encodeBase64(salt);
-  
-  for (let i = 0; i < 10000; i++) {
-    key = await Crypto.digestStringAsync(
-      Crypto.CryptoDigestAlgorithm.SHA256,
-      key
-    );
-  }
-  
-  const bytes = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) {
-    bytes[i] = parseInt(key.substring(i * 2, i * 2 + 2), 16);
-  }
-  
-  return bytes;
-}
+// GH-11: Legacy derivePINKeyLegacy v1 REMOVED (10k iterations SHA-256, non-standard)
 
 export async function encryptMasterKeyWithPIN(
   masterKey: Uint8Array,
@@ -723,17 +670,8 @@ export async function decryptMasterKeyWithPIN(
   const nonceBytes = decodeBase64(nonce);
   const encryptedBytes = decodeBase64(encryptedKey);
   
-  // Utiliser la bonne version du KDF
-  let pinKey: Uint8Array;
-  if (version === 3) {
-    // v6.0: Vrai PBKDF2-HMAC-SHA256 (@noble/hashes)
-    pinKey = await derivePINKeyV3(cleanedPIN, saltBytes);
-  } else if (version === 2) {
-    pinKey = await derivePINKey(cleanedPIN, saltBytes);
-  } else {
-    // Legacy: version 1 ou non spécifiée
-    pinKey = await derivePINKeyLegacy(cleanedPIN, saltBytes);
-  }
+  // GH-11: Only v3 (true PBKDF2-HMAC-SHA256) — legacy v1/v2 removed
+  const pinKey = await derivePINKeyV3(cleanedPIN, saltBytes);
   
   const decrypted = nacl.secretbox.open(encryptedBytes, nonceBytes, pinKey);
   
@@ -806,7 +744,10 @@ export { encodeBase64, decodeBase64, encodeUTF8, decodeUTF8 };
 // ============================================
 
 export async function generateConversationTag(masterKey: Uint8Array): Promise<string> {
-  const tagBytes = await hkdf(masterKey, new Uint8Array(32), 'whisper-tag-v1', 16);
+  // P2-A5: Salt contextuel
+  const saltInput = new TextEncoder().encode('ghostr-tag-salt-v2');
+  const salt = nobleHmac(nobleSha256, saltInput, masterKey);
+  const tagBytes = await hkdf(masterKey, salt, 'whisper-tag-v2', 16);
   return bytesToHex(tagBytes);
 }
 
@@ -861,10 +802,14 @@ export async function generateIdentityCommitment(
   combined.set(masterKey);
   combined.set(userSecret, masterKey.length);
   
+  // P2-A5: Salt contextuel dérivé du masterKey
+  const saltInput = new TextEncoder().encode('ghostr-identity-salt-v2');
+  const salt = nobleHmac(nobleSha256, saltInput, masterKey);
+  
   const commitment = await hkdf(
     combined,
-    new Uint8Array(32),
-    'whisper-identity-v1',
+    salt,
+    'whisper-identity-v2',
     16
   );
   
@@ -899,10 +844,14 @@ export async function deriveConversationSenderToken(
   combined.set(userSecret);
   combined.set(masterKey, userSecret.length);
   
+  // GH-02 fix: Contextual salt instead of empty Uint8Array(32)
+  const saltInput = new TextEncoder().encode('ghostr-sender-token-salt-v2');
+  const salt = nobleHmac(nobleSha256, saltInput, combined);
+  
   const tokenBytes = await hkdf(
     combined,
-    new Uint8Array(32),
-    'whisper-sender-token-v1',
+    salt,
+    'whisper-sender-token-v2',
     16
   );
   
@@ -923,11 +872,11 @@ export async function generateRoomAuthToken(
   masterKey: Uint8Array,
   callId: string
 ): Promise<string> {
-  const info = `whisper-room-auth-v1:${callId}`;
-  // Note: utilise le hkdf legacy pour compatibilité entre versions clients.
-  // Les deux participants d'un appel doivent dériver le même token.
-  // Migration vers nobleHkdf nécessiterait une coordination de version.
-  const tokenBytes = await hkdf(masterKey, new Uint8Array(32), info, 32);
+  const info = `whisper-room-auth-v2:${callId}`;
+  // GH-02 fix: Contextual salt instead of empty Uint8Array(32)
+  const saltInput = new TextEncoder().encode('ghostr-room-auth-salt-v2');
+  const salt = nobleHmac(nobleSha256, saltInput, masterKey);
+  const tokenBytes = await hkdf(masterKey, salt, info, 32);
   return encodeBase64(tokenBytes);
 }
 

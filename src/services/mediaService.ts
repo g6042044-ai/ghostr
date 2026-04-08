@@ -10,6 +10,8 @@ import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 import { supabase, supabaseStorage } from './api';
 import { getRandomBytes, encryptE2E, decryptE2E } from './crypto';
+// P0-A2: legacyMediaProxy supprimé — tous les downloads via OHTTP relay
+import { fetchMediaViaRelay } from './encryptedBlobService';
 
 // ============================================
 // CONFIGURATION
@@ -19,7 +21,7 @@ const MAX_IMAGE_DIMENSION = 2048;  // Max pixels (côté le plus long)
 const THUMBNAIL_SIZE = 300;        // Taille miniature
 const JPEG_QUALITY_FULL = 0.8;     // Qualité image principale
 const JPEG_QUALITY_THUMB = 0.6;    // Qualité miniature
-const STORAGE_BUCKET = 'whisper-media';
+const STORAGE_BUCKET = 'ghostr-blobs';
 
 // Limite de taille (doit correspondre à la config Supabase)
 const MAX_FILE_SIZE_MB = 20;
@@ -210,7 +212,7 @@ export async function pickFile(): Promise<PickedFile | null> {
           fileSize = (fileInfo as any).size || 0;
         }
       } catch (e) {
-        console.warn('Impossible d\'obtenir la taille du fichier:', e);
+        __DEV__ && console.warn('Impossible d\'obtenir la taille du fichier:', e);
       }
     }
 
@@ -221,7 +223,7 @@ export async function pickFile(): Promise<PickedFile | null> {
       size: fileSize,
     };
   } catch (error) {
-    console.error('Erreur sélection fichier:', error);
+    __DEV__ && console.error('Erreur sélection fichier:', error);
     throw new Error('Impossible de sélectionner le fichier');
   }
 }
@@ -549,7 +551,7 @@ export async function uploadEncryptedImage(
     await FileSystem.deleteAsync(processedImage.fullUri, { idempotent: true });
     await FileSystem.deleteAsync(processedImage.thumbUri, { idempotent: true });
   } catch (e) {
-    console.warn('Erreur nettoyage fichiers temporaires:', e);
+    __DEV__ && console.warn('Erreur nettoyage fichiers temporaires:', e);
   }
 
   return {
@@ -578,13 +580,8 @@ export async function downloadAndDecryptImage(
   const nonce = decodeBase64(nonceBase64);
 
   // Télécharger le fichier chiffré
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Échec téléchargement: ${response.status}`);
-  }
-
-  const encryptedBuffer = await response.arrayBuffer();
-  const encryptedData = new Uint8Array(encryptedBuffer);
+  // ACTION-01: Route via OHTTP pour cacher le tag au CF Relay
+  const encryptedData = await fetchMediaViaRelay(url);
 
   // Déchiffrer
   const decryptedData = decryptImage(encryptedData, nonce, fileKey);
@@ -749,7 +746,7 @@ export async function clearImageCache(): Promise<void> {
     await FileSystem.deleteAsync(cacheDir, { idempotent: true });
     imageCache.clear();
   } catch (e) {
-    console.warn('Erreur nettoyage cache images:', e);
+    __DEV__ && console.warn('Erreur nettoyage cache images:', e);
   }
 }
 
@@ -798,7 +795,7 @@ export async function validateFileSize(input: string | number): Promise<{ valid:
       }
       sizeBytes = (fileInfo as any).size || 0;
     } catch (e) {
-      console.error('Erreur lecture taille fichier:', e);
+      __DEV__ && console.error('Erreur lecture taille fichier:', e);
       return { valid: false, error: 'Impossible de lire le fichier' };
     }
   } else {
@@ -929,13 +926,8 @@ export async function downloadAndDecryptFile(
   const nonce = decodeBase64(nonceBase64);
 
   // Télécharger le fichier chiffré
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Échec téléchargement: ${response.status}`);
-  }
-
-  const encryptedBuffer = await response.arrayBuffer();
-  const encryptedData = new Uint8Array(encryptedBuffer);
+  // ACTION-01: Route via OHTTP pour cacher le tag au CF Relay
+  const encryptedData = await fetchMediaViaRelay(url);
 
   // Déchiffrer
   const decryptedData = decryptFile(encryptedData, nonce, fileKey);
@@ -1031,7 +1023,7 @@ export async function clearFileCache(): Promise<void> {
     await FileSystem.deleteAsync(cacheDir, { idempotent: true });
     fileCache.clear();
   } catch (e) {
-    console.warn('Erreur nettoyage cache fichiers:', e);
+    __DEV__ && console.warn('Erreur nettoyage cache fichiers:', e);
   }
 }
 

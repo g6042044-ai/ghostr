@@ -1,5 +1,5 @@
 // src/screens/SecurityScreen.tsx
-// v8.0 - Two-step setup: password → timeout selection
+// v9.0 - Cleaned up UI, min 8 chars, strength is advisory only
 
 import React, { useState, useEffect, useRef } from 'react';
 import {
@@ -10,20 +10,24 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   getLockSettings, setupLock, disableLock, updateLockSettings, changePassword,
   getSecurityInfo, getEncryptionKeys, LockSettings, SecurityInfo,
+  estimatePasswordStrength,
 } from '../services/appLock';
 import { setEncryptionKeys } from '../services/storage';
 import { sessionService } from '../services/tripleRatchet/sessionService';
-import { theme, Header, Button, AlertModal, BottomSheet } from '../components/ui';
+import { theme, Header, Button, AlertModal } from '../components/ui';
+import { SplashScreen } from './SplashScreen';
 
 interface Props { onBack: () => void; }
-type Screen = 'main' | 'setup-password' | 'setup-timeout' | 'change-password';
+type Screen = 'main' | 'setup-password' | 'setup-timeout' | 'change-password' | 'disable';
+
+const MIN_PASSWORD_LENGTH = 8;
 
 const TIMEOUT_OPTIONS = [
-  { label: 'Immédiatement', desc: 'Dès que vous quittez l\'app', value: 0, icon: '⚡' },
-  { label: 'Après 1 minute', desc: 'Recommandé', value: 1, icon: '⏱️' },
-  { label: 'Après 5 minutes', desc: 'Utilisation fréquente', value: 5, icon: '🕐' },
-  { label: 'Après 15 minutes', desc: 'Moins sécurisé', value: 15, icon: '🕑' },
-  { label: 'Après 30 minutes', desc: 'Sécurité minimale', value: 30, icon: '🕓' },
+  { label: 'Immédiatement', value: 0 },
+  { label: '1 minute', value: 1, recommended: true },
+  { label: '5 minutes', value: 5 },
+  { label: '15 minutes', value: 15 },
+  { label: '30 minutes', value: 30 },
 ];
 
 export function SecurityScreen({ onBack }: Props) {
@@ -36,21 +40,29 @@ export function SecurityScreen({ onBack }: Props) {
   const [timeout, setTimeout] = useState(1);
   const [currentPassword, setCurrentPassword] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
-  const [showDisableConfirm, setShowDisableConfirm] = useState(false);
   const [disablePassword, setDisablePassword] = useState('');
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
   const [securityInfo, setSecurityInfo] = useState<SecurityInfo | null>(null);
   const [upgradeProgress, setUpgradeProgress] = useState(0);
+  const [kbVisible, setKbVisible] = useState(false);
 
-  // Step 2 animation
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(30)).current;
 
   useEffect(() => { loadSettings(); }, []);
 
-  // Animate step 2 entrance
+  // Keyboard listener — hide decorative elements
+  useEffect(() => {
+    const show = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hide = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const s1 = Keyboard.addListener(show, () => setKbVisible(true));
+    const s2 = Keyboard.addListener(hide, () => setKbVisible(false));
+    return () => { s1.remove(); s2.remove(); };
+  }, []);
+
   useEffect(() => {
     if (screen === 'setup-timeout') {
       fadeAnim.setValue(0);
@@ -73,26 +85,27 @@ export function SecurityScreen({ onBack }: Props) {
     finally { setLoading(false); }
   };
 
-  // Step 1 → Step 2: validate password then go to timeout selection
   const handlePasswordNext = () => {
     Keyboard.dismiss();
     setFormError(null);
     if (!newPassword.trim()) { setFormError('Veuillez entrer un mot de passe'); return; }
-    if (newPassword.length < 6) { setFormError('Le mot de passe doit contenir au moins 6 caractères'); return; }
+    if (newPassword.length < MIN_PASSWORD_LENGTH) { setFormError(`Minimum ${MIN_PASSWORD_LENGTH} caractères`); return; }
     if (newPassword !== confirmPassword) { setFormError('Les mots de passe ne correspondent pas'); return; }
-    setTimeout(1); // Reset to default
+    setTimeout(1);
     setScreen('setup-timeout');
   };
 
-  // Step 2: activate with chosen timeout
   const handleSetupLock = async () => {
+    setLoadingMessage('Activation de la protection…');
     setActionLoading(true);
+    await new Promise<void>(resolve => setTimeout(resolve, 80));
     try {
       const success = await setupLock(newPassword, false, timeout, p => setUpgradeProgress(p));
       if (success) {
+        setLoadingMessage('Chiffrement des données…');
         try { const keys = await getEncryptionKeys(newPassword); if (keys) { await setEncryptionKeys(keys.localKey, keys.conversationsKey); await sessionService.reEncryptAllPlaintextData(); } } catch {}
         setScreen('main'); loadSettings(); resetForm();
-        setSuccessMessage('Protection activée ! Vos données sont maintenant protégées.'); setShowSuccessModal(true);
+        setSuccessMessage('Protection activée'); setShowSuccessModal(true);
       } else setFormError('Échec de l\'activation');
     } catch { setFormError('Une erreur est survenue'); }
     finally { setActionLoading(false); setUpgradeProgress(0); }
@@ -101,11 +114,34 @@ export function SecurityScreen({ onBack }: Props) {
   const handleDisableLock = async () => {
     Keyboard.dismiss();
     if (!disablePassword) return;
+    setLoadingMessage('Vérification du mot de passe…');
     setActionLoading(true);
+    await new Promise<void>(resolve => setTimeout(resolve, 80));
     try {
+      // Étape 1: Valider le mot de passe AVANT toute modification
+      const keys = await getEncryptionKeys(disablePassword);
+      if (!keys) { setFormError('Mot de passe incorrect'); setActionLoading(false); return; }
+      keys.localKey.fill(0);
+      keys.conversationsKey.fill(0);
+
+      // Étape 2: Re-chiffrer TOUTES les données du PIN vers les clés hardware
+      // AVANT de supprimer la config du verrou. Si un crash survient ici,
+      // les données restent lisibles et le verrou est toujours en place.
+      setLoadingMessage('Migration du chiffrement…');
+      const { transitionToHardwareEncryption } = await import('../services/storage');
+      await transitionToHardwareEncryption();
+
+      // Étape 3: Supprimer la configuration du verrou (safe — données déjà hardware-encrypted)
       const success = await disableLock(disablePassword);
-      if (success) { setShowDisableConfirm(false); setDisablePassword(''); loadSettings(); setSuccessMessage('Protection désactivée'); setShowSuccessModal(true); }
-      else setFormError('Mot de passe incorrect');
+      if (success) {
+        setDisablePassword('');
+        setScreen('main');
+        loadSettings();
+        setSuccessMessage('Protection désactivée');
+        setShowSuccessModal(true);
+      } else {
+        setFormError('Erreur lors de la désactivation');
+      }
     } catch { setFormError('Une erreur est survenue'); }
     finally { setActionLoading(false); }
   };
@@ -114,12 +150,14 @@ export function SecurityScreen({ onBack }: Props) {
     Keyboard.dismiss();
     setFormError(null);
     if (!currentPassword.trim() || !newPassword.trim()) { setFormError('Veuillez remplir tous les champs'); return; }
-    if (newPassword.length < 6) { setFormError('Le mot de passe doit contenir au moins 6 caractères'); return; }
-    if (newPassword !== confirmPassword) { setFormError('Les nouveaux mots de passe ne correspondent pas'); return; }
+    if (newPassword.length < MIN_PASSWORD_LENGTH) { setFormError(`Minimum ${MIN_PASSWORD_LENGTH} caractères`); return; }
+    if (newPassword !== confirmPassword) { setFormError('Les mots de passe ne correspondent pas'); return; }
+    setLoadingMessage('Changement du mot de passe…');
     setActionLoading(true);
+    await new Promise<void>(resolve => setTimeout(resolve, 80));
     try {
       const success = await changePassword(currentPassword, newPassword, p => setUpgradeProgress(p));
-      if (success) { setScreen('main'); loadSettings(); resetForm(); setSuccessMessage('Mot de passe modifié avec succès.'); setShowSuccessModal(true); }
+      if (success) { setScreen('main'); loadSettings(); resetForm(); setSuccessMessage('Mot de passe modifié'); setShowSuccessModal(true); }
       else setFormError('Mot de passe actuel incorrect');
     } catch { setFormError('Une erreur est survenue'); }
     finally { setActionLoading(false); setUpgradeProgress(0); }
@@ -131,19 +169,13 @@ export function SecurityScreen({ onBack }: Props) {
 
   const resetForm = () => { setNewPassword(''); setConfirmPassword(''); setCurrentPassword(''); setTimeout(1); setFormError(null); };
 
-  // Password strength indicator
-  const getPasswordStrength = (pw: string) => {
-    if (!pw) return { level: 0, label: '', color: 'transparent' };
-    let score = 0;
-    if (pw.length >= 6) score++;
-    if (pw.length >= 10) score++;
-    if (/[A-Z]/.test(pw) && /[a-z]/.test(pw)) score++;
-    if (/[0-9]/.test(pw)) score++;
-    if (/[^A-Za-z0-9]/.test(pw)) score++;
-    if (score <= 1) return { level: 1, label: 'Faible', color: theme.colors.danger };
-    if (score <= 2) return { level: 2, label: 'Moyen', color: theme.colors.warning };
-    if (score <= 3) return { level: 3, label: 'Bon', color: theme.colors.primary };
-    return { level: 4, label: 'Excellent', color: theme.colors.success };
+  // Strength indicator (advisory only)
+  const getStrength = (pw: string) => {
+    if (!pw || pw.length < MIN_PASSWORD_LENGTH) return null;
+    const s = estimatePasswordStrength(pw);
+    const colors = [theme.colors.danger, theme.colors.danger, theme.colors.warning, theme.colors.primary, theme.colors.success];
+    const labels = ['', 'Faible', 'Moyen', 'Bon', 'Excellent'];
+    return { level: s.score, color: colors[s.score], label: labels[s.score] };
   };
 
   if (loading) return (
@@ -153,228 +185,282 @@ export function SecurityScreen({ onBack }: Props) {
     </View>
   );
 
-  // ── STEP 1: PASSWORD ──
+  // Full-screen splash during crypto operations
+  if (actionLoading) return (
+    <SplashScreen
+      statusMessage={loadingMessage}
+      progress={upgradeProgress > 0 ? upgradeProgress : undefined}
+    />
+  );
+
+  // ════════════════════════════════════════════
+  // STEP 1: PASSWORD
+  // ════════════════════════════════════════════
   if (screen === 'setup-password') {
-    const strength = getPasswordStrength(newPassword);
+    const strength = getStrength(newPassword);
     const passwordsMatch = confirmPassword.length > 0 && newPassword === confirmPassword;
-    const passwordsMismatch = confirmPassword.length > 0 && newPassword !== confirmPassword;
 
     return (
       <View style={[styles.container, { paddingBottom: insets.bottom }]}>
-        <Header title="Étape 1 sur 2" onBackPress={() => { setScreen('main'); resetForm(); }} />
+        <Header title="" onBackPress={() => { setScreen('main'); resetForm(); }} />
         <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}>
-          <ScrollView style={styles.flex} contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-            <View style={styles.headerSection}>
-              <View style={styles.stepIndicator}>
-                <View style={[styles.stepDot, styles.stepDotActive]} />
+          <ScrollView style={styles.flex} contentContainerStyle={[styles.formContent, kbVisible && styles.formContentCompact]} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+
+            {/* Steps — hidden when keyboard up */}
+            {!kbVisible && (
+              <View style={styles.steps}>
+                <View style={[styles.stepDot, styles.stepDotActive]}><Text style={styles.stepNum}>1</Text></View>
                 <View style={styles.stepLine} />
-                <View style={styles.stepDot} />
+                <View style={styles.stepDot}><Text style={styles.stepNum}>2</Text></View>
               </View>
-              <Text style={styles.formTitle}>Choisissez un mot de passe</Text>
-              <Text style={styles.formSubtitle}>Il protégera l'accès à toutes vos conversations</Text>
-            </View>
+            )}
 
-            <View style={styles.form}>
-              <View style={styles.inputGroup}>
-                <Text style={styles.inputLabel}>Mot de passe</Text>
-                <TextInput style={styles.input} value={newPassword} onChangeText={t => { setNewPassword(t); setFormError(null); }} placeholder="Minimum 6 caractères" placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} textContentType="newPassword" autoComplete="new-password" returnKeyType="next" />
-                {/* Password strength bar */}
-                {newPassword.length > 0 && (
-                  <View style={styles.strengthRow}>
-                    <View style={styles.strengthBar}>
-                      {[1,2,3,4].map(i => (
-                        <View key={i} style={[styles.strengthSegment, { backgroundColor: i <= strength.level ? strength.color : theme.colors.border }]} />
-                      ))}
-                    </View>
-                    <Text style={[styles.strengthLabel, { color: strength.color }]}>{strength.label}</Text>
+            <Text style={[styles.formTitle, kbVisible && styles.formTitleStandalone]}>Créer un mot de passe</Text>
+            {!kbVisible && <Text style={styles.formSub}>Il protégera l'accès à vos conversations</Text>}
+
+            {/* Password */}
+            <View style={styles.fieldGroup}>
+              <TextInput
+                style={[styles.input, formError && !newPassword.trim() && styles.inputErr]}
+                value={newPassword}
+                onChangeText={t => { setNewPassword(t); setFormError(null); }}
+                placeholder={`Minimum ${MIN_PASSWORD_LENGTH} caractères`}
+                placeholderTextColor={theme.colors.placeholder}
+                secureTextEntry autoCapitalize="none" autoCorrect={false}
+                textContentType="newPassword" autoComplete="new-password"
+                returnKeyType="next"
+              />
+              {strength && (
+                <View style={styles.strengthRow}>
+                  <View style={styles.strengthBar}>
+                    {[1,2,3,4].map(i => (
+                      <View key={i} style={[styles.strengthSeg, { backgroundColor: i <= strength.level ? strength.color : theme.colors.border }]} />
+                    ))}
                   </View>
-                )}
-              </View>
-              <View style={styles.inputGroup}>
-                <Text style={styles.inputLabel}>Confirmer le mot de passe</Text>
-                <View style={{ position: 'relative' }}>
-                  <TextInput style={[styles.input, passwordsMismatch && styles.inputError, passwordsMatch && styles.inputSuccess]} value={confirmPassword} onChangeText={t => { setConfirmPassword(t); setFormError(null); }} placeholder="Retapez le mot de passe" placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} textContentType="newPassword" autoComplete="new-password" returnKeyType="done" blurOnSubmit />
-                  {passwordsMatch && <Text style={styles.matchIcon}>✓</Text>}
+                  <Text style={[styles.strengthLabel, { color: strength.color }]}>{strength.label}</Text>
                 </View>
-              </View>
-              {formError && <View style={styles.errorBanner}><Text style={{ fontSize: 18 }}>⚠️</Text><Text style={styles.errorText}>{formError}</Text></View>}
+              )}
             </View>
 
-            <View style={styles.warningCard}>
-              <Text style={{ fontSize: 24 }}>⚠️</Text>
-              <View style={styles.flex}><Text style={styles.warningTitle}>Important</Text><Text style={styles.warningText}>Si vous oubliez ce mot de passe, vos données seront irrécupérables.</Text></View>
+            {/* Confirm */}
+            <View style={styles.fieldGroup}>
+              <View style={{ position: 'relative' }}>
+                <TextInput
+                  style={[styles.input, passwordsMatch && styles.inputOk]}
+                  value={confirmPassword}
+                  onChangeText={t => { setConfirmPassword(t); setFormError(null); }}
+                  placeholder="Confirmer le mot de passe"
+                  placeholderTextColor={theme.colors.placeholder}
+                  secureTextEntry autoCapitalize="none" autoCorrect={false}
+                  textContentType="newPassword" autoComplete="new-password"
+                  returnKeyType="done" blurOnSubmit
+                />
+                {passwordsMatch && <Text style={styles.matchIcon}>✓</Text>}
+              </View>
+            </View>
+
+            {!kbVisible && formError && <Text style={styles.errorText}>{formError}</Text>}
+
+            {!kbVisible && (
+              <View style={styles.warningCard}>
+                <View style={styles.warningAccent} />
+                <Text style={styles.warningText}>
+                  Si vous oubliez ce mot de passe, vos données seront irrécupérables.
+                </Text>
+              </View>
+            )}
+
+            <View style={styles.inlineAction}>
+              <Button title="Continuer" onPress={handlePasswordNext} variant="primary" size="large" fullWidth />
             </View>
           </ScrollView>
-          <View style={styles.bottomActions}>
-            <Button title="Continuer" onPress={handlePasswordNext} variant="primary" size="large" fullWidth />
-          </View>
         </KeyboardAvoidingView>
       </View>
     );
   }
 
-  // ── STEP 2: TIMEOUT SELECTION ──
+  // ════════════════════════════════════════════
+  // STEP 2: TIMEOUT
+  // ════════════════════════════════════════════
   if (screen === 'setup-timeout') return (
     <View style={[styles.container, { paddingBottom: insets.bottom }]}>
-      <Header title="Étape 2 sur 2" onBackPress={() => setScreen('setup-password')} />
+      <Header title="" onBackPress={() => setScreen('setup-password')} />
       <Animated.View style={[styles.flex, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
         <ScrollView style={styles.flex} contentContainerStyle={styles.formContent} showsVerticalScrollIndicator={false}>
-          <View style={styles.headerSection}>
-            <View style={styles.stepIndicator}>
-              <View style={[styles.stepDot, styles.stepDotDone]}>
-                <Text style={styles.stepDoneCheck}>✓</Text>
-              </View>
-              <View style={[styles.stepLine, styles.stepLineDone]} />
-              <View style={[styles.stepDot, styles.stepDotActive]} />
-            </View>
-            <Text style={styles.formTitle}>Verrouillage automatique</Text>
-            <Text style={styles.formSubtitle}>Après combien de temps l'app se verrouille quand vous la quittez ?</Text>
+
+          {/* Steps */}
+          <View style={styles.steps}>
+            <View style={[styles.stepDot, styles.stepDotDone]}><Text style={styles.stepCheck}>✓</Text></View>
+            <View style={[styles.stepLine, styles.stepLineDone]} />
+            <View style={[styles.stepDot, styles.stepDotActive]}><Text style={styles.stepNum}>2</Text></View>
           </View>
 
-          <View style={styles.timeoutCards}>
-            {TIMEOUT_OPTIONS.map((o, i) => {
-              const isSelected = timeout === o.value;
-              const isRecommended = o.value === 1;
+          <Text style={styles.formTitle}>Verrouillage automatique</Text>
+          <Text style={styles.formSub}>Délai avant verrouillage quand vous quittez l'app</Text>
+
+          <View style={styles.timeoutList}>
+            {TIMEOUT_OPTIONS.map((o) => {
+              const sel = timeout === o.value;
               return (
                 <TouchableOpacity
                   key={o.value}
-                  style={[styles.timeoutCard, isSelected && styles.timeoutCardActive]}
+                  style={[styles.timeoutRow, sel && styles.timeoutRowSel]}
                   onPress={() => setTimeout(o.value)}
                   activeOpacity={0.7}
                 >
-                  <Text style={styles.timeoutCardIcon}>{o.icon}</Text>
                   <View style={styles.flex}>
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                      <Text style={[styles.timeoutCardLabel, isSelected && styles.timeoutCardLabelActive]}>{o.label}</Text>
-                      {isRecommended && <View style={styles.recommendedBadge}><Text style={styles.recommendedText}>Recommandé</Text></View>}
+                      <Text style={[styles.timeoutLabel, sel && styles.timeoutLabelSel]}>{o.label}</Text>
+                      {o.recommended && <View style={styles.recBadge}><Text style={styles.recText}>Recommandé</Text></View>}
                     </View>
-                    <Text style={styles.timeoutCardDesc}>{o.desc}</Text>
                   </View>
-                  <View style={[styles.radioOuter, isSelected && styles.radioOuterActive]}>
-                    {isSelected && <View style={styles.radioInner} />}
+                  <View style={[styles.radio, sel && styles.radioSel]}>
+                    {sel && <View style={styles.radioInner} />}
                   </View>
                 </TouchableOpacity>
               );
             })}
           </View>
 
-          {formError && <View style={styles.errorBanner}><Text style={{ fontSize: 18 }}>⚠️</Text><Text style={styles.errorText}>{formError}</Text></View>}
+          {formError && <Text style={styles.errorText}>{formError}</Text>}
+
+          <View style={styles.inlineAction}>
+            <Button title="Activer la protection" onPress={handleSetupLock} variant="primary" size="large" fullWidth />
+          </View>
         </ScrollView>
-        <View style={styles.bottomActions}>
-          <Button title="Activer la protection" onPress={handleSetupLock} variant="primary" size="large" fullWidth loading={actionLoading} />
-        </View>
       </Animated.View>
     </View>
   );
 
-  // ── CHANGE PASSWORD SCREEN ──
+  // ════════════════════════════════════════════
+  // CHANGE PASSWORD
+  // ════════════════════════════════════════════
   if (screen === 'change-password') return (
     <View style={[styles.container, { paddingBottom: insets.bottom }]}>
       <Header title="Changer le mot de passe" onBackPress={() => { setScreen('main'); resetForm(); }} />
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}>
-        <ScrollView style={styles.flex} contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-          <View style={styles.headerSection}>
-            <View style={styles.iconContainer}><Text style={{ fontSize: 40 }}>🔐</Text></View>
-            <Text style={styles.formTitle}>Nouveau mot de passe</Text>
-            <Text style={styles.formSubtitle}>Entrez votre mot de passe actuel puis le nouveau</Text>
+        <ScrollView style={styles.flex} contentContainerStyle={[styles.formContent, kbVisible && styles.formContentCompact]} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+          <View style={styles.fieldGroup}>
+            <Text style={styles.inputLabel}>Mot de passe actuel</Text>
+            <TextInput style={styles.input} value={currentPassword} onChangeText={t => { setCurrentPassword(t); setFormError(null); }} placeholder="Votre mot de passe actuel" placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} textContentType="password" autoComplete="password" returnKeyType="next" />
           </View>
-          <View style={styles.form}>
-            <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>Mot de passe actuel</Text>
-              <TextInput style={styles.input} value={currentPassword} onChangeText={t => { setCurrentPassword(t); setFormError(null); }} placeholder="Votre mot de passe actuel" placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} textContentType="password" autoComplete="password" returnKeyType="next" />
-            </View>
-            <View style={styles.divider} />
-            <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>Nouveau mot de passe</Text>
-              <TextInput style={styles.input} value={newPassword} onChangeText={t => { setNewPassword(t); setFormError(null); }} placeholder="Minimum 6 caractères" placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} textContentType="newPassword" autoComplete="new-password" returnKeyType="next" />
-            </View>
-            <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>Confirmer</Text>
-              <TextInput style={styles.input} value={confirmPassword} onChangeText={t => { setConfirmPassword(t); setFormError(null); }} placeholder="Retapez le nouveau mot de passe" placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} textContentType="newPassword" autoComplete="new-password" returnKeyType="done" blurOnSubmit />
-            </View>
-            {formError && <View style={styles.errorBanner}><Text style={{ fontSize: 18 }}>⚠️</Text><Text style={styles.errorText}>{formError}</Text></View>}
+          <View style={styles.sep} />
+          <View style={styles.fieldGroup}>
+            <Text style={styles.inputLabel}>Nouveau mot de passe</Text>
+            <TextInput style={styles.input} value={newPassword} onChangeText={t => { setNewPassword(t); setFormError(null); }} placeholder={`Minimum ${MIN_PASSWORD_LENGTH} caractères`} placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} textContentType="newPassword" autoComplete="new-password" returnKeyType="next" />
+          </View>
+          <View style={styles.fieldGroup}>
+            <Text style={styles.inputLabel}>Confirmer</Text>
+            <TextInput style={styles.input} value={confirmPassword} onChangeText={t => { setConfirmPassword(t); setFormError(null); }} placeholder="Retapez le nouveau mot de passe" placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} textContentType="newPassword" autoComplete="new-password" returnKeyType="done" blurOnSubmit />
+          </View>
+          {formError && <Text style={styles.errorText}>{formError}</Text>}
+
+          <View style={styles.inlineAction}>
+            <Button title="Changer le mot de passe" onPress={handleChangePassword} variant="primary" size="large" fullWidth />
           </View>
         </ScrollView>
-        <View style={styles.bottomActions}><Button title="Changer le mot de passe" onPress={handleChangePassword} variant="primary" size="large" fullWidth loading={actionLoading} /></View>
       </KeyboardAvoidingView>
     </View>
   );
 
-  // ── MAIN SCREEN ──
+  // ════════════════════════════════════════════
+  // DISABLE PROTECTION
+  // ════════════════════════════════════════════
+  if (screen === 'disable') return (
+    <View style={[styles.container, { paddingBottom: insets.bottom }]}>
+      <Header title="Désactiver la protection" onBackPress={() => { setScreen('main'); setDisablePassword(''); setFormError(null); }} />
+      <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+        <View style={styles.flexCenter}>
+          {!kbVisible && <Text style={styles.formTitle}>Confirmer la désactivation</Text>}
+          {!kbVisible && <Text style={styles.formSub}>Entrez votre mot de passe pour supprimer la protection.</Text>}
+
+          <View style={[styles.fieldGroup, kbVisible && { marginTop: 0 }]}>
+            <TextInput
+              style={styles.input}
+              value={disablePassword}
+              onChangeText={t => { setDisablePassword(t); setFormError(null); }}
+              placeholder="Votre mot de passe"
+              placeholderTextColor={theme.colors.placeholder}
+              secureTextEntry autoCapitalize="none" autoCorrect={false}
+              textContentType="password" autoComplete="password"
+              returnKeyType="done" onSubmitEditing={handleDisableLock} blurOnSubmit
+            />
+          </View>
+
+          {formError && <Text style={styles.errorText}>{formError}</Text>}
+
+          {!kbVisible && (
+            <View style={styles.warningCard}>
+              <View style={[styles.warningAccent, { backgroundColor: theme.colors.danger }]} />
+              <Text style={styles.warningText}>
+                Sans protection, toute personne ayant accès à votre téléphone pourra lire vos conversations.
+              </Text>
+            </View>
+          )}
+
+          <View style={styles.inlineAction}>
+            <Button title="Désactiver la protection" onPress={handleDisableLock} variant="danger" size="large" fullWidth />
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </View>
+  );
+
+  // ════════════════════════════════════════════
+  // MAIN
+  // ════════════════════════════════════════════
   return (
     <View style={[styles.container, { paddingBottom: insets.bottom }]}>
       <Header title="Sécurité" onBackPress={onBack} />
       <ScrollView style={styles.flex} contentContainerStyle={styles.mainContent} showsVerticalScrollIndicator={false}>
-        <View style={[styles.statusCard, settings?.enabled ? styles.statusEnabled : styles.statusDisabled]}>
-          <View style={[styles.statusIcon, settings?.enabled ? styles.statusIconOn : styles.statusIconOff]}><Text style={{ fontSize: 24 }}>{settings?.enabled ? '🔐' : '🔓'}</Text></View>
-          <View style={styles.flex}><Text style={styles.statusTitle}>{settings?.enabled ? 'Protection activée' : 'Protection désactivée'}</Text><Text style={styles.statusSub}>{settings?.enabled ? 'Vos données sont chiffrées' : 'Activez pour sécuriser vos données'}</Text></View>
+
+        {/* Status */}
+        <View style={[styles.statusCard, settings?.enabled ? styles.statusOn : styles.statusOff]}>
+          <View style={styles.flex}>
+            <Text style={styles.statusTitle}>{settings?.enabled ? 'Protection activée' : 'Protection désactivée'}</Text>
+            <Text style={styles.statusSub}>{settings?.enabled ? 'Vos données sont chiffrées' : 'Activez pour sécuriser vos données'}</Text>
+          </View>
+          <View style={[styles.statusDot, settings?.enabled && styles.statusDotOn]} />
         </View>
 
         {settings?.enabled ? (
           <>
-            {securityInfo && (
-              <View style={[styles.statusCard, { marginBottom: 16, borderLeftWidth: 3, borderLeftColor: securityInfo.strength === 'high' ? theme.colors.success : securityInfo.strength === 'standard' ? theme.colors.primary : theme.colors.warning }]}>
-                <View style={[styles.statusIcon, { backgroundColor: (securityInfo.strength === 'low' ? theme.colors.warning : theme.colors.success) + '20' }]}><Text style={{ fontSize: 24 }}>{securityInfo.strength === 'high' ? '🛡️' : securityInfo.strength === 'standard' ? '🔒' : '⚠️'}</Text></View>
-                <View style={styles.flex}>
-                  <Text style={styles.statusTitle}>{securityInfo.algorithmName}</Text>
-                  <Text style={styles.statusSub}>{securityInfo.strength === 'high' ? 'Protection maximale' : securityInfo.strength === 'standard' ? `${securityInfo.iterations?.toLocaleString() || ''} itérations` : 'Mise à jour recommandée'}</Text>
-                  {securityInfo.needsUpgrade && <Text style={[styles.statusSub, { color: theme.colors.warning, marginTop: 4, fontSize: 12 }]}>💡 Changez votre mot de passe pour renforcer la sécurité</Text>}
-                </View>
-              </View>
-            )}
-
+            {/* Timeout settings */}
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>VERROUILLAGE AUTOMATIQUE</Text>
               <View style={styles.optionsCard}>
                 {TIMEOUT_OPTIONS.map((o, i) => (
                   <TouchableOpacity key={o.value} style={[styles.optionRow, i === TIMEOUT_OPTIONS.length - 1 && styles.optionRowLast]} onPress={() => handleUpdateSettings(o.value)} activeOpacity={0.7}>
                     <Text style={styles.optionLabel}>{o.label}</Text>
-                    {settings.timeoutMinutes === o.value && <View style={styles.checkBadge}><Text style={styles.checkIconText}>✓</Text></View>}
+                    {settings.timeoutMinutes === o.value && <View style={styles.checkBadge}><Text style={styles.checkMark}>✓</Text></View>}
                   </TouchableOpacity>
                 ))}
               </View>
             </View>
 
+            {/* Actions */}
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>ACTIONS</Text>
-              <TouchableOpacity style={styles.actionCard} onPress={() => setScreen('change-password')} activeOpacity={0.7}>
-                <View style={[styles.actionIcon, { backgroundColor: theme.colors.primary + '15' }]}><Text style={{ fontSize: 20 }}>🔐</Text></View>
-                <View style={styles.flex}><Text style={styles.actionTitle}>Changer le mot de passe</Text><Text style={styles.actionSubtitle}>Modifier votre mot de passe actuel</Text></View>
+              <TouchableOpacity style={styles.actionRow} onPress={() => setScreen('change-password')} activeOpacity={0.7}>
+                <Text style={styles.actionLabel}>Changer le mot de passe</Text>
                 <Text style={styles.chevron}>›</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.actionCard, styles.actionCardDanger]} onPress={() => setShowDisableConfirm(true)} activeOpacity={0.7}>
-                <View style={[styles.actionIcon, { backgroundColor: theme.colors.danger + '15' }]}><Text style={{ fontSize: 20 }}>🔓</Text></View>
-                <View style={styles.flex}><Text style={[styles.actionTitle, { color: theme.colors.danger }]}>Désactiver la protection</Text><Text style={styles.actionSubtitle}>Supprimer le verrouillage</Text></View>
+              <TouchableOpacity style={[styles.actionRow, styles.actionRowDanger]} onPress={() => { setDisablePassword(''); setFormError(null); setScreen('disable'); }} activeOpacity={0.7}>
+                <Text style={[styles.actionLabel, { color: theme.colors.danger }]}>Désactiver la protection</Text>
                 <Text style={styles.chevron}>›</Text>
               </TouchableOpacity>
             </View>
-
-            <View style={styles.infoCard}><Text style={{ fontSize: 20 }}>💡</Text><Text style={[styles.flex, styles.infoText]}>Le verrouillage s'active automatiquement quand vous quittez l'app ou verrouillez votre écran.</Text></View>
           </>
         ) : (
           <View style={styles.enableSection}>
-            <Text style={styles.enableDesc}>Protégez vos conversations avec un mot de passe. Vos données seront chiffrées localement et inaccessibles sans authentification.</Text>
-            <View style={styles.featuresCard}>
-              {['Chiffrement local des données', 'Verrouillage automatique', 'Protection après fermeture'].map((f, i) => (
-                <View key={i} style={styles.featureRow}><Text style={styles.featureCheck}>✓</Text><Text style={styles.featureText}>{f}</Text></View>
-              ))}
-            </View>
+            <Text style={styles.enableDesc}>
+              Protégez vos conversations avec un mot de passe. Vos données seront chiffrées localement.
+            </Text>
             <Button title="Activer la protection" onPress={() => setScreen('setup-password')} variant="primary" size="large" fullWidth />
           </View>
         )}
       </ScrollView>
 
-      <BottomSheet visible={showDisableConfirm} onClose={() => { setShowDisableConfirm(false); setDisablePassword(''); setFormError(null); }} title="Désactiver la protection">
-        <View style={{ paddingBottom: 20 }}>
-          <Text style={styles.formSubtitle}>Entrez votre mot de passe pour confirmer</Text>
-          <TextInput style={[styles.input, { marginTop: 16 }]} value={disablePassword} onChangeText={t => { setDisablePassword(t); setFormError(null); }} placeholder="Votre mot de passe" placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} textContentType="password" autoComplete="password" returnKeyType="done" blurOnSubmit />
-          {formError && <View style={[styles.errorBanner, { marginTop: 12 }]}><Text style={{ fontSize: 18 }}>⚠️</Text><Text style={styles.errorText}>{formError}</Text></View>}
-          <View style={{ flexDirection: 'row', gap: 12, marginTop: 20 }}>
-            <Button title="Annuler" onPress={() => { setShowDisableConfirm(false); setDisablePassword(''); setFormError(null); }} variant="secondary" size="medium" style={{ flex: 1 }} />
-            <Button title="Désactiver" onPress={handleDisableLock} variant="danger" size="medium" loading={actionLoading} style={{ flex: 1 }} />
-          </View>
-        </View>
-      </BottomSheet>
       <AlertModal visible={showSuccessModal} title="Succès" message={successMessage} primaryButton={{ title: 'OK', onPress: () => setShowSuccessModal(false) }} onClose={() => setShowSuccessModal(false)} />
     </View>
   );
@@ -383,103 +469,91 @@ export function SecurityScreen({ onBack }: Props) {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: theme.colors.background },
   flex: { flex: 1 },
+  flexCenter: { flex: 1, justifyContent: 'center', paddingHorizontal: 24 },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   mainContent: { padding: 20 },
-  formContent: { padding: 20, paddingBottom: 40 },
+  formContent: { padding: 24, paddingBottom: 40 },
+  formContentCompact: { paddingTop: 16, paddingBottom: 24 },
 
-  // Step indicator
-  stepIndicator: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 28, gap: 0 },
-  stepDot: { width: 32, height: 32, borderRadius: 16, backgroundColor: theme.colors.surface, borderWidth: 2, borderColor: theme.colors.border, alignItems: 'center', justifyContent: 'center' },
+  // Steps
+  steps: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 32, gap: 0 },
+  stepDot: { width: 28, height: 28, borderRadius: 14, backgroundColor: theme.colors.surface, borderWidth: 1.5, borderColor: theme.colors.border, alignItems: 'center', justifyContent: 'center' },
   stepDotActive: { borderColor: theme.colors.primary, backgroundColor: theme.colors.primary + '15' },
   stepDotDone: { borderColor: theme.colors.success, backgroundColor: theme.colors.success },
-  stepDoneCheck: { fontSize: 14, color: '#fff', fontWeight: '700' },
-  stepLine: { width: 48, height: 2, backgroundColor: theme.colors.border },
+  stepNum: { fontSize: 13, fontWeight: '600', color: theme.colors.textSecondary },
+  stepCheck: { fontSize: 13, color: '#fff', fontWeight: '700' },
+  stepLine: { width: 40, height: 1.5, backgroundColor: theme.colors.border },
   stepLineDone: { backgroundColor: theme.colors.success },
 
-  headerSection: { alignItems: 'center', marginBottom: 32 },
-  iconContainer: { width: 80, height: 80, borderRadius: 20, backgroundColor: theme.colors.primary + '15', alignItems: 'center', justifyContent: 'center', marginBottom: 20 },
-  formTitle: { fontSize: 24, fontWeight: '700', color: theme.colors.text, marginBottom: 8, textAlign: 'center' },
-  formSubtitle: { fontSize: 15, color: theme.colors.textSecondary, textAlign: 'center', lineHeight: 22, paddingHorizontal: 12 },
+  // Form header
+  formTitle: { fontSize: 22, fontWeight: '700', color: theme.colors.text, textAlign: 'center', marginBottom: 8 },
+  formTitleStandalone: { marginBottom: 24 },
+  formSub: { fontSize: 15, color: theme.colors.textSecondary, textAlign: 'center', lineHeight: 22, marginBottom: 28 },
 
-  // Status cards
-  statusCard: { flexDirection: 'row', alignItems: 'center', borderRadius: 16, padding: 18, marginBottom: 24, gap: 14 },
-  statusEnabled: { backgroundColor: theme.colors.success + '15', borderWidth: 1, borderColor: theme.colors.success + '30' },
-  statusDisabled: { backgroundColor: theme.colors.surface, borderWidth: 1, borderColor: theme.colors.border },
-  statusIcon: { width: 52, height: 52, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
-  statusIconOn: { backgroundColor: theme.colors.success + '25' },
-  statusIconOff: { backgroundColor: theme.colors.surfaceLight },
+  // Fields
+  fieldGroup: { marginBottom: 16 },
+  inputLabel: { fontSize: 14, fontWeight: '600', color: theme.colors.textSecondary, marginBottom: 8, marginLeft: 4 },
+  input: { backgroundColor: theme.colors.inputBackground, borderRadius: 16, borderWidth: 1.5, borderColor: theme.colors.inputBorder, paddingHorizontal: 18, paddingVertical: Platform.OS === 'ios' ? 16 : 14, fontSize: 16, color: theme.colors.text },
+  inputErr: { borderColor: theme.colors.danger + '60' },
+  inputOk: { borderColor: theme.colors.success + '60' },
+  matchIcon: { position: 'absolute', right: 18, top: Platform.OS === 'ios' ? 16 : 14, fontSize: 18, color: theme.colors.success },
+  sep: { height: 1, backgroundColor: theme.colors.divider, marginVertical: 8 },
+
+  // Strength
+  strengthRow: { flexDirection: 'row', alignItems: 'center', marginTop: 10, gap: 10 },
+  strengthBar: { flex: 1, flexDirection: 'row', gap: 4 },
+  strengthSeg: { flex: 1, height: 4, borderRadius: 2 },
+  strengthLabel: { fontSize: 12, fontWeight: '600', minWidth: 60 },
+
+  // Error
+  errorText: { color: theme.colors.danger, fontSize: 14, fontWeight: '500', textAlign: 'center', marginBottom: 16 },
+
+  // Warning
+  warningCard: { flexDirection: 'row', backgroundColor: theme.colors.warning + '10', borderRadius: 12, padding: 14, marginTop: 8, gap: 0, overflow: 'hidden' },
+  warningAccent: { width: 3, backgroundColor: theme.colors.warning, borderRadius: 2, marginRight: 14 },
+  warningText: { flex: 1, fontSize: 14, color: theme.colors.textSecondary, lineHeight: 20 },
+
+  // Timeout
+  timeoutList: { gap: 8, marginBottom: 24 },
+  timeoutRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: theme.colors.surface, borderRadius: 14, padding: 16, borderWidth: 1.5, borderColor: theme.colors.border },
+  timeoutRowSel: { borderColor: theme.colors.primary, backgroundColor: theme.colors.primary + '08' },
+  timeoutLabel: { fontSize: 16, fontWeight: '500', color: theme.colors.text },
+  timeoutLabelSel: { color: theme.colors.primary },
+  recBadge: { backgroundColor: theme.colors.primary + '20', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
+  recText: { fontSize: 11, fontWeight: '600', color: theme.colors.primary },
+  radio: { width: 20, height: 20, borderRadius: 10, borderWidth: 2, borderColor: theme.colors.border, alignItems: 'center', justifyContent: 'center' },
+  radioSel: { borderColor: theme.colors.primary },
+  radioInner: { width: 10, height: 10, borderRadius: 5, backgroundColor: theme.colors.primary },
+
+  // Inline action button (inside scroll, not floating)
+  inlineAction: { marginTop: 24 },
+
+  // ── Main screen ──
+  statusCard: { flexDirection: 'row', alignItems: 'center', borderRadius: 16, padding: 18, marginBottom: 24 },
+  statusOn: { backgroundColor: theme.colors.success + '12', borderWidth: 1, borderColor: theme.colors.success + '25' },
+  statusOff: { backgroundColor: theme.colors.surface, borderWidth: 1, borderColor: theme.colors.border },
   statusTitle: { fontSize: 17, fontWeight: '600', color: theme.colors.text, marginBottom: 2 },
   statusSub: { fontSize: 14, color: theme.colors.textSecondary },
+  statusDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: theme.colors.textMuted, marginLeft: 12 },
+  statusDotOn: { backgroundColor: theme.colors.success },
 
-  // Sections
   section: { marginBottom: 24 },
   sectionTitle: { fontSize: 13, fontWeight: '600', color: theme.colors.textMuted, letterSpacing: 0.5, marginBottom: 12, marginLeft: 4 },
   optionsCard: { backgroundColor: theme.colors.surface, borderRadius: 16, overflow: 'hidden' },
   optionRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 16, borderBottomWidth: 1, borderBottomColor: theme.colors.divider },
   optionRowLast: { borderBottomWidth: 0 },
   optionLabel: { fontSize: 16, color: theme.colors.text },
-  checkBadge: { width: 28, height: 28, borderRadius: 14, backgroundColor: theme.colors.primary + '20', alignItems: 'center', justifyContent: 'center' },
-  checkIconText: { fontSize: 14, color: theme.colors.primary, fontWeight: '700' },
+  checkBadge: { width: 24, height: 24, borderRadius: 12, backgroundColor: theme.colors.primary + '20', alignItems: 'center', justifyContent: 'center' },
+  checkMark: { fontSize: 13, color: theme.colors.primary, fontWeight: '700' },
 
-  // Action cards
-  actionCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: theme.colors.surface, borderRadius: 16, padding: 16, marginBottom: 12 },
-  actionCardDanger: { backgroundColor: theme.colors.danger + '10', borderWidth: 1, borderColor: theme.colors.danger + '20' },
-  actionIcon: { width: 44, height: 44, borderRadius: 12, alignItems: 'center', justifyContent: 'center', marginRight: 14 },
-  actionTitle: { fontSize: 16, fontWeight: '500', color: theme.colors.text, marginBottom: 2 },
-  actionSubtitle: { fontSize: 13, color: theme.colors.textSecondary },
-  chevron: { fontSize: 24, color: theme.colors.textMuted },
+  actionRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: theme.colors.surface, borderRadius: 14, padding: 16, marginBottom: 10 },
+  actionRowDanger: { backgroundColor: theme.colors.danger + '08', borderWidth: 1, borderColor: theme.colors.danger + '15' },
+  actionLabel: { fontSize: 16, fontWeight: '500', color: theme.colors.text },
+  chevron: { fontSize: 22, color: theme.colors.textMuted },
 
-  // Enable section
-  enableSection: { marginBottom: 24 },
-  enableDesc: { fontSize: 15, color: theme.colors.textSecondary, lineHeight: 22, marginBottom: 20 },
-  featuresCard: { backgroundColor: theme.colors.surface, borderRadius: 16, padding: 16, marginBottom: 20, borderLeftWidth: 3, borderLeftColor: theme.colors.success },
-  featureRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8 },
-  featureCheck: { fontSize: 14, color: theme.colors.success, fontWeight: '700', marginRight: 12 },
-  featureText: { fontSize: 15, color: theme.colors.text },
-
-  // Form
-  form: { marginBottom: 24 },
-  inputGroup: { marginBottom: 20 },
-  inputLabel: { fontSize: 14, fontWeight: '600', color: theme.colors.textSecondary, marginBottom: 10, marginLeft: 4 },
-  input: { backgroundColor: theme.colors.inputBackground, borderRadius: 16, borderWidth: 1.5, borderColor: theme.colors.inputBorder, paddingHorizontal: 18, paddingVertical: Platform.OS === 'ios' ? 16 : 14, fontSize: 16, color: theme.colors.text },
-  inputError: { borderColor: theme.colors.danger + '60' },
-  inputSuccess: { borderColor: theme.colors.success + '60' },
-  matchIcon: { position: 'absolute', right: 18, top: Platform.OS === 'ios' ? 16 : 14, fontSize: 18, color: theme.colors.success },
-  divider: { height: 1, backgroundColor: theme.colors.divider, marginVertical: 8 },
-
-  // Password strength
-  strengthRow: { flexDirection: 'row', alignItems: 'center', marginTop: 10, gap: 10 },
-  strengthBar: { flex: 1, flexDirection: 'row', gap: 4 },
-  strengthSegment: { flex: 1, height: 4, borderRadius: 2 },
-  strengthLabel: { fontSize: 12, fontWeight: '600', minWidth: 60 },
-
-  // Timeout cards (step 2)
-  timeoutCards: { gap: 10, marginBottom: 24 },
-  timeoutCard: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: theme.colors.surface,
-    borderRadius: 16, padding: 16, gap: 14,
-    borderWidth: 1.5, borderColor: theme.colors.border,
-  },
-  timeoutCardActive: { borderColor: theme.colors.primary, backgroundColor: theme.colors.primary + '08' },
-  timeoutCardIcon: { fontSize: 24 },
-  timeoutCardLabel: { fontSize: 16, fontWeight: '600', color: theme.colors.text },
-  timeoutCardLabelActive: { color: theme.colors.primary },
-  timeoutCardDesc: { fontSize: 13, color: theme.colors.textSecondary, marginTop: 2 },
-  recommendedBadge: { backgroundColor: theme.colors.primary + '20', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
-  recommendedText: { fontSize: 11, fontWeight: '600', color: theme.colors.primary },
-  radioOuter: { width: 22, height: 22, borderRadius: 11, borderWidth: 2, borderColor: theme.colors.border, alignItems: 'center', justifyContent: 'center' },
-  radioOuterActive: { borderColor: theme.colors.primary },
-  radioInner: { width: 12, height: 12, borderRadius: 6, backgroundColor: theme.colors.primary },
-
-  // Misc
-  warningCard: { flexDirection: 'row', backgroundColor: theme.colors.warning + '15', borderRadius: 16, padding: 16, marginBottom: 20, gap: 12, borderLeftWidth: 3, borderLeftColor: theme.colors.warning },
-  warningTitle: { fontSize: 15, fontWeight: '600', color: theme.colors.warning, marginBottom: 4 },
-  warningText: { fontSize: 14, color: theme.colors.textSecondary, lineHeight: 20 },
-  infoCard: { flexDirection: 'row', backgroundColor: theme.colors.surface, borderRadius: 16, padding: 16, gap: 12, marginTop: 8 },
-  infoText: { fontSize: 14, color: theme.colors.textSecondary, lineHeight: 20 },
-  errorBanner: { flexDirection: 'row', alignItems: 'center', backgroundColor: theme.colors.danger + '15', borderRadius: 12, padding: 14, marginBottom: 16, gap: 10 },
-  errorText: { fontSize: 14, color: theme.colors.danger, flex: 1 },
-  bottomActions: { padding: 20, paddingTop: 12, backgroundColor: theme.colors.background, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.colors.divider },
+  enableSection: { marginTop: 8 },
+  enableDesc: { fontSize: 15, color: theme.colors.textSecondary, lineHeight: 22, marginBottom: 12 },
+  enableTagline: { fontSize: 13, fontWeight: '500', color: theme.colors.primary, textAlign: 'center', marginBottom: 20, opacity: 0.7 },
 });
 
 export default SecurityScreen;

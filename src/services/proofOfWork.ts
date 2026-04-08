@@ -21,13 +21,12 @@ import { sha256 } from '@noble/hashes/sha256';
 // CONSTANTS
 // ============================================
 
-/** 
- * ACTION 8 (Audit Fix): Difficulté augmentée de 16 à 18 bits.
- * 16 bits = ~65K itérations (~200ms mobile) — trivial pour un GPU.
- * 18 bits = ~262K itérations (~1-2s mobile) — 4× plus coûteux pour l'attaquant,
- * UX fluide (splash screen ~1-2s). Surge mode monte à 24 bits côté serveur.
+/**
+ * PoW difficulty: 16 bits = ~65K iterations = <1 second on mobile (pure JS SHA-256).
+ * Combined with CF Worker IP rate limiting + cert quota (100 msgs/cert), this is
+ * sufficient anti-spam. 22 bits was ~4M iterations = 80s on Hermes (unusable).
  */
-export const POW_DIFFICULTY_BITS = 18;
+export const POW_DIFFICULTY_BITS = 16;
 
 /** Fenêtre de validité du timestamp (±5 minutes) */
 export const POW_TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
@@ -61,9 +60,7 @@ export async function computeProofOfWork(
 ): Promise<ProofOfWork> {
   const timestamp = Date.now();
 
-  // Salt aléatoire 16 bytes → hex
   const saltBytes = new Uint8Array(16);
-  // P9 fix: Require CSPRNG, no insecure fallback
   if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.getRandomValues) {
     globalThis.crypto.getRandomValues(saltBytes);
   } else {
@@ -73,34 +70,65 @@ export async function computeProofOfWork(
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 
-  // Build challenge prefix: "timestamp:salt:"
+  // PERF FIX: Pre-allocate a single mutable buffer instead of creating
+  // 3 objects per iteration (toString + TextEncoder + new Uint8Array).
+  // This eliminates GC pressure and is ~10x faster on Hermes/mobile.
   const prefix = `${timestamp}:${salt}:`;
   const prefixBytes = new TextEncoder().encode(prefix);
+  const prefixLen = prefixBytes.length;
+  const maxNonceDigits = 10; // supports nonce up to 9,999,999,999
+  const buffer = new Uint8Array(prefixLen + maxNonceDigits);
+  buffer.set(prefixBytes, 0);
 
-  // Traiter par batch pour ne pas bloquer le thread UI.
-  // 10K hashes ≈ 20-40ms sur mobile — assez court pour garder 30fps.
-  const BATCH_SIZE = 10_000;
+  // Pre-compute difficulty check values (avoid function call per iteration)
+  const fullZeroBytes = Math.floor(difficulty / 8);
+  const remainingBits = difficulty % 8;
+  const remainingMask = remainingBits > 0 ? (0xFF << (8 - remainingBits)) : 0;
+
+  // Larger batches = fewer setTimeout yields = faster total time
+  const BATCH_SIZE = 50_000;
   let nonce = 0;
 
   while (true) {
     const batchEnd = nonce + BATCH_SIZE;
     while (nonce < batchEnd) {
-      const nonceStr = nonce.toString();
-      const nonceBytes = new TextEncoder().encode(nonceStr);
-      const input = new Uint8Array(prefixBytes.length + nonceBytes.length);
-      input.set(prefixBytes, 0);
-      input.set(nonceBytes, prefixBytes.length);
+      // Write nonce digits directly into the pre-allocated buffer (ZERO allocation)
+      let n = nonce;
+      let digitCount: number;
+      if (n === 0) {
+        buffer[prefixLen] = 48; // ASCII '0'
+        digitCount = 1;
+      } else {
+        let temp = n;
+        digitCount = 0;
+        while (temp > 0) { digitCount++; temp = (temp / 10) | 0; }
+        let pos = prefixLen + digitCount - 1;
+        temp = n;
+        while (temp > 0) {
+          buffer[pos--] = 48 + (temp % 10);
+          temp = (temp / 10) | 0;
+        }
+      }
 
-      const hash = sha256(input);
+      // Hash the exact slice — subarray creates a view, not a copy
+      const hash = sha256(buffer.subarray(0, prefixLen + digitCount));
 
-      if (hasLeadingZeroBits(hash, difficulty)) {
+      // Inline difficulty check (avoid function call overhead)
+      let valid = true;
+      for (let i = 0; i < fullZeroBytes; i++) {
+        if (hash[i] !== 0) { valid = false; break; }
+      }
+      if (valid && remainingBits > 0 && (hash[fullZeroBytes] & remainingMask) !== 0) {
+        valid = false;
+      }
+      if (valid) {
         return { timestamp, salt, nonce, difficulty };
       }
 
       nonce++;
     }
 
-    // Yield au thread UI — les animations peuvent avancer
+    // Yield to event loop
     await new Promise<void>(resolve => setTimeout(resolve, 0));
   }
 }

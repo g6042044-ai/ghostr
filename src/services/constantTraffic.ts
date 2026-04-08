@@ -26,16 +26,21 @@ import { secureRandomInt } from './crypto';
 // CONFIGURATION
 // ============================================
 
-/** Intervalle entre chaque slot de transmission (ms) */
+/** Intervalle entre chaque slot de transmission (ms) — INCHANGÉ */
 const SLOT_INTERVAL_MS = 30_000; // 30 secondes
 
-/** Intervalle entre chaque poll (ms) */
-const POLL_INTERVAL_MS = 45_000; // 45 secondes
+/** Intervalle entre chaque poll (ms) — agressif pour réception appels */
+const POLL_INTERVAL_MS = 5_000; // 5 secondes
 
-/** Audit Fix M-04: Jitter augmenté à ±30s (était ±10s)
- * ±10s est insuffisant contre un adversaire réseau qui peut corréler
+/** Jitter d'ENVOI: ±30s — protège l'anonymat d'envoi.
+ * Audit Fix M-04: ±10s est insuffisant contre un adversaire réseau qui peut corréler
  * les patterns temporels sur ~24h d'observation. */
-const JITTER_MS = 30_000; // ±30 secondes
+const SLOT_JITTER_MS = 30_000; // ±30 secondes
+
+/** Jitter de RÉCEPTION: ±3s — proportionnel au poll réduit.
+ * N'impacte PAS l'anonymat : le poll est une lecture uniforme, tous les clients
+ * pollent au même rythme constant via OHTTP avec 50 tags shufflés (vrais + decoys). */
+const POLL_JITTER_MS = 3_000; // ±3 secondes
 
 /** Audit Fix M-04: Probabilité d'un burst de dummy traffic par slot (5%) */
 const BURST_PROBABILITY = 0.05;
@@ -64,7 +69,9 @@ const BURST_MAX_COUNT = 8; // v25.1: élargi de 5→8 pour couvrir les sous-rafa
  *   +33% environ (1s → 1.33s par chunk en moyenne). Pour 200KB: ~67s au lieu de ~50s.
  */
 const DECOY_INTERLEAVE_THRESHOLD = 3;
-const DECOY_INTERLEAVE_PROBABILITY = 0.25;
+// GH-15: Variable probability per burst (15%-40%) instead of fixed 25%
+const DECOY_INTERLEAVE_PROBABILITY_MIN = 0.15;
+const DECOY_INTERLEAVE_PROBABILITY_MAX = 0.40;
 
 // ============================================
 // TYPES
@@ -82,6 +89,7 @@ interface QueuedMessage {
   sendFn: SendMessageFn;
   priority: 'normal' | 'urgent' | 'deferred';
   enqueuedAt: number;
+  rejectFn?: (reason: Error) => void;
 }
 
 // ============================================
@@ -135,9 +143,9 @@ let appStateSubscription: ReturnType<typeof AppState.addEventListener> | null = 
  *   - Remplace Math.random() par Crypto.getRandomBytes() (CSPRNG)
  *   - Distribution exponentielle au lieu d'uniforme
  *     (rend la corrélation statistique beaucoup plus difficile)
- *   - Jitter augmenté à ±30s
+ *   - Jitter paramétrable: SLOT_JITTER_MS pour l'envoi, POLL_JITTER_MS pour la réception
  */
-function jitteredMs(baseMs: number): number {
+function jitteredMs(baseMs: number, jitterMs: number = SLOT_JITTER_MS): number {
   // Générer un float aléatoire CSPRNG dans [0, 1)
   const randomBytes = Crypto.getRandomBytes(4);
   const randomUint = new DataView(
@@ -148,15 +156,15 @@ function jitteredMs(baseMs: number): number {
   const u = randomUint / 0x100000000; // [0, 1)
   
   // Distribution exponentielle: -ln(1 - u) * lambda
-  // Centrée sur 0 avec scale = JITTER_MS
+  // Centrée sur 0 avec scale = jitterMs
   // Signe aléatoire pour +/- jitter
   const signBytes = Crypto.getRandomBytes(1);
   const sign = (signBytes[0] & 1) === 0 ? 1 : -1;
   
-  // Exponentielle tronquée à [0, JITTER_MS]
+  // Exponentielle tronquée à [0, jitterMs]
   const exponentialJitter = Math.min(
-    -Math.log(1 - u * 0.999) * (JITTER_MS / 3), // lambda = JITTER/3
-    JITTER_MS
+    -Math.log(1 - u * 0.999) * (jitterMs / 3), // lambda = jitter/3
+    jitterMs
   );
   
   const jitter = sign * exponentialJitter;
@@ -193,9 +201,14 @@ async function slotTick(): Promise<void> {
     // lesquels sont des chunks réels (l'analyse par tag reste possible mais
     // nécessite une corrélation temporelle fine, pas juste le tag).
     // =========================================================
-    if (messageQueue.length > DECOY_INTERLEAVE_THRESHOLD) {
+    // NEVER delay urgent messages (call signals) with decoy interleaving.
+    // Urgent messages must be sent within 50-200ms for real-time signaling.
+    if (nextMessage.priority !== 'urgent' && messageQueue.length > DECOY_INTERLEAVE_THRESHOLD) {
+      // GH-15: Variable probability per burst — harder to detect statistically
+      const range = DECOY_INTERLEAVE_PROBABILITY_MAX - DECOY_INTERLEAVE_PROBABILITY_MIN;
+      const burstProbability = DECOY_INTERLEAVE_PROBABILITY_MIN + (secureRandomInt(1000) / 1000) * range;
       const interleaveRandom = Crypto.getRandomBytes(1)[0] / 256;
-      if (interleaveRandom < DECOY_INTERLEAVE_PROBABILITY) {
+      if (interleaveRandom < burstProbability) {
         try {
           // Decoy medium-tier à tag aléatoire — même taille que les chunks,
           // mais envoyé vers un tag que personne ne poll → pas d'erreur côté destinataire
@@ -219,7 +232,7 @@ async function slotTick(): Promise<void> {
       stats.realMessagesSent++;
       __DEV__ && console.log(`[ConstantTraffic] 📤 Slot #${stats.slotsFired}: REAL message sent (queue: ${messageQueue.length})`);
     } catch (error) {
-      console.error('[ConstantTraffic] Real message send error:', error);
+      __DEV__ && console.error('[ConstantTraffic] Real message send error:', error);
     }
   } else if (sendDecoyFn) {
     // Pas de vrai message → envoyer un decoy
@@ -234,7 +247,14 @@ async function slotTick(): Promise<void> {
   
   // Audit Fix M-04: Burst aléatoire de dummy traffic pour briser les patterns
   // Avec probabilité BURST_PROBABILITY, envoyer quelques decoys supplémentaires
-  if (sendDecoyFn) {
+  //
+  // v30.1: SKIP burst when urgent messages are pending in queue.
+  // Random bursts fire 2-8 concurrent OHTTP requests. When call signals
+  // (offer, crypto, answer) are queued as urgent, these burst decoys compete
+  // for OHTTP relay bandwidth and delay the next urgent slot by 1-3s.
+  // Bursts will resume naturally once all urgent messages are drained.
+  const hasUrgentPending = messageQueue.length > 0 && messageQueue[0].priority === 'urgent';
+  if (sendDecoyFn && !hasUrgentPending) {
     const burstRandom = Crypto.getRandomBytes(4);
     const burstValue = new DataView(
       burstRandom.buffer,
@@ -261,6 +281,16 @@ function scheduleNextSlot(): void {
   if (!isRunning) return;
   
   if (messageQueue.length > 0) {
+    // FIX Bug 2+3: If the NEXT message in queue is urgent, ALWAYS use fast drain.
+    // This also fixes Bug 3 (timer overwrite): scheduleNextSlot is the single
+    // source of truth for the next timer — no need to worry about enqueueMessage's
+    // timer being overwritten, because we always check priority here.
+    if (messageQueue[0].priority === 'urgent') {
+      const fastDelay = 50 + secureRandomInt(150); // 50-200ms — same as enqueueMessage urgent
+      slotTimerId = setTimeout(slotTick, fastDelay);
+      return;
+    }
+    
     consecutiveDrainCount++;
     
     // v25.2: SUB-BURST DRAIN ADAPTATIF
@@ -338,7 +368,7 @@ async function pollTick(): Promise<void> {
   try {
     await pollFn();
   } catch (error) {
-    console.error('[ConstantTraffic] Poll error:', error);
+    __DEV__ && console.error('[ConstantTraffic] Poll error:', error);
   }
   
   scheduleNextPoll();
@@ -346,7 +376,7 @@ async function pollTick(): Promise<void> {
 
 function scheduleNextPoll(): void {
   if (!isRunning) return;
-  pollTimerId = setTimeout(pollTick, jitteredMs(POLL_INTERVAL_MS));
+  pollTimerId = setTimeout(pollTick, jitteredMs(POLL_INTERVAL_MS, POLL_JITTER_MS));
 }
 
 // ============================================
@@ -408,7 +438,7 @@ export function startConstantTraffic(
   // Écouter les changements d'état de l'app
   appStateSubscription = AppState.addEventListener('change', handleAppStateChange);
   
-  __DEV__ && console.log('[ConstantTraffic] Started (slot every ~30s ±30s, poll every ~45s ±30s)');
+  __DEV__ && console.log('[ConstantTraffic] Started (slot every ~30s ±30s, poll every ~5s ±5s)');
 }
 
 /**
@@ -430,6 +460,31 @@ export function stopConstantTraffic(): void {
   if (appStateSubscription) {
     appStateSubscription.remove();
     appStateSubscription = null;
+  }
+  
+  // P0 FIX: Flush urgent messages immédiatement au lieu de les détruire.
+  // Sans ça, les signaux d'appel (offer, answer, hangup) enqueued avec
+  // priority='urgent' sont perdus quand l'AppState cycle background→foreground,
+  // ce qui rendait les appels impossibles.
+  const urgentMessages = messageQueue.filter(m => m.priority === 'urgent');
+  const nonUrgentMessages = messageQueue.filter(m => m.priority !== 'urgent');
+  
+  // Envoyer les messages urgents en fire-and-forget
+  for (const msg of urgentMessages) {
+    msg.sendFn().catch(e => {
+      __DEV__ && console.warn('[ConstantTraffic] Flush urgent on stop error:', e);
+    });
+  }
+  
+  if (urgentMessages.length > 0) {
+    __DEV__ && console.log(`[ConstantTraffic] 🚨 Flushed ${urgentMessages.length} urgent messages on stop`);
+  }
+  
+  // Rejeter les promises des messages non-urgents pour éviter les hanging promises
+  for (const msg of nonUrgentMessages) {
+    if (msg.rejectFn) {
+      msg.rejectFn(new Error('ConstantTraffic stopped — message dropped'));
+    }
   }
   
   messageQueue = [];
@@ -489,6 +544,10 @@ export function enqueueMessage<T>(
       sendFn: wrappedSendFn,
       priority,
       enqueuedAt: Date.now(),
+      // P0 FIX: Stocker reject pour pouvoir résoudre la promise si la queue
+      // est vidée (stopConstantTraffic). Sans ça, la promise hang indéfiniment
+      // et sendCallSignal1to1 ne retourne jamais.
+      rejectFn: reject,
     };
     
     if (priority === 'urgent') {
@@ -508,13 +567,18 @@ export function enqueueMessage<T>(
     }
     
     // Accélérer le prochain slot : annuler le timer en cours et déclencher
-    // après un délai aléatoire (200ms-2s). Ce timing est indistinguable des
+    // après un délai aléatoire. Le timing est indistinguable des
     // random bursts existants (5% des slots déclenchent 2-5 messages rapides).
     if (slotTimerId) {
       clearTimeout(slotTimerId);
       slotTimerId = null;
     }
-    const microJitter = 200 + secureRandomInt(1800);
+    
+    // P1 FIX: Urgent = 50-200ms (signaux d'appel, critiques pour la latence)
+    // Normal = 200-2000ms (texte, médias, pas de contrainte temps réel)
+    const microJitter = priority === 'urgent'
+      ? 50 + secureRandomInt(150)    // 50-200ms pour appels
+      : 200 + secureRandomInt(1800); // 200-2000ms pour messages normaux
     slotTimerId = setTimeout(slotTick, microJitter);
   });
 }

@@ -1,0 +1,15 @@
+{
+  "name": "ghostr-push-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ghostr Push Notification Proxy — Split-Trust architecture",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "keygen": "node keygen.js"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2",
+    "tweetnacl": "^1.0.3"
+  }
+}

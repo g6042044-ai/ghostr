@@ -13,16 +13,17 @@ import {
   StyleSheet,
   TextInput,
   TouchableOpacity,
-  Alert,
   ActivityIndicator,
   Platform,
   ScrollView,
   KeyboardAvoidingView,
+  BackHandler,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { CameraView, useCameraPermissions, BarcodeScanningResult } from 'expo-camera';
+import { Ionicons } from '@expo/vector-icons';
 
 import { sessionService } from '../services/tripleRatchet';
 import { theme, Header, Button } from '../components/ui';
@@ -64,6 +65,11 @@ export function Join1to1Screen() {
       scannedRef.current = false;
       setError(null);
     }
+    // Block back button during processing
+    if (step === 'processing') {
+      const backHandler = BackHandler.addEventListener('hardwareBackPress', () => true);
+      return () => backHandler.remove();
+    }
   }, [step]);
 
   // ==========================================
@@ -84,42 +90,31 @@ export function Join1to1Screen() {
       
       const result = await sessionService.acceptInviteAndRespond(inviteString);
       
+      // Envoyer notre push token au nouveau pair via E2E
+      try {
+        const { sendPushTokenToPeer } = require('../services/api1to1');
+        sendPushTokenToPeer(result.session.id).catch(() => {});
+      } catch {}
+      
       setStatusMessage('Connexion établie !');
       
       const contactName = result.session.theirProfile.displayName || 'Contact';
       
-      // Navigate to the SAME ConnectionSuccessScreen used by creators
       navigation.replace('ConnectionSuccess', {
         sessionId: result.session.id,
         contactName,
         inviteLabel: 'code d\'invitation',
+        contactAvatarBase64: result.session.theirProfile.avatarBase64,
       });
       
     } catch (e: any) {
       console.error('[Join1to1] Error:', e);
       
-      // Existing session detected → offer replacement
+      // Existing session detected → auto-replace silently
       if (e.isExistingSession) {
+        console.log(`[Join1to1] Session exists with ${e.existingContactName}, auto-replacing...`);
         setLoading(false);
-        Alert.alert(
-          'Conversation existante',
-          `Vous avez déjà une conversation avec ${e.existingContactName}. Voulez-vous reconnecter ? L'ancienne session sera remplacée.`,
-          [
-            {
-              text: 'Annuler',
-              style: 'cancel',
-              onPress: () => {
-                scannedRef.current = false;
-                setStep('choose');
-              },
-            },
-            {
-              text: 'Reconnecter',
-              style: 'destructive',
-              onPress: () => processInviteReplace(inviteString, e.existingSessionId),
-            },
-          ],
-        );
+        processInviteReplace(inviteString, e.existingSessionId);
         return;
       }
       
@@ -139,6 +134,12 @@ export function Join1to1Screen() {
     try {
       await sessionService.initialize();
       
+      // BUG FIX #1: Nettoyer les données de transport AVANT de remplacer la session
+      // Le nouveau sessionId sera identique (déterministe) → les anciennes données pollueraient
+      const { clearLocalMessages1to1, clearUnreadCount } = await import('../services/api1to1');
+      await clearLocalMessages1to1(existingSessionId);
+      await clearUnreadCount(existingSessionId);
+      
       setStatusMessage('Établissement de la connexion sécurisée…');
       
       const result = await sessionService.acceptInviteAndReplace(inviteString, existingSessionId);
@@ -149,6 +150,7 @@ export function Join1to1Screen() {
         sessionId: result.session.id,
         contactName,
         inviteLabel: 'code d\'invitation',
+        contactAvatarBase64: result.session.theirProfile.avatarBase64,
       });
       
     } catch (e: any) {
@@ -213,7 +215,7 @@ export function Join1to1Screen() {
         <ScrollView style={styles.scrollView} contentContainerStyle={styles.content}>
           <View style={styles.headerSection}>
             <View style={styles.iconContainer}>
-              <Text style={styles.icon}>🔗</Text>
+              <Ionicons name="link-outline" size={36} color={theme.colors.primary} />
             </View>
             <Text style={styles.title}>Rejoindre une conversation</Text>
             <Text style={styles.subtitle}>
@@ -224,32 +226,33 @@ export function Join1to1Screen() {
           <View style={styles.options}>
             <TouchableOpacity style={styles.optionCard} onPress={() => setStep('scan')} activeOpacity={0.7}>
               <View style={styles.optionIconWrapper}>
-                <Text style={styles.optionIcon}>📷</Text>
+                <Ionicons name="scan-outline" size={24} color={theme.colors.primary} />
               </View>
               <View style={styles.optionContent}>
                 <Text style={styles.optionTitle}>Scanner le QR code</Text>
                 <Text style={styles.optionSubtitle}>Rapide et facile</Text>
               </View>
-              <Text style={styles.optionChevron}>›</Text>
+              <Ionicons name="chevron-forward" size={18} color={theme.colors.textMuted} />
             </TouchableOpacity>
 
             <TouchableOpacity style={styles.optionCard} onPress={() => setStep('manual')} activeOpacity={0.7}>
               <View style={styles.optionIconWrapper}>
-                <Text style={styles.optionIcon}>📋</Text>
+                <Ionicons name="clipboard-outline" size={24} color={theme.colors.primary} />
               </View>
               <View style={styles.optionContent}>
                 <Text style={styles.optionTitle}>Coller le code</Text>
                 <Text style={styles.optionSubtitle}>Si vous avez reçu le code par message</Text>
               </View>
-              <Text style={styles.optionChevron}>›</Text>
+              <Ionicons name="chevron-forward" size={18} color={theme.colors.textMuted} />
             </TouchableOpacity>
           </View>
 
           <View style={styles.infoBox}>
-            <Text style={styles.infoTitle}>🔐 Sécurité automatique</Text>
+            <Text style={styles.infoTitle}><Ionicons name="shield-checkmark" size={14} color={theme.colors.primary} />  Sécurité automatique</Text>
             <Text style={styles.infoText}>
               Les clés de chiffrement sont créées localement sur chaque téléphone. Aucune donnée sensible ne transite par le serveur.
             </Text>
+
           </View>
 
           {error && (
@@ -284,7 +287,7 @@ export function Join1to1Screen() {
           <Header title="Scanner" onBackPress={() => setStep('choose')} />
           <View style={styles.permissionContent}>
             <View style={styles.iconContainer}>
-              <Text style={styles.icon}>📷</Text>
+              <Ionicons name="camera-outline" size={36} color={theme.colors.primary} />
             </View>
             <Text style={styles.title}>Accès à la caméra</Text>
             <Text style={styles.subtitle}>
@@ -349,7 +352,7 @@ export function Join1to1Screen() {
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
         >
-          <ScrollView style={styles.scrollView} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+          <ScrollView style={styles.scrollView} contentContainerStyle={[styles.content, { paddingBottom: 40 }]} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <View style={styles.headerSection}>
             <Text style={styles.title}>Code d'invitation</Text>
             <Text style={styles.subtitle}>
@@ -375,21 +378,21 @@ export function Join1to1Screen() {
 
           {error && (
             <View style={styles.errorBanner}>
-              <Text style={styles.errorText}>⚠️ {error}</Text>
+              <Text style={styles.errorText}>{error}</Text>
             </View>
           )}
-        </ScrollView>
 
-        <View style={styles.bottomActions}>
-          <Button
-            title="Se connecter"
-            onPress={handleManualSubmit}
-            variant="primary"
-            size="large"
-            fullWidth
-            loading={loading}
-          />
-        </View>
+          <View style={styles.inlineAction}>
+            <Button
+              title="Se connecter"
+              onPress={handleManualSubmit}
+              variant="primary"
+              size="large"
+              fullWidth
+              loading={loading}
+            />
+          </View>
+        </ScrollView>
         </KeyboardAvoidingView>
       </View>
     );
@@ -446,6 +449,19 @@ const styles = StyleSheet.create({
   },
   infoTitle: { fontSize: 15, fontWeight: '600', color: theme.colors.text, marginBottom: 8 },
   infoText: { fontSize: 14, color: theme.colors.textSecondary, lineHeight: 20 },
+  infoTagline: {
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: theme.colors.primary + '30',
+    alignItems: 'center',
+  },
+  infoTaglineText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: theme.colors.primary,
+    opacity: 0.7,
+  },
   
   // Scanner
   camera: { flex: 1 },
@@ -494,8 +510,8 @@ const styles = StyleSheet.create({
   },
   errorText: { fontSize: 14, color: theme.colors.danger, textAlign: 'center' },
   
-  // Bottom
-  bottomActions: { padding: 20, borderTopWidth: 1, borderTopColor: theme.colors.divider },
+  // Inline action button (inside scroll)
+  inlineAction: { marginTop: 8 },
 });
 
 export default Join1to1Screen;

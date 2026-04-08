@@ -237,14 +237,27 @@ export interface DHRotationMessage {
 
 /**
  * Format sérialisé pour échange via signaling
+ *
+ * Les clés symétriques (callRootKey, sendChainKey, recvChainKey, sendHeaderKey,
+ * recvHeaderKey) sont incluses pour garantir la synchronisation entre les deux parties.
+ *
+ * Raison: Le rootKey du Triple Ratchet avance à chaque message échangé et n'est PAS
+ * garanti d'être identique des deux côtés au moment de l'appel (la session peut avoir
+ * avancé chez l'initiateur depuis le dernier message traité par le répondant).
+ * L'initiateur dérive ses clés depuis son état courant et les transmet pour que
+ * les deux parties aient exactement les mêmes clés d'appel.
+ *
+ * Sécurité: Ces clés transitent via le canal Triple Ratchet déjà chiffré E2E.
+ * Seule la clé publique DH X25519 sert aux rotations forward secrecy futures.
  */
 export interface SerializedCallRatchetInit {
   type: 'call_ratchet_init';
   version: number;
   callId: string;
-  publicKey: string | null;
+  publicKey: string | null;  // Clé publique X25519 pour les rotations DH futures
   keyId: number;
   isInitiator: boolean;
+  // Clés symétriques dérivées par l'initiateur — le répondant les utilise inversées
   callRootKey: string;
   sendChainKey: string;
   recvChainKey: string;
@@ -376,7 +389,7 @@ export async function initializeCallRatchet(
     __DEV__ && console.log('[CallRatchet] 🔐 PQ-protected call initialization (pqSecret mixed)');
   } else {
     baseKeyMaterial = rootKeyBytes;
-    console.warn('[CallRatchet] ⚠️ No pqSecret available, call not PQ-protected');
+    __DEV__ && console.warn('[CallRatchet] ⚠️ No pqSecret available, call not PQ-protected');
   }
 
   const callIdBytes = new TextEncoder().encode(callId);
@@ -456,7 +469,7 @@ export async function initializeCallRatchetFromSecret(
     __DEV__ && console.log('[CallRatchet] 🔐 PQ-protected call from secret');
   } else {
     baseKeyMaterial = sharedSecret;
-    console.warn('[CallRatchet] ⚠️ Call from secret without PQ protection');
+    __DEV__ && console.warn('[CallRatchet] ⚠️ Call from secret without PQ protection');
   }
 
   const callIdBytes = new TextEncoder().encode(callId);
@@ -590,13 +603,13 @@ export function decryptAudioPacket(
 ): { audioData: Uint8Array | null; newState: CallRatchetState } {
   const minSize = 1 + 4 + 4 + CALL_RATCHET_CONSTANTS.NONCE_SIZE + 16;
   if (packet.length < minSize) {
-    console.warn('[CallRatchet] Packet too short');
+    __DEV__ && console.warn('[CallRatchet] Packet too short');
     return { audioData: null, newState: state };
   }
 
   const version = packet[0];
   if (version !== CALL_RATCHET_CONSTANTS.VERSION) {
-    console.warn('[CallRatchet] Unknown version:', version);
+    __DEV__ && console.warn('[CallRatchet] Unknown version:', version);
     return { audioData: null, newState: state };
   }
 
@@ -653,12 +666,12 @@ export function decryptAudioPacket(
 
   // Anti-replay
   if (updatedState.receivedIndexes.has(packetIndex)) {
-    console.warn('[CallRatchet] Replay detected, index:', packetIndex);
+    __DEV__ && console.warn('[CallRatchet] Replay detected, index:', packetIndex);
     return { audioData: null, newState: updatedState };
   }
 
   if (packetIndex > updatedState.recvPacketIndex + CALL_RATCHET_CONSTANTS.MAX_SKIP_PACKETS) {
-    console.warn('[CallRatchet] Packet too far ahead:', packetIndex, 'current:', updatedState.recvPacketIndex);
+    __DEV__ && console.warn('[CallRatchet] Packet too far ahead:', packetIndex, 'current:', updatedState.recvPacketIndex);
     return { audioData: null, newState: updatedState };
   }
 
@@ -672,7 +685,7 @@ export function decryptAudioPacket(
   );
 
   if (!result.audioData || !result.advancedChainKey) {
-    console.warn('[CallRatchet] Decryption failed');
+    __DEV__ && console.warn('[CallRatchet] Decryption failed');
     return { audioData: null, newState: updatedState };
   }
 
@@ -882,17 +895,17 @@ export function processDHRotationRequest(
   response: DHRotationMessage;
 } | null {
   if (message.callId !== state.callId) {
-    console.warn('[CallRatchet] DH rotation request callId mismatch');
+    __DEV__ && console.warn('[CallRatchet] DH rotation request callId mismatch');
     return null;
   }
 
   if (message.isResponse) {
-    console.warn('[CallRatchet] Expected request, got response');
+    __DEV__ && console.warn('[CallRatchet] Expected request, got response');
     return null;
   }
 
   if (!message.mlkemPublicKey) {
-    console.warn('[CallRatchet] DH rotation request missing ML-KEM public key');
+    __DEV__ && console.warn('[CallRatchet] DH rotation request missing ML-KEM public key');
     return null;
   }
 
@@ -1014,27 +1027,27 @@ export function processDHRotationResponse(
   message: DHRotationMessage
 ): CallRatchetState | null {
   if (message.callId !== state.callId) {
-    console.warn('[CallRatchet] DH rotation response callId mismatch');
+    __DEV__ && console.warn('[CallRatchet] DH rotation response callId mismatch');
     return null;
   }
 
   if (!message.isResponse) {
-    console.warn('[CallRatchet] Expected response, got request');
+    __DEV__ && console.warn('[CallRatchet] Expected response, got request');
     return null;
   }
 
   if (!message.mlkemCiphertext) {
-    console.warn('[CallRatchet] DH rotation response missing ML-KEM ciphertext');
+    __DEV__ && console.warn('[CallRatchet] DH rotation response missing ML-KEM ciphertext');
     return null;
   }
 
   if (!state.myMLKEMKey) {
-    console.warn('[CallRatchet] No ML-KEM secret key stored — cannot process response');
+    __DEV__ && console.warn('[CallRatchet] No ML-KEM secret key stored — cannot process response');
     return null;
   }
 
   if (!state.myDHKey) {
-    console.warn('[CallRatchet] No DH key stored — cannot process response');
+    __DEV__ && console.warn('[CallRatchet] No DH key stored — cannot process response');
     return null;
   }
 
@@ -1110,14 +1123,14 @@ export function processDHRotation(
   if (message.isResponse) {
     const newState = processDHRotationResponse(state, message);
     if (!newState) {
-      console.warn('[CallRatchet] processDHRotationResponse failed, keeping old state');
+      __DEV__ && console.warn('[CallRatchet] processDHRotationResponse failed, keeping old state');
       return { newState: state };
     }
     return { newState };
   } else {
     const result = processDHRotationRequest(state, message);
     if (!result) {
-      console.warn('[CallRatchet] processDHRotationRequest failed, keeping old state');
+      __DEV__ && console.warn('[CallRatchet] processDHRotationRequest failed, keeping old state');
       return { newState: state };
     }
     return { newState: result.newState, responseMessage: result.response };
@@ -1279,6 +1292,12 @@ export function getCallRatchetStats(state: CallRatchetState): {
 }
 
 export function createCallRatchetInit(state: CallRatchetState): SerializedCallRatchetInit {
+  // Les deux parties doivent avoir exactement les mêmes clés d'appel.
+  // L'initiateur dérive ses clés depuis son état Triple Ratchet courant et les transmet.
+  // Le répondant utilise ces clés inversées (SEND↔RECV) via initializeCallRatchetFromInit.
+  // Cela garantit la synchronisation même si les états Triple Ratchet ont divergé
+  // (la session avance à chaque message — les deux rootKeys peuvent différer au moment
+  // de l'appel). Ces clés transitent via le canal Triple Ratchet déjà chiffré E2E.
   return {
     type: 'call_ratchet_init',
     version: state.version,
@@ -1294,6 +1313,16 @@ export function createCallRatchetInit(state: CallRatchetState): SerializedCallRa
   };
 }
 
+/**
+ * Initialise l'état du répondant depuis les clés envoyées par l'initiateur.
+ *
+ * L'initiateur dérive ses clés d'appel depuis son état Triple Ratchet courant
+ * puis les transmet via le signal crypto_init. Le répondant les reçoit ici
+ * et les utilise en inversant SEND↔RECV pour obtenir des clés complémentaires.
+ *
+ * Ce mécanisme garantit que les deux parties ont exactement les mêmes clés
+ * même si leurs états Triple Ratchet ont divergé (sessions non synchronisées).
+ */
 export function initializeCallRatchetFromInit(
   init: SerializedCallRatchetInit,
   callId: string
@@ -1314,12 +1343,12 @@ export function initializeCallRatchetFromInit(
     version: init.version,
     callId,
     callRootKey,
-    sendChainKey: theirRecvChainKey,   // Inversé!
-    recvChainKey: theirSendChainKey,   // Inversé!
+    sendChainKey: theirRecvChainKey,    // Inversé: leur recv = notre send
+    recvChainKey: theirSendChainKey,    // Inversé: leur send = notre recv
     sendPacketIndex: 0,
     recvPacketIndex: 0,
-    sendHeaderKey: theirRecvHeaderKey, // Inversé!
-    recvHeaderKey: theirSendHeaderKey, // Inversé!
+    sendHeaderKey: theirRecvHeaderKey,  // Inversé
+    recvHeaderKey: theirSendHeaderKey,  // Inversé
     myDHKey,
     theirDHKey,
     dhRotationCounter: 0,
@@ -1347,7 +1376,7 @@ export function processCallRatchetInit(
   init: SerializedCallRatchetInit
 ): CallRatchetState {
   if (init.callId !== state.callId) {
-    console.warn('[CallRatchet] Init callId mismatch');
+    __DEV__ && console.warn('[CallRatchet] Init callId mismatch');
     return state;
   }
 

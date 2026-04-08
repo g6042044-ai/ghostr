@@ -141,16 +141,17 @@ export const theme = {
     heavy: '800' as const,
   },
   
-  // Safe area
+  // Safe area — Use useSafeAreaInsets() at runtime, these are ONLY fallbacks
   safeArea: {
-    top: Platform.OS === 'ios' ? 47 : 24,
-    bottom: Platform.OS === 'ios' ? 34 : 16,
+    top: 0,   // Always use useSafeAreaInsets().top at runtime
+    bottom: 0, // Always use useSafeAreaInsets().bottom at runtime
   },
   
-  // Header heights
+  // Header heights — consistent across platforms
   header: {
-    height: Platform.OS === 'ios' ? 44 : 56,
-    paddingTop: Platform.OS === 'ios' ? 47 : 24,
+    height: 52,
+    // Vertical padding inside header content (insets.top added separately)
+    contentPaddingVertical: 6,
   },
   
   // Input heights

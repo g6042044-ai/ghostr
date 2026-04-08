@@ -112,7 +112,7 @@ async function checkSuspiciousPaths(): Promise<boolean> {
     try {
       const info = await FileSystem.getInfoAsync(path);
       if (info.exists) {
-        console.warn(`⚠️ Suspicious path detected: ${path}`);
+        __DEV__ && console.warn(`⚠️ Suspicious path detected: ${path}`);
         return true;
       }
     } catch {
@@ -166,13 +166,13 @@ async function checkSecureStorage(): Promise<boolean> {
     await SecureStore.deleteItemAsync(testKey);
     
     if (readBack !== testValue) {
-      console.warn('⚠️ SecureStore integrity check failed');
+      __DEV__ && console.warn('⚠️ SecureStore integrity check failed');
       return false;
     }
     
     return true;
   } catch (error) {
-    console.warn('⚠️ SecureStore not available:', error);
+    __DEV__ && console.warn('⚠️ SecureStore not available:', error);
     return false;
   }
 }

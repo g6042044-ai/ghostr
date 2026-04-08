@@ -309,6 +309,13 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 22,
   },
+  emptyTagline: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: theme.colors.primary,
+    marginTop: 16,
+    opacity: 0.7,
+  },
 
   // Bottom
   bottomBar: {

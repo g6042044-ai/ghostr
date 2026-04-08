@@ -21,6 +21,8 @@
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 import { secureRandomInt } from './crypto';
+// P1-A1: SHA-256 pour le tag commitment
+import { sha256 } from '@noble/hashes/sha256';
 
 // ============================================
 // TYPES
@@ -64,6 +66,8 @@ interface SealedSenderInner {
   innerPayload: string;
   /** Certificat anonyme prouvant la légitimité de l'expéditeur */
   certificate: SenderCertificate;
+  /** P1-A1: SHA-256(tag) — le gateway vérifie que ce commitment matche le tag de l'enveloppe */
+  tagCommitment: string; // Hex
 }
 
 // ============================================
@@ -98,6 +102,37 @@ export function getSenderCertificate(): SenderCertificate | null {
  * Le prochain envoi déclenchera l'obtention d'un nouveau certificat via PoW.
  */
 export function invalidateSenderCertificate(): void {
+  _currentCertificate = null;
+}
+
+/**
+ * R-13: Efface TOUT l'état sealed sender lors du verrouillage de l'application.
+ *
+ * SÉCURITÉ: _serverSealedSenderPubKey est une clé publique NaCl X25519 (32 bytes).
+ * Bien qu'une clé PUBLIQUE ne soit pas secrète, la laisser en mémoire après le
+ * verrouillage permet à un attaquant ayant accès au process (ex: memory dump via ADB
+ * sur un appareil rooté, ou exploitation d'une CVE JavaScript) de:
+ *   - Identifier quelle instance gateway est utilisée (fingerprinting)
+ *   - Préparer une attaque par substitution de clé si le verrou est levé
+ *
+ * Le certificat anonyme (_currentCertificate) contient:
+ *   - Un nonce aléatoire de 32 bytes (identifiant de session gateway)
+ *   - Un HMAC permettant au gateway de vérifier l'authenticité
+ *   → Sa conservation en mémoire après lock expose l'identité de session.
+ *
+ * Après clearSealedSenderState(), les deux doivent être refetchés au déverrouillage.
+ */
+export function clearSealedSenderState(): void {
+  // Zeroizer les bytes si possible (clé publique dans un Uint8Array)
+  if (_serverSealedSenderPubKey) {
+    try {
+      _serverSealedSenderPubKey.fill(0);
+    } catch {
+      // Uint8Array potentiellement détaché (ArrayBuffer partagé) — ignorer
+    }
+    _serverSealedSenderPubKey = null;
+  }
+  // Le certificat ne contient pas de Uint8Array — null suffit
   _currentCertificate = null;
 }
 
@@ -279,24 +314,37 @@ function padSealedPayloadToTier(sealedPayloadStr: string): string {
 }
 
 function _applyPadding(json: string, currentBytes: number, targetBytes: number): string {
-  // Format: insert ,"_p":"XXXXX" before the closing }
-  // Overhead: ,"_p":"" = 8 chars = 8 bytes (ASCII)
-  const overhead = 8; // ,"_p":""
+  // GH-13 fix: Parse JSON → add _p field → re-serialize for robustness
+  // Overhead estimate: ,"_p":"" = 8 bytes min
+  const overhead = 8;
   const padNeeded = targetBytes - currentBytes - overhead;
   
   if (padNeeded <= 0) return json;
   
-  // Générer du padding aléatoire (base64-like chars pour être réaliste)
-  // Utilise des chars A-Za-z0-9 qui sont 1 byte each en UTF-8
   const padChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  const randomBytes = nacl.randomBytes(padNeeded);
   let padding = '';
   for (let i = 0; i < padNeeded; i++) {
-    padding += padChars[randomBytes[i] % padChars.length];
+    padding += padChars[secureRandomInt(padChars.length)];
   }
   
-  // Insérer avant le dernier }
-  return json.slice(0, -1) + ',"_p":"' + padding + '"}';
+  // GH-13: Safe JSON manipulation — parse, add field, re-serialize
+  try {
+    const obj = JSON.parse(json);
+    obj._p = padding;
+    const result = JSON.stringify(obj);
+    // Adjust if serialized size differs from estimate (due to escaping etc.)
+    const resultBytes = new TextEncoder().encode(result).length;
+    if (resultBytes > targetBytes) {
+      // Trim padding to fit
+      const excess = resultBytes - targetBytes;
+      obj._p = padding.slice(0, Math.max(0, padding.length - excess));
+      return JSON.stringify(obj);
+    }
+    return result;
+  } catch {
+    // Fallback: string manipulation (should not happen with valid JSON)
+    return json.slice(0, -1) + ',"_p":"' + padding + '"}';
+  }
 }
 
 export function createSealedSenderEnvelope(
@@ -316,9 +364,15 @@ export function createSealedSenderEnvelope(
   const paddedPayload = padSealedPayloadToTier(innerPayload);
 
   // Construire le contenu interne
+  // P1-A1: Inclure SHA-256(tag) pour que le gateway vérifie la cohérence
+  const tagBytes = new TextEncoder().encode(tag);
+  const tagHash = sha256(tagBytes);
+  const tagCommitment = Array.from(tagHash).map(b => b.toString(16).padStart(2, '0')).join('');
+
   const inner: SealedSenderInner = {
     innerPayload: paddedPayload,
     certificate: cert,
+    tagCommitment,
   };
 
   const innerBytes = new TextEncoder().encode(JSON.stringify(inner));

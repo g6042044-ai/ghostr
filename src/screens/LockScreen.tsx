@@ -1,56 +1,72 @@
 // src/screens/LockScreen.tsx
-// v6.0 - Proper keyboard handling on both platforms
+// Signal-style: flex-based, logo shrinks with keyboard, no scroll
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   View, Text, TextInput, StyleSheet, Vibration, Animated, Platform,
-  StatusBar, Keyboard, TouchableOpacity, ActivityIndicator,
-  KeyboardAvoidingView, Image, Easing, ScrollView,
+  StatusBar, Keyboard, KeyboardAvoidingView, Image, Easing, TouchableOpacity,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { getEncryptionKeysWithInfo, getLockState, getSecurityInfo, SecurityInfo } from '../services/appLock';
+import { getEncryptionKeysWithInfo, getLockState } from '../services/appLock';
 import { setEncryptionKeys } from '../services/storage';
+import { precomputePoW } from '../services/api1to1';
 import { theme } from '../components/ui';
+import { SplashScreen } from './SplashScreen';
 
 interface Props { onUnlock: () => void; }
+
+const LOGO_FULL = 90;
+const LOGO_SMALL = 52;
 
 export function LockScreen({ onUnlock }: Props) {
   const insets = useSafeAreaInsets();
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [attempts, setAttempts] = useState(0);
-  const [progress, setProgress] = useState(0);
-  const [progressText, setProgressText] = useState('');
-  const [securityInfo, setSecurityInfo] = useState<SecurityInfo | null>(null);
-  const [showMigrationSuccess, setShowMigrationSuccess] = useState(false);
   const [lockedUntil, setLockedUntil] = useState<number | null>(null);
   const [remainingSeconds, setRemainingSeconds] = useState(0);
-  
-  const shakeAnimation = useRef(new Animated.Value(0)).current;
-  const fadeAnimation = useRef(new Animated.Value(0)).current;
-  const scaleAnimation = useRef(new Animated.Value(0.9)).current;
-  const logoFloatAnimation = useRef(new Animated.Value(0)).current;
+  const [kbVisible, setKbVisible] = useState(false);
+
   const inputRef = useRef<TextInput>(null);
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const logoSizeAnim = useRef(new Animated.Value(LOGO_FULL)).current;
+  const decorOpacity = useRef(new Animated.Value(1)).current;
+  const shakeAnim = useRef(new Animated.Value(0)).current;
 
-  useEffect(() => { getSecurityInfo().then(setSecurityInfo); }, []);
+  // PERF A4: Lancer le PoW dès que l'utilisateur commence à taper son PIN.
+  // Le PoW est un pur calcul CPU (SHA-256 itératif, ~200ms-1s) sans aucune
+  // dépendance sur les clés secrètes ou les données utilisateur.
+  // En le lançant ici au lieu d'après la validation du PIN, on gagne 200ms-1s
+  // sur le temps total de déverrouillage.
+  const powStartedRef = useRef(false);
 
+  // Entrance
   useEffect(() => {
-    Animated.parallel([
-      Animated.timing(fadeAnimation, { toValue: 1, duration: 500, useNativeDriver: true }),
-      Animated.spring(scaleAnimation, { toValue: 1, tension: 50, friction: 8, useNativeDriver: true }),
-    ]).start();
+    Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: true }).start();
   }, []);
 
+  // Keyboard → shrink logo, hide decor
   useEffect(() => {
-    const f = Animated.loop(Animated.sequence([
-      Animated.timing(logoFloatAnimation, { toValue: -4, duration: 1500, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
-      Animated.timing(logoFloatAnimation, { toValue: 0, duration: 1500, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
-    ]));
-    f.start();
-    return () => f.stop();
+    const show = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hide = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const s1 = Keyboard.addListener(show, () => {
+      setKbVisible(true);
+      Animated.parallel([
+        Animated.timing(logoSizeAnim, { toValue: LOGO_SMALL, duration: 250, useNativeDriver: false }),
+        Animated.timing(decorOpacity, { toValue: 0, duration: 200, useNativeDriver: true }),
+      ]).start();
+    });
+    const s2 = Keyboard.addListener(hide, () => {
+      setKbVisible(false);
+      Animated.parallel([
+        Animated.timing(logoSizeAnim, { toValue: LOGO_FULL, duration: 250, useNativeDriver: false }),
+        Animated.timing(decorOpacity, { toValue: 1, duration: 250, useNativeDriver: true }),
+      ]).start();
+    });
+    return () => { s1.remove(); s2.remove(); };
   }, []);
 
+  // Lockout countdown
   useEffect(() => {
     if (!lockedUntil) { setRemainingSeconds(0); return; }
     const update = () => {
@@ -63,104 +79,133 @@ export function LockScreen({ onUnlock }: Props) {
     return () => clearInterval(iv);
   }, [lockedUntil]);
 
-  const shake = () => {
+  const formatLockout = (s: number) => s >= 60 ? `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}` : `${s}s`;
+
+  const shake = useCallback(() => {
     if (Platform.OS !== 'web') Vibration.vibrate(100);
     Animated.sequence([
-      Animated.timing(shakeAnimation, { toValue: 15, duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnimation, { toValue: -15, duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnimation, { toValue: 15, duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnimation, { toValue: -15, duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnimation, { toValue: 0, duration: 50, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: 15, duration: 50, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: -15, duration: 50, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: 15, duration: 50, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: -15, duration: 50, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: 0, duration: 50, useNativeDriver: true }),
     ]).start();
-  };
+  }, []);
 
-  const handleUnlock = async () => {
+  const handleUnlock = useCallback(async () => {
     Keyboard.dismiss();
-    if (lockedUntil && Date.now() < lockedUntil) { setError(`Trop de tentatives. Attendez ${remainingSeconds}s.`); shake(); return; }
+    if (lockedUntil && Date.now() < lockedUntil) { shake(); return; }
     if (!password.trim()) { setError('Veuillez entrer votre mot de passe'); shake(); return; }
-    setLoading(true); setError(null); setProgress(0); setProgressText('Dérivation de la clé...');
+    setLoading(true); setError(null);
+    await new Promise<void>(resolve => setTimeout(resolve, 80));
     try {
-      const result = await getEncryptionKeysWithInfo(password, (p) => {
-        setProgress(p);
-        if (p < 0.3) setProgressText('Initialisation...');
-        else if (p < 0.7) setProgressText('Dérivation de la clé...');
-        else if (p < 0.95) setProgressText('Vérification...');
-        else setProgressText('Finalisation...');
-      });
+      const result = await getEncryptionKeysWithInfo(password);
       if (result.keys) {
-        setAttempts(0); setLockedUntil(null);
         await setEncryptionKeys(result.keys.localKey, result.keys.conversationsKey);
-        if (result.migrated) { setShowMigrationSuccess(true); setProgressText('Sécurité renforcée ! ✅'); await new Promise(r => setTimeout(r, 1500)); }
         onUnlock();
       } else {
         const state = await getLockState();
-        setAttempts(state.failedAttempts);
-        if (state.remainingLockoutSeconds > 0) { setLockedUntil(Date.now() + (state.remainingLockoutSeconds * 1000)); setRemainingSeconds(state.remainingLockoutSeconds); setError(`Trop de tentatives. Attendez ${state.remainingLockoutSeconds}s.`); }
-        else setError('Mot de passe incorrect');
+        if (state.remainingLockoutSeconds > 0) {
+          setLockedUntil(Date.now() + (state.remainingLockoutSeconds * 1000));
+          setRemainingSeconds(state.remainingLockoutSeconds);
+        } else { setError('Mot de passe incorrect'); }
         shake(); setPassword('');
       }
-    } catch { setError('Une erreur est survenue'); shake(); } finally { setLoading(false); setProgress(0); setProgressText(''); }
-  };
+    } catch { setError('Une erreur est survenue'); shake(); }
+    finally { setLoading(false); }
+  }, [password, lockedUntil, onUnlock]);
 
   const isBlocked = lockedUntil !== null && Date.now() < lockedUntil;
+  if (loading) return <SplashScreen statusMessage="Déverrouillage en cours…" />;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <StatusBar barStyle="light-content" backgroundColor={theme.colors.background} />
-      <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}>
-        <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} bounces={false}>
-          <Animated.View style={[styles.content, { opacity: fadeAnimation, transform: [{ scale: scaleAnimation }] }]}>
-            <View style={styles.logoSection}>
-              <View style={styles.logoWrapper}>
-                <Animated.View style={{ transform: [{ translateY: logoFloatAnimation }] }}>
-                  <Image source={require('../../assets/icon_nobg.png')} style={styles.logoImage} />
-                </Animated.View>
-              </View>
-              <Text style={styles.title}>Ghostr</Text>
-              <View style={styles.secureBadge}><View style={styles.secureDot} /><Text style={styles.secureLabel}>Messagerie sécurisée</Text></View>
-            </View>
 
-            {securityInfo && (
-              <View style={[styles.securityBadge, { borderColor: (securityInfo.strength === 'high' ? theme.colors.success : securityInfo.strength === 'standard' ? theme.colors.primary : theme.colors.warning) + '40' }]}>
-                <Text style={{ fontSize: 24, marginRight: 12 }}>{securityInfo.strength === 'high' ? '🛡️' : securityInfo.strength === 'standard' ? '🔒' : '⚠️'}</Text>
-                <View style={styles.flex}>
-                  <Text style={[styles.securityAlgo, { color: securityInfo.strength === 'high' ? theme.colors.success : securityInfo.strength === 'standard' ? theme.colors.primary : theme.colors.warning }]}>{securityInfo.algorithmName}</Text>
-                  <Text style={styles.securityStrength}>{securityInfo.strength === 'high' ? 'Protection maximale' : securityInfo.strength === 'standard' ? `${securityInfo.iterations?.toLocaleString() || ''} itérations` : 'Mise à jour recommandée'}</Text>
-                </View>
+      <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+        <Animated.View style={[styles.mainContent, { opacity: fadeAnim }]}>
+
+          {/* Logo — shrinks when keyboard is up */}
+          <View style={styles.logoSection}>
+            <Animated.View style={[styles.logoCard, {
+              width: Animated.add(logoSizeAnim, 28),
+              height: Animated.add(logoSizeAnim, 28),
+              borderRadius: 24,
+            }]}>
+              <Animated.Image
+                source={require('../../assets/icon_nobg.png')}
+                style={{ width: logoSizeAnim, height: logoSizeAnim, borderRadius: 18 }}
+                resizeMode="contain"
+              />
+            </Animated.View>
+            {!kbVisible && <Text style={styles.title}>Ghostr</Text>}
+          </View>
+
+          {/* Input + Error + Button */}
+          <View style={styles.formSection}>
+            <Animated.View style={{ transform: [{ translateX: shakeAnim }] }}>
+              <View style={[
+                styles.inputWrapper,
+                error && styles.inputWrapperError,
+                isBlocked && styles.inputWrapperDisabled,
+              ]}>
+                <TextInput
+                  ref={inputRef}
+                  style={[styles.input, isBlocked && { color: theme.colors.textMuted }]}
+                  placeholder="••••••••"
+                  placeholderTextColor={theme.colors.textMuted}
+                  secureTextEntry
+                  value={password}
+                  onChangeText={(t) => {
+                    setPassword(t);
+                    if (!isBlocked) setError(null);
+                    // PERF A4: Lancer le calcul PoW dès la première frappe.
+                    // C'est du pur CPU (SHA-256 itératif, ~200ms-1s) sans aucune
+                    // dépendance sur les clés ou données utilisateur.
+                    if (t.length > 0 && !powStartedRef.current) {
+                      powStartedRef.current = true;
+                      precomputePoW();
+                    }
+                  }}
+                  editable={!isBlocked}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  autoComplete="password"
+                  textContentType="password"
+                  returnKeyType="done"
+                  onSubmitEditing={handleUnlock}
+                  blurOnSubmit
+                />
+              </View>
+            </Animated.View>
+
+            {error && <Text style={styles.errorText}>{error}</Text>}
+
+            {isBlocked && remainingSeconds > 0 && (
+              <View style={styles.lockoutPill}>
+                <Text style={styles.lockoutText}>Réessayez dans {formatLockout(remainingSeconds)}</Text>
               </View>
             )}
 
-            <Text style={styles.instructions}>{isBlocked ? 'Compte temporairement bloqué' : 'Entrez votre mot de passe'}</Text>
-
-            <Animated.View style={[styles.inputSection, { transform: [{ translateX: shakeAnimation }] }]}>
-              <View style={[styles.inputWrapper, error && styles.inputWrapperError, isBlocked && styles.inputWrapperDisabled]}>
-                <TextInput ref={inputRef} style={[styles.input, isBlocked && { color: theme.colors.textMuted }]} placeholder="••••••••" placeholderTextColor={theme.colors.textMuted} secureTextEntry value={password} onChangeText={t => { setPassword(t); if (!isBlocked) setError(null); }} editable={!loading && !isBlocked} autoCapitalize="none" autoCorrect={false} autoComplete="password" textContentType="password" returnKeyType="done" blurOnSubmit />
-              </View>
-              {error && <View style={styles.errorRow}><Text style={{ fontSize: 16 }}>⚠️</Text><Text style={styles.errorText}>{error}</Text></View>}
-              {isBlocked && remainingSeconds > 0 && <View style={styles.countdown}><Text style={styles.countdownText}>Réessayez dans {remainingSeconds}s</Text></View>}
-              {loading && progress > 0 && (
-                <View style={styles.progressWrap}>
-                  <View style={styles.progressBg}><View style={[styles.progressFill, { width: `${Math.round(progress * 100)}%` }]} /></View>
-                  <Text style={styles.progressLabel}>{progressText}</Text>
-                </View>
-              )}
-              {showMigrationSuccess && <View style={styles.migrationRow}><Text style={{ fontSize: 18 }}>🔐</Text><Text style={styles.migrationText}>Sécurité renforcée automatiquement</Text></View>}
-            </Animated.View>
-
-            <TouchableOpacity style={[styles.unlockBtn, (loading || isBlocked) && { opacity: 0.6 }]} onPress={handleUnlock} disabled={loading || isBlocked} activeOpacity={0.8}>
-              {loading ? (
-                <View style={styles.loadingRow}><ActivityIndicator color={theme.colors.textOnPrimary} size="small" /><Text style={styles.loadingLabel}>{progress > 0 ? `${Math.round(progress * 100)}%` : 'Chargement...'}</Text></View>
-              ) : (
-                <><Text style={{ fontSize: 20 }}>{isBlocked ? '🔒' : '🔓'}</Text><Text style={styles.unlockLabel}>{isBlocked ? 'Bloqué' : 'Déverrouiller'}</Text></>
-              )}
+            <TouchableOpacity
+              style={[styles.unlockBtn, isBlocked && styles.unlockBtnDisabled]}
+              onPress={handleUnlock}
+              disabled={isBlocked}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.unlockLabel}>{isBlocked ? 'Verrouillé' : 'Déverrouiller'}</Text>
             </TouchableOpacity>
-            {attempts > 0 && attempts < 5 && !isBlocked && <Text style={styles.attemptsText}>{5 - attempts} tentative{5 - attempts > 1 ? 's' : ''} restante{5 - attempts > 1 ? 's' : ''}</Text>}
+          </View>
+
+        </Animated.View>
+
+        {/* Footer — hidden when keyboard is up */}
+        {!kbVisible && (
+          <Animated.View style={[styles.footer, { paddingBottom: insets.bottom + 20, opacity: decorOpacity }]}>
+            <Text style={styles.footerText}>Chiffrement de bout en bout</Text>
           </Animated.View>
-        </ScrollView>
+        )}
       </KeyboardAvoidingView>
-      <View style={[styles.footer, { paddingBottom: insets.bottom + 20 }]}>
-        <View style={styles.footerBadge}><Text style={{ fontSize: 16 }}>🔐</Text><Text style={styles.footerText}>Triple Ratchet · Post-Quantique</Text></View>
-      </View>
     </View>
   );
 }
@@ -168,42 +213,61 @@ export function LockScreen({ onUnlock }: Props) {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: theme.colors.background },
   flex: { flex: 1 },
-  scrollContent: { flexGrow: 1, justifyContent: 'center' },
-  content: { alignItems: 'center', paddingHorizontal: 32 },
-  logoSection: { alignItems: 'center', marginBottom: 24 },
-  logoWrapper: { width: 110, height: 110, borderRadius: 28, backgroundColor: theme.colors.surface, alignItems: 'center', justifyContent: 'center', marginBottom: 24, ...theme.shadow.md },
-  logoImage: { width: 72, height: 72, borderRadius: 18 },
-  title: { fontSize: 36, fontWeight: '700', color: theme.colors.text, letterSpacing: -0.5, marginBottom: 12 },
-  secureBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: theme.colors.success + '15', paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20 },
-  secureDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: theme.colors.success, marginRight: 8 },
-  secureLabel: { fontSize: 14, color: theme.colors.success, fontWeight: '600' },
-  securityBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: theme.colors.surface, paddingHorizontal: 16, paddingVertical: 12, borderRadius: 16, borderWidth: 1, marginBottom: 20, ...theme.shadow.sm },
-  securityAlgo: { fontSize: 14, fontWeight: '600' },
-  securityStrength: { fontSize: 12, color: theme.colors.textSecondary, marginTop: 2 },
-  instructions: { fontSize: 16, color: theme.colors.textSecondary, marginBottom: 28 },
-  inputSection: { width: '100%', marginBottom: 24 },
-  inputWrapper: { backgroundColor: theme.colors.surface, borderRadius: 20, borderWidth: 2, borderColor: theme.colors.border, overflow: 'hidden' },
+  mainContent: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 32,
+  },
+
+  // Logo
+  logoSection: { alignItems: 'center', marginBottom: 32 },
+  logoCard: {
+    backgroundColor: theme.colors.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
+    ...theme.shadow.md,
+  },
+  title: { fontSize: 30, fontWeight: '700', color: theme.colors.text, letterSpacing: -0.5 },
+
+  // Form
+  formSection: { width: '100%' },
+  inputWrapper: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: 18,
+    borderWidth: 2,
+    borderColor: theme.colors.border,
+    overflow: 'hidden',
+  },
   inputWrapperError: { borderColor: theme.colors.danger },
-  inputWrapperDisabled: { backgroundColor: theme.colors.surface + '80', borderColor: theme.colors.textMuted },
-  input: { paddingHorizontal: 24, paddingVertical: 18, fontSize: 20, color: theme.colors.text, textAlign: 'center', letterSpacing: 4 },
-  errorRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginTop: 16, gap: 8 },
-  errorText: { color: theme.colors.danger, fontSize: 14, fontWeight: '500' },
-  countdown: { alignItems: 'center', marginTop: 12, paddingVertical: 8, paddingHorizontal: 16, backgroundColor: theme.colors.warning + '20', borderRadius: 12 },
-  countdownText: { color: theme.colors.warning, fontSize: 15, fontWeight: '600' },
-  progressWrap: { marginTop: 16, alignItems: 'center' },
-  progressBg: { width: '100%', height: 6, backgroundColor: theme.colors.border, borderRadius: 3, overflow: 'hidden' },
-  progressFill: { height: '100%', backgroundColor: theme.colors.primary, borderRadius: 3 },
-  progressLabel: { marginTop: 8, fontSize: 13, color: theme.colors.textSecondary },
-  migrationRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginTop: 16, paddingVertical: 10, paddingHorizontal: 16, backgroundColor: theme.colors.success + '20', borderRadius: 12, gap: 8 },
-  migrationText: { color: theme.colors.success, fontSize: 14, fontWeight: '600' },
-  unlockBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: theme.colors.primary, paddingVertical: 18, paddingHorizontal: 48, borderRadius: 28, gap: 12, minWidth: 220, ...theme.shadow.md },
-  unlockLabel: { color: theme.colors.textOnPrimary, fontSize: 18, fontWeight: '600' },
-  loadingRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  loadingLabel: { color: theme.colors.textOnPrimary, fontSize: 16, fontWeight: '500' },
-  attemptsText: { marginTop: 16, fontSize: 13, color: theme.colors.warning },
-  footer: { alignItems: 'center', paddingTop: 20 },
-  footerBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: theme.colors.success + '15', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 20, gap: 10 },
-  footerText: { color: theme.colors.success, fontSize: 13, fontWeight: '500' },
+  inputWrapperDisabled: { backgroundColor: theme.colors.surface + '80', borderColor: theme.colors.textMuted + '40' },
+  input: {
+    paddingHorizontal: 24, paddingVertical: 18,
+    fontSize: 20, color: theme.colors.text, textAlign: 'center', letterSpacing: 4,
+  },
+  errorText: { color: theme.colors.danger, fontSize: 14, fontWeight: '500', textAlign: 'center', marginTop: 12 },
+  lockoutPill: {
+    alignSelf: 'center', marginTop: 10,
+    paddingVertical: 8, paddingHorizontal: 20,
+    backgroundColor: theme.colors.warning + '18', borderRadius: 20,
+  },
+  lockoutText: { color: theme.colors.warning, fontSize: 14, fontWeight: '600' },
+
+  unlockBtn: {
+    alignItems: 'center', justifyContent: 'center',
+    backgroundColor: theme.colors.primary,
+    paddingVertical: 18, borderRadius: 18,
+    marginTop: 20,
+    ...theme.shadow.md,
+  },
+  unlockBtnDisabled: { opacity: 0.5 },
+  unlockLabel: { color: theme.colors.textOnPrimary, fontSize: 17, fontWeight: '600' },
+
+  // Footer
+  footer: { alignItems: 'center' },
+  footerTagline: { fontSize: 14, color: theme.colors.textSecondary, fontWeight: '500', marginBottom: 4 },
+  footerText: { fontSize: 13, color: theme.colors.textMuted, fontWeight: '500' },
 });
 
 export default LockScreen;

@@ -1,27 +1,31 @@
 // src/services/encryptedBlobService.ts
-// v26.0: Encrypted Blob Storage — Replace chunking with direct blob upload
+// v27.0: Encrypted Blob Storage — OHTTP-only (ACTION-03 Phase 1 Security)
 //
-// ARCHITECTURE:
-//   Upload: data → nacl.secretbox(random key) → pad to tier → upload via relay
-//   Download: fetch via relay → unpad → nacl.secretbox.open(key) → data
+// ARCHITECTURE (v27.0 — CHANGED from v26.0):
+//   Upload: data → nacl.secretbox(random key) → pad to tier → base64 → OHTTP relay → gateway → Supabase Storage
+//   Download: OHTTP relay → gateway → Supabase Storage → base64 → unpad → nacl.secretbox.open → data
 //
-// SÉCURITÉ:
-//   • Chiffrement XSalsa20-Poly1305 côté client (clé aléatoire par blob)
-//   • Padding à tiers fixes → masque le type de contenu
-//   • Upload/download via CF Relay → IP cachée de Supabase
-//   • Path = UUID aléatoire → aucun lien avec la session/conversation
-//   • Clé de déchiffrement dans le message E2E → seul le destinataire peut lire
-//   • TTL 48h → les blobs expirent automatiquement
+// v26.0 VULNERABILITY FIXED:
+//   Previously, uploads/downloads went through CF Relay's /storage/* proxy.
+//   The CF Relay saw the client's IP AND the blob path (UUID) in the URL.
+//   Supabase saw the blob UUID AND the timestamp/size.
+//   An adversary with access to both logs could correlate IP ↔ blob via timestamp+size.
 //
-// SPLIT-TRUST:
-//   CF Relay:  voit l'IP du client, voit la TAILLE du blob, pas le contenu (TLS)
-//   Supabase:  voit le blob chiffré, ne voit PAS l'IP du client
-//   → Aucun tiers ne voit IP + contenu simultanément
+// v27.0 FIX:
+//   ALL blob operations now go through the OHTTP tunnel (/relay endpoint).
+//   The CF Relay sees ONLY an opaque encrypted blob — no UUID, no path, no size.
+//   The gateway sees the UUID and forwards to Supabase, but never sees the IP.
+//   → No single entity can correlate IP ↔ blob ↔ conversation.
+//
+// TRADE-OFF:
+//   Base64 encoding adds ~33% overhead on the OHTTP payload.
+//   A 16MB blob becomes ~21.3MB in transit through the tunnel.
+//   This is acceptable for the anonymity guarantee.
 
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 import { getRandomBytes } from './crypto';
-import { supabaseStorage, API_URL, SUPABASE_ANON_KEY } from './api';
+import { secureRpc } from './relayTransport';
 
 // ============================================
 // CONSTANTS
@@ -168,7 +172,7 @@ function padToTier(ciphertext: Uint8Array, tierSize: number): Uint8Array {
 }
 
 // ============================================
-// UPLOAD (via relay → Supabase Storage)
+// UPLOAD (via OHTTP relay → gateway → Supabase Storage)
 // ============================================
 
 /**
@@ -194,10 +198,12 @@ export interface UploadBlobResult {
 }
 
 /**
- * Chiffre, padde, et uploade un blob anonyme sur Supabase Storage via le relay.
+ * Chiffre, padde, et uploade un blob anonyme via OHTTP relay.
  *
- * Le relay CF masque l'IP du client. Supabase ne voit qu'un blob opaque
- * avec un UUID aléatoire — aucun lien avec l'utilisateur ou la conversation.
+ * v27.0 (ACTION-03): Upload goes through OHTTP tunnel, not /storage/* proxy.
+ * The CF Relay sees only an opaque encrypted OHTTP blob.
+ * The gateway decrypts, extracts the blob data, and uploads to Supabase Storage.
+ * → No single entity sees both IP and blob UUID.
  *
  * @param data - Données brutes à chiffrer (Uint8Array)
  * @returns Métadonnées du blob pour inclusion dans le message E2E
@@ -214,23 +220,24 @@ export async function encryptAndUploadBlob(data: Uint8Array): Promise<UploadBlob
     `[BlobService] 🔐 Encrypted: ${Math.round(data.length / 1024)}KB → ${Math.round(encrypted.ciphertextSize / 1024)}KB → padded to ${Math.round(encrypted.tier / 1024)}KB`
   );
 
-  // 2. Upload via relay (supabaseStorage utilise API_URL = RELAY_URL)
+  // 2. Upload via OHTTP relay (v27.0: no more /storage/* proxy)
   const blobId = generateBlobId();
   const blobPath = `${blobId}.bin`;
 
-  const { error } = await supabaseStorage.storage
-    .from(BLOB_BUCKET)
-    .upload(blobPath, encrypted.paddedBlob, {
-      contentType: 'application/octet-stream',
-      cacheControl: '0', // Pas de cache — le blob expire
-      upsert: false,
-    });
+  // Base64 encode the padded blob for JSON transport through OHTTP
+  const blobB64 = encodeBase64(encrypted.paddedBlob);
+
+  const { data: result, error } = await secureRpc('upload_blob', {
+    blob_data: blobB64,
+    blob_path: blobPath,
+    content_type: 'application/octet-stream',
+  });
 
   if (error) {
     throw new Error(`[BlobService] Upload failed: ${error.message}`);
   }
 
-  __DEV__ && console.log(`[BlobService] ✅ Uploaded blob ${blobId.slice(0, 12)}... (${Math.round(encrypted.tier / 1024)}KB)`);
+  __DEV__ && console.log(`[BlobService] ✅ Uploaded blob ${blobId.slice(0, 12)}... via OHTTP (${Math.round(encrypted.tier / 1024)}KB)`);
 
   return {
     blobId,
@@ -241,16 +248,15 @@ export async function encryptAndUploadBlob(data: Uint8Array): Promise<UploadBlob
 }
 
 // ============================================
-// DOWNLOAD (via relay → Supabase Storage)
+// DOWNLOAD (via OHTTP relay → gateway → Supabase Storage)
 // ============================================
 
 /**
- * Télécharge et déchiffre un blob depuis Supabase Storage via le relay.
+ * Télécharge et déchiffre un blob via OHTTP relay.
  *
- * Le download passe par le relay CF via fetch direct (API_URL + /storage/v1/object/).
- * ATTENTION: NE PAS utiliser supabaseStorage.storage.download() ni createSignedUrl() — 
- * .download() retourne un Blob sans .arrayBuffer() en React Native,
- * et createSignedUrl() génère une URL directe vers Supabase qui CONTOURNE le relay.
+ * v27.0 (ACTION-03): Download goes through OHTTP tunnel, not /storage/* proxy.
+ * The gateway fetches the blob from Supabase Storage, base64-encodes it,
+ * and sends it back through the encrypted OHTTP response.
  *
  * @param blobId - UUID du blob
  * @param blobKey - Clé de chiffrement (base64, du message E2E)
@@ -264,33 +270,28 @@ export async function downloadAndDecryptBlob(
   blobNonce: string,
   blobSize: number
 ): Promise<Uint8Array> {
-  __DEV__ && console.log(`[BlobService] ⬇️ Downloading blob ${blobId.slice(0, 12)}...`);
+  __DEV__ && console.log(`[BlobService] ⬇️ Downloading blob ${blobId.slice(0, 12)}... via OHTTP`);
 
-  // 1. Download via relay proxy (CF Worker /storage/* route)
-  // CRITIQUE: NE PAS utiliser createSignedUrl() — la signed URL pointe
-  // directement vers Supabase, CONTOURNANT le relay → fuite IP.
-  // On fetch via API_URL (= relay) qui proxy vers Supabase.
   const blobPath = `${blobId}.bin`;
-  const downloadUrl = `${API_URL}/storage/v1/object/${BLOB_BUCKET}/${blobPath}`;
-  
-  const response = await fetch(downloadUrl, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-      'apikey': SUPABASE_ANON_KEY,
-    },
+
+  // 1. Download via OHTTP relay (v27.0: no more /storage/* proxy)
+  const { data: result, error } = await secureRpc('download_blob', {
+    blob_path: blobPath,
   });
 
-  if (!response.ok) {
-    throw new Error(`[BlobService] Download HTTP ${response.status}: ${response.statusText}`);
+  if (error) {
+    throw new Error(`[BlobService] Download failed: ${error.message}`);
   }
 
-  // 2. Convertir Response → Uint8Array (fetch Response a .arrayBuffer() en RN)
-  const arrayBuffer = await response.arrayBuffer();
-  const paddedBlob = new Uint8Array(arrayBuffer);
+  if (!result || !(result as any).blob_data) {
+    throw new Error('[BlobService] Download returned empty data');
+  }
+
+  // 2. Decode base64 blob from OHTTP response
+  const paddedBlob = decodeBase64((result as any).blob_data);
 
   __DEV__ && console.log(
-    `[BlobService] ⬇️ Downloaded ${Math.round(paddedBlob.length / 1024)}KB, ciphertext ${Math.round(blobSize / 1024)}KB`
+    `[BlobService] ⬇️ Downloaded ${Math.round(paddedBlob.length / 1024)}KB via OHTTP, ciphertext ${Math.round(blobSize / 1024)}KB`
   );
 
   // 3. Déchiffrer
@@ -309,19 +310,18 @@ export async function downloadAndDecryptBlob(
 }
 
 // ============================================
-// CLEANUP (appelé depuis le client, optionnel)
+// CLEANUP (via OHTTP relay, best-effort)
 // ============================================
 
 /**
- * Supprime un blob du storage (après téléchargement par le destinataire).
+ * Supprime un blob du storage via OHTTP relay (best-effort).
  * En pratique, le cron job côté serveur nettoie les blobs > 48h.
- * Cette fonction est optionnelle (best-effort cleanup).
  */
 export async function deleteBlob(blobId: string): Promise<void> {
   try {
     const blobPath = `${blobId}.bin`;
-    await supabaseStorage.storage.from(BLOB_BUCKET).remove([blobPath]);
-    __DEV__ && console.log(`[BlobService] 🗑️ Deleted blob ${blobId.slice(0, 12)}...`);
+    await secureRpc('delete_blob', { blob_path: blobPath });
+    __DEV__ && console.log(`[BlobService] 🗑️ Deleted blob ${blobId.slice(0, 12)}... via OHTTP`);
   } catch {
     // Best-effort — le cron nettoiera
   }
@@ -339,4 +339,93 @@ export function base64ToUint8Array(base64: string): Uint8Array {
 /** Convertit Uint8Array → base64 */
 export function uint8ArrayToBase64(data: Uint8Array): string {
   return encodeBase64(data);
+}
+
+// ============================================
+// P0-A2: REMPLACEMENT DE fetchMediaSecurely (legacyMediaProxy supprimé)
+// ============================================
+
+/**
+ * Télécharge un média chiffré via le relay OHTTP.
+ *
+ * Remplace fetchMediaSecurely (legacyMediaProxy.ts, supprimé en P0-A2).
+ * Toutes les URLs de médias pointent vers le bucket ghostr-blobs.
+ * Le téléchargement passe par le tunnel OHTTP pour protéger l'IP.
+ *
+ * Fonctionnement:
+ *   1. Parse l'URL pour extraire le chemin du blob dans le bucket
+ *   2. Télécharge via secureRpc('download_blob') à travers le relay OHTTP
+ *   3. Retourne les données brutes chiffrées (Uint8Array)
+ *
+ * @param url - URL du média (format Supabase: .../ghostr-blobs/<path>)
+ * @returns Données chiffrées brutes (encore chiffrées avec la clé du fichier)
+ */
+export async function fetchMediaViaRelay(url: string): Promise<Uint8Array> {
+  // Extraire le chemin du blob depuis l'URL Supabase Storage
+  // Format: .../storage/v1/object/public/ghostr-blobs/<blobPath>
+  // ou:     .../storage/v1/object/ghostr-blobs/<blobPath>
+  const blobPath = extractBlobPathFromUrl(url);
+
+  if (!blobPath) {
+    // Fallback: URL non-Supabase ou format inconnu — ne devrait pas arriver
+    // dans le flux normal, mais on log et on retente via fetch direct
+    __DEV__ && console.warn(
+      '[BlobService] ⚠️ URL non reconnue, impossible de router via OHTTP:',
+      url.slice(0, 80)
+    );
+    throw new Error(
+      `[BlobService] URL de média non reconnue. Le proxy /storage/* a été supprimé. ` +
+      `Toutes les URLs doivent pointer vers ghostr-blobs. URL: ${url.slice(0, 80)}...`
+    );
+  }
+
+  __DEV__ && console.log(
+    `[BlobService] ⬇️ fetchMediaViaRelay: ${blobPath.slice(0, 30)}... via OHTTP`
+  );
+
+  const { data, error } = await secureRpc('download_blob', {
+    blob_path: blobPath,
+  });
+
+  if (error) {
+    throw new Error(`[BlobService] Download via OHTTP failed: ${error.message}`);
+  }
+
+  if (!data || !(data as any).blob_data) {
+    throw new Error('[BlobService] Download returned empty data');
+  }
+
+  const mediaBytes = decodeBase64((data as any).blob_data);
+
+  __DEV__ && console.log(
+    `[BlobService] ✅ Downloaded ${Math.round(mediaBytes.length / 1024)}KB via OHTTP`
+  );
+
+  return mediaBytes;
+}
+
+/**
+ * Extrait le chemin du blob depuis une URL Supabase Storage.
+ *
+ * @param url - URL complète (ex: https://relay.example.com/storage/v1/object/public/ghostr-blobs/abc/def.enc)
+ * @returns Chemin du blob (ex: "abc/def.enc") ou null si non reconnu
+ */
+function extractBlobPathFromUrl(url: string): string | null {
+  try {
+    // Pattern 1: /ghostr-blobs/<path> (URL publique ou avec /public/)
+    const match = url.match(/\/ghostr-blobs\/(.+)$/);
+    if (match) {
+      return decodeURIComponent(match[1]);
+    }
+
+    // Pattern 2: URL encodée (%2F au lieu de /)
+    const matchEncoded = url.match(/\/ghostr-blobs%2F(.+)$/i);
+    if (matchEncoded) {
+      return decodeURIComponent(matchEncoded[1]);
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
 }

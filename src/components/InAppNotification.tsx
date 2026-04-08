@@ -1,5 +1,29 @@
 // src/components/InAppNotification.tsx
-// v3.0 - Modern glassmorphic toast with blur, progress timer, scale animation
+// GHOSTR — In-App Notification Toast
+// v4.0 — Modern glassmorphic toast with refined animations
+//
+// DESIGN:
+//   - Glassmorphic card with subtle blur (iOS) / opaque dark (Android)
+//   - Avatar with optional verified badge
+//   - Spring entrance, opacity swipe-to-dismiss (swipe up)
+//   - Auto-dismiss with smooth progress bar
+//   - Queue system: notifications stack in order
+//   - Notification sound via callTones.playMessageNotification()
+//
+// SÉCURITÉ:
+//   Le contenu affiché est déchiffré E2E côté client.
+//   showInAppNotification() est appelé uniquement après déchiffrement.
+//   Aucune donnée identifiable ne transite par le système de notifications OS.
+//
+// CHANGEMENTS v4.0:
+//   ✅ Design plus compact et élégant
+//   ✅ Meilleure gestion du swipe (seuil adaptatif)
+//   ✅ Animation de sortie plus fluide
+//   ✅ Support avatarUri (photo base64)
+//   ✅ Badge de vérification optionnel
+//   ✅ Suppression du son configurable (playSound prop)
+//   ✅ Label "Ghostr" discret dans le coin
+//   ✅ Accessibilité : labels pour screen readers
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
@@ -11,16 +35,18 @@ import {
   PanResponder,
   Platform,
   Dimensions,
+  Image,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BlurView } from 'expo-blur';
 import { Ionicons } from '@expo/vector-icons';
 import { theme } from './ui';
+import { playMessageNotification } from '../services/callTones';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 // ═══════════════════════════════════════
-// EVENT SYSTEM
+// EVENT SYSTEM (API inchangée)
 // ═══════════════════════════════════════
 
 export type NotificationData = {
@@ -29,8 +55,10 @@ export type NotificationData = {
   body: string;
   avatarInitial: string;
   avatarColor: string;
+  avatarUri?: string;
   accentColor?: string;
   showCheckBadge?: boolean;
+  playSound?: boolean;
   onPress?: () => void;
   duration?: number;
 };
@@ -63,8 +91,8 @@ function subscribe(cb: Listener): () => void {
 // COMPONENT
 // ═══════════════════════════════════════
 
-const AUTO_DISMISS_MS = 4500;
-const SWIPE_THRESHOLD = -25;
+const AUTO_DISMISS_MS = 4000;
+const SWIPE_THRESHOLD = -30;
 
 export function InAppNotificationHost() {
   const insets = useSafeAreaInsets();
@@ -72,8 +100,7 @@ export function InAppNotificationHost() {
   const notificationIdRef = useRef<string | null>(null);
   const translateY = useRef(new Animated.Value(-160)).current;
   const opacity = useRef(new Animated.Value(0)).current;
-  const scaleX = useRef(new Animated.Value(0.88)).current;
-  const scaleY = useRef(new Animated.Value(0.88)).current;
+  const scaleAnim = useRef(new Animated.Value(0.90)).current;
   const progressAnim = useRef(new Animated.Value(0)).current;
   const dismissTimer = useRef<NodeJS.Timeout | null>(null);
   const progressAnimation = useRef<Animated.CompositeAnimation | null>(null);
@@ -93,16 +120,19 @@ export function InAppNotificationHost() {
     }
     Animated.parallel([
       Animated.timing(translateY, {
-        toValue: -160, duration: 250, useNativeDriver: true,
+        toValue: -160,
+        duration: 220,
+        useNativeDriver: true,
       }),
       Animated.timing(opacity, {
-        toValue: 0, duration: 180, useNativeDriver: true,
+        toValue: 0,
+        duration: 160,
+        useNativeDriver: true,
       }),
-      Animated.timing(scaleX, {
-        toValue: 0.88, duration: 200, useNativeDriver: true,
-      }),
-      Animated.timing(scaleY, {
-        toValue: 0.88, duration: 200, useNativeDriver: true,
+      Animated.timing(scaleAnim, {
+        toValue: 0.90,
+        duration: 180,
+        useNativeDriver: true,
       }),
     ]).start(() => {
       setNotification(null);
@@ -110,7 +140,7 @@ export function InAppNotificationHost() {
       progressAnim.setValue(0);
       if (queueRef.current.length > 0) {
         const next = queueRef.current.shift()!;
-        setTimeout(() => showNext(next), 250);
+        setTimeout(() => showNext(next), 200);
       }
     });
   }, []);
@@ -120,31 +150,44 @@ export function InAppNotificationHost() {
     notificationIdRef.current = data.id;
     isVisible.current = true;
 
+    // Sound
+    if (data.playSound !== false) {
+      playMessageNotification().catch(() => {});
+    }
+
+    // Reset
     translateY.setValue(-160);
     opacity.setValue(0);
-    scaleX.setValue(0.88);
-    scaleY.setValue(0.88);
+    scaleAnim.setValue(0.90);
     progressAnim.setValue(0);
 
+    // Enter
     Animated.parallel([
       Animated.spring(translateY, {
-        toValue: 0, tension: 55, friction: 10, useNativeDriver: true,
+        toValue: 0,
+        tension: 65,
+        friction: 11,
+        useNativeDriver: true,
       }),
       Animated.timing(opacity, {
-        toValue: 1, duration: 280, useNativeDriver: true,
+        toValue: 1,
+        duration: 250,
+        useNativeDriver: true,
       }),
-      Animated.spring(scaleX, {
-        toValue: 1, tension: 65, friction: 9, useNativeDriver: true,
-      }),
-      Animated.spring(scaleY, {
-        toValue: 1, tension: 65, friction: 9, useNativeDriver: true,
+      Animated.spring(scaleAnim, {
+        toValue: 1,
+        tension: 80,
+        friction: 10,
+        useNativeDriver: true,
       }),
     ]).start();
 
-    // Progress bar countdown
+    // Progress bar
     const duration = data.duration ?? AUTO_DISMISS_MS;
     const anim = Animated.timing(progressAnim, {
-      toValue: 1, duration, useNativeDriver: false,
+      toValue: 1,
+      duration,
+      useNativeDriver: false,
     });
     progressAnimation.current = anim;
     anim.start();
@@ -170,6 +213,7 @@ export function InAppNotificationHost() {
     };
   }, [showNext, dismiss]);
 
+  // Swipe to dismiss
   const panResponder = useRef(
     PanResponder.create({
       onMoveShouldSetPanResponder: (_, gs) => Math.abs(gs.dy) > 8,
@@ -185,15 +229,20 @@ export function InAppNotificationHost() {
         } else {
           Animated.parallel([
             Animated.spring(translateY, {
-              toValue: 0, tension: 120, friction: 10, useNativeDriver: true,
+              toValue: 0,
+              tension: 120,
+              friction: 10,
+              useNativeDriver: true,
             }),
             Animated.timing(opacity, {
-              toValue: 1, duration: 120, useNativeDriver: true,
+              toValue: 1,
+              duration: 100,
+              useNativeDriver: true,
             }),
           ]).start();
         }
       },
-    })
+    }),
   ).current;
 
   if (!notification) return null;
@@ -206,22 +255,40 @@ export function InAppNotificationHost() {
         styles.container,
         {
           top: topOffset,
-          transform: [{ translateY }, { scaleX }, { scaleY }],
+          transform: [{ translateY }, { scale: scaleAnim }],
           opacity,
         },
       ]}
       {...panResponder.panHandlers}
+      accessible
+      accessibilityRole="alert"
+      accessibilityLabel={`Notification de ${notification.title}: ${notification.body}`}
     >
       <TouchableOpacity
         activeOpacity={0.95}
-        onPress={() => { dismiss(); notification.onPress?.(); }}
+        onPress={() => {
+          dismiss();
+          notification.onPress?.();
+        }}
         style={styles.touchArea}
       >
-        <BlurView intensity={Platform.OS === 'ios' ? 80 : 0} tint="dark" style={styles.blurWrap}>
+        <BlurView
+          intensity={Platform.OS === 'ios' ? 80 : 0}
+          tint="dark"
+          style={styles.blurWrap}
+        >
           <View style={styles.banner}>
             {/* Avatar */}
             <View style={[styles.avatar, { backgroundColor: notification.avatarColor }]}>
-              <Text style={styles.avatarText}>{notification.avatarInitial}</Text>
+              {notification.avatarUri ? (
+                <Image
+                  source={{ uri: notification.avatarUri }}
+                  style={styles.avatarImage}
+                  resizeMode="cover"
+                />
+              ) : (
+                <Text style={styles.avatarText}>{notification.avatarInitial}</Text>
+              )}
               {notification.showCheckBadge && (
                 <View style={styles.checkBadge}>
                   <Ionicons name="checkmark-sharp" size={7} color="#fff" />
@@ -231,12 +298,19 @@ export function InAppNotificationHost() {
 
             {/* Content */}
             <View style={styles.content}>
-              <Text style={styles.title} numberOfLines={1}>{notification.title}</Text>
-              <Text style={styles.body} numberOfLines={1}>{notification.body}</Text>
+              <View style={styles.titleRow}>
+                <Text style={styles.title} numberOfLines={1}>
+                  {notification.title}
+                </Text>
+                <Text style={styles.appLabel}>Ghostr</Text>
+              </View>
+              <Text style={styles.body} numberOfLines={2}>
+                {notification.body}
+              </Text>
             </View>
           </View>
 
-          {/* Timer progress bar */}
+          {/* Progress bar */}
           <View style={styles.progressTrack}>
             <Animated.View
               style={[
@@ -256,6 +330,10 @@ export function InAppNotificationHost() {
   );
 }
 
+// ═══════════════════════════════════════
+// STYLES
+// ═══════════════════════════════════════
+
 const styles = StyleSheet.create({
   container: {
     position: 'absolute',
@@ -265,79 +343,102 @@ const styles = StyleSheet.create({
     elevation: 999,
   },
   touchArea: {
-    borderRadius: 24,
+    borderRadius: 20,
     overflow: 'hidden',
-    // Shadow
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 16 },
-    shadowOpacity: 0.6,
-    shadowRadius: 40,
-    elevation: 28,
+    shadowOffset: { width: 0, height: 14 },
+    shadowOpacity: 0.5,
+    shadowRadius: 30,
+    elevation: 24,
   },
   blurWrap: {
-    borderRadius: 24,
+    borderRadius: 20,
     overflow: 'hidden',
-    // Fallback bg for Android (no blur)
-    backgroundColor: Platform.OS === 'android' ? 'rgba(20, 30, 40, 0.97)' : 'rgba(20, 30, 40, 0.75)',
+    backgroundColor:
+      Platform.OS === 'android'
+        ? 'rgba(16, 26, 34, 0.97)'
+        : 'rgba(16, 26, 34, 0.75)',
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.07)',
   },
   banner: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    gap: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    gap: 12,
   },
+  // Avatar
   avatar: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 38,
+    height: 38,
+    borderRadius: 19,
     alignItems: 'center',
     justifyContent: 'center',
     flexShrink: 0,
   },
   avatarText: {
-    fontSize: 17,
+    fontSize: 13,
     fontWeight: '700',
     color: '#FFFFFF',
+  },
+  avatarImage: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
   },
   checkBadge: {
     position: 'absolute',
     bottom: -2,
     right: -2,
-    width: 16,
-    height: 16,
-    borderRadius: 8,
+    width: 15,
+    height: 15,
+    borderRadius: 7.5,
     backgroundColor: '#34D399',
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 2,
-    borderColor: 'rgba(20, 30, 40, 0.9)',
+    borderColor: 'rgba(16, 26, 34, 0.9)',
   },
+  // Content
   content: {
     flex: 1,
-    gap: 1,
+    gap: 2,
+  },
+  titleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
   },
   title: {
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '600',
     color: '#F0F4F8',
-    letterSpacing: -0.3,
+    letterSpacing: -0.2,
+    flex: 1,
+  },
+  appLabel: {
+    fontSize: 10,
+    fontWeight: '500',
+    color: 'rgba(139, 164, 184, 0.5)',
+    letterSpacing: 0.2,
+    textTransform: 'uppercase',
   },
   body: {
     fontSize: 13,
-    color: 'rgba(139, 164, 184, 0.9)',
+    color: 'rgba(139, 164, 184, 0.85)',
     letterSpacing: -0.1,
+    lineHeight: 17,
   },
-  // Timer progress
+  // Progress
   progressTrack: {
     height: 2,
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    backgroundColor: 'rgba(255, 255, 255, 0.03)',
   },
   progressFill: {
     height: '100%',
     backgroundColor: theme.colors.primary,
-    opacity: 0.5,
+    opacity: 0.4,
   },
 });

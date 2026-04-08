@@ -55,6 +55,7 @@ interface AlertModalProps {
 
 interface ActionSheetItem {
   title: string;
+  subtitle?: string;
   icon?: React.ReactNode;
   onPress: () => void;
   destructive?: boolean;
@@ -65,6 +66,7 @@ interface ActionSheetProps {
   visible: boolean;
   onClose: () => void;
   title?: string;
+  subtitle?: string;
   items: ActionSheetItem[];
   showCancel?: boolean;
   cancelText?: string;
@@ -287,6 +289,7 @@ export const ActionSheet: React.FC<ActionSheetProps> = ({
   visible,
   onClose,
   title,
+  subtitle,
   items,
   showCancel = true,
   cancelText = 'Annuler',
@@ -294,9 +297,18 @@ export const ActionSheet: React.FC<ActionSheetProps> = ({
   const insets = useSafeAreaInsets();
   const slideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
   const fadeAnim = useRef(new Animated.Value(0)).current;
+  const itemAnims = useRef(items.map(() => new Animated.Value(0))).current;
 
   useEffect(() => {
     if (visible) {
+      // Reset item anims
+      itemAnims.forEach(a => a.setValue(0));
+      
+      // PERF FIX: Lancer les animations des items EN PARALLÈLE avec le slide,
+      // pas APRÈS. Avant: le sheet glissait (300-500ms) PUIS les items apparaissaient
+      // un par un (stagger 60ms × N). L'utilisateur attendait ~600ms avant de voir
+      // les boutons. Après: les items commencent à apparaître 80ms après le début
+      // du slide et sont visibles dès que le sheet atteint sa position finale.
       Animated.parallel([
         Animated.spring(slideAnim, {
           toValue: 0,
@@ -309,6 +321,20 @@ export const ActionSheet: React.FC<ActionSheetProps> = ({
           duration: 200,
           useNativeDriver: true,
         }),
+        // Items: petit délai puis stagger rapide — visibles pendant que le sheet glisse
+        Animated.sequence([
+          Animated.delay(80),
+          Animated.stagger(40,
+            itemAnims.map(anim =>
+              Animated.spring(anim, {
+                toValue: 1,
+                useNativeDriver: true,
+                tension: 120,
+                friction: 14,
+              })
+            )
+          ),
+        ]),
       ]).start();
     } else {
       Animated.parallel([
@@ -344,49 +370,84 @@ export const ActionSheet: React.FC<ActionSheetProps> = ({
             styles.actionSheet,
             {
               transform: [{ translateY: slideAnim }],
-              paddingBottom: Math.max(insets.bottom, 20),
+              paddingBottom: Math.max(insets.bottom, 16) + 8,
             },
           ]}
         >
           <View style={styles.handle} />
 
+          {/* Header */}
           {title && (
             <View style={styles.actionSheetHeader}>
               <Text style={styles.actionSheetTitle}>{title}</Text>
+              {subtitle && (
+                <Text style={styles.actionSheetSubtitle}>{subtitle}</Text>
+              )}
             </View>
           )}
 
-          <View style={styles.actionSheetItems}>
+          {/* Items as cards */}
+          <View style={styles.actionSheetCards}>
             {items.map((item, index) => (
-              <TouchableOpacity
+              <Animated.View
                 key={index}
-                style={[
-                  styles.actionSheetItem,
-                  index === items.length - 1 && styles.actionSheetItemLast,
-                  item.disabled && styles.actionSheetItemDisabled,
-                ]}
-                onPress={() => {
-                  if (!item.disabled) {
-                    item.onPress();
-                    onClose();
-                  }
+                style={{
+                  opacity: itemAnims[index] || 1,
+                  transform: [{
+                    translateY: (itemAnims[index] || new Animated.Value(1)).interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [16, 0],
+                    }),
+                  }],
                 }}
-                activeOpacity={0.7}
-                disabled={item.disabled}
               >
-                {item.icon && (
-                  <View style={styles.actionSheetItemIcon}>{item.icon}</View>
-                )}
-                <Text
+                <TouchableOpacity
                   style={[
-                    styles.actionSheetItemText,
-                    item.destructive && styles.actionSheetItemTextDestructive,
-                    item.disabled && styles.actionSheetItemTextDisabled,
+                    styles.actionSheetCard,
+                    item.disabled && styles.actionSheetCardDisabled,
+                    item.destructive && styles.actionSheetCardDestructive,
                   ]}
+                  onPress={() => {
+                    if (!item.disabled) {
+                      item.onPress();
+                      onClose();
+                    }
+                  }}
+                  activeOpacity={0.7}
+                  disabled={item.disabled}
                 >
-                  {item.title}
-                </Text>
-              </TouchableOpacity>
+                  {item.icon && (
+                    <View style={[
+                      styles.actionSheetCardIcon,
+                      item.destructive && styles.actionSheetCardIconDestructive,
+                    ]}>
+                      {item.icon}
+                    </View>
+                  )}
+                  <View style={styles.actionSheetCardContent}>
+                    <Text
+                      style={[
+                        styles.actionSheetCardTitle,
+                        item.destructive && styles.actionSheetCardTitleDestructive,
+                        item.disabled && styles.actionSheetCardTitleDisabled,
+                      ]}
+                    >
+                      {item.title}
+                    </Text>
+                    {item.subtitle && (
+                      <Text style={styles.actionSheetCardSubtitle}>
+                        {item.subtitle}
+                      </Text>
+                    )}
+                  </View>
+                  <View style={styles.actionSheetCardChevron}>
+                    <Text style={[
+                      styles.actionSheetCardChevronText,
+                      item.destructive && { color: theme.colors.danger },
+                    ]}>›</Text>
+                  </View>
+                </TouchableOpacity>
+              </Animated.View>
             ))}
           </View>
 
@@ -531,74 +592,104 @@ const styles = StyleSheet.create({
     color: theme.colors.text,
   },
 
-  // Action Sheet
+  // Action Sheet - Modern card-based design
   actionSheet: {
     backgroundColor: theme.colors.background,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
   },
   actionSheetHeader: {
-    paddingHorizontal: 20,
-    paddingVertical: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: theme.colors.divider,
+    paddingHorizontal: 24,
+    paddingTop: 8,
+    paddingBottom: 4,
   },
   actionSheetTitle: {
-    fontSize: 16,
-    fontWeight: '600',
+    fontSize: 22,
+    fontWeight: '700',
+    color: theme.colors.text,
+    letterSpacing: -0.4,
+  },
+  actionSheetSubtitle: {
+    fontSize: 14,
     color: theme.colors.textSecondary,
-    textAlign: 'center',
+    marginTop: 4,
+    lineHeight: 20,
   },
-  actionSheetItems: {
-    paddingTop: 8,
+  actionSheetCards: {
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 4,
+    gap: 8,
   },
-  actionSheetItem: {
+  actionSheetCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 20,
-    minHeight: 56,
-    borderBottomWidth: 1,
-    borderBottomColor: theme.colors.divider,
+    backgroundColor: theme.colors.surface,
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
   },
-  actionSheetItemLast: {
-    borderBottomWidth: 0,
-  },
-  actionSheetItemDisabled: {
+  actionSheetCardDisabled: {
     opacity: 0.5,
   },
-  actionSheetItemIcon: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+  actionSheetCardDestructive: {
+    backgroundColor: theme.colors.danger + '08',
+    borderColor: theme.colors.danger + '20',
+  },
+  actionSheetCardIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 14,
     backgroundColor: theme.colors.surfaceLight,
     alignItems: 'center',
     justifyContent: 'center',
-    marginRight: 16,
+    marginRight: 14,
   },
-  actionSheetItemText: {
-    fontSize: 17,
-    color: theme.colors.text,
+  actionSheetCardIconDestructive: {
+    backgroundColor: theme.colors.danger + '15',
+  },
+  actionSheetCardContent: {
     flex: 1,
   },
-  actionSheetItemTextDestructive: {
+  actionSheetCardTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: theme.colors.text,
+    letterSpacing: -0.2,
+  },
+  actionSheetCardTitleDestructive: {
     color: theme.colors.danger,
   },
-  actionSheetItemTextDisabled: {
+  actionSheetCardTitleDisabled: {
     color: theme.colors.textMuted,
   },
+  actionSheetCardSubtitle: {
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+    marginTop: 3,
+    lineHeight: 18,
+  },
+  actionSheetCardChevron: {
+    marginLeft: 8,
+  },
+  actionSheetCardChevronText: {
+    fontSize: 22,
+    color: theme.colors.textMuted,
+    fontWeight: '300',
+  },
   actionSheetCancel: {
-    marginTop: 8,
-    marginHorizontal: 20,
+    marginTop: 4,
+    marginHorizontal: 16,
     height: 50,
     minHeight: 50,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: theme.colors.surface,
+    backgroundColor: theme.colors.surfaceLight,
     borderRadius: 14,
   },
   actionSheetCancelText: {
-    fontSize: 17,
+    fontSize: 16,
     fontWeight: '600',
     color: theme.colors.textSecondary,
   },

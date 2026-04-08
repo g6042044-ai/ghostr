@@ -1,5 +1,6 @@
 // src/components/ui/Header.tsx
-// Composants de header modernes - Style WhatsApp/Telegram
+// Header modernes — Safe area aware, cohérent iOS/Android
+// FIX: Utilise useSafeAreaInsets() dynamiquement (pas de valeurs hardcodées)
 
 import React from 'react';
 import {
@@ -13,7 +14,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { theme } from './theme';
-import { IconButton } from './Button';
+import { generateAvatarInitials } from '../../services/crypto';
 
 // ============================================
 // TYPES
@@ -38,7 +39,7 @@ interface ChatHeaderProps {
   avatar?: React.ReactNode;
   onBackPress: () => void;
   onMenuPress?: () => void;
-  onTitlePress?: () => void;  // v16.0: Pour naviguer vers les infos du contact
+  onTitlePress?: () => void;
   isOnline?: boolean;
   isTyping?: boolean;
   isEncrypted?: boolean;
@@ -52,6 +53,10 @@ interface SelectionHeaderProps {
   onSelectAll?: () => void;
   rightActions?: React.ReactNode;
 }
+
+// Consistent content height across all platforms
+// Matches ConversationListScreen header visual height
+const HEADER_CONTENT_HEIGHT = 56;
 
 // ============================================
 // STANDARD HEADER
@@ -76,7 +81,7 @@ export const Header: React.FC<HeaderProps> = ({
       style={[
         styles.header,
         {
-          paddingTop: insets.top + 8,
+          paddingTop: insets.top,
           backgroundColor,
         },
         elevated && styles.headerElevated,
@@ -92,6 +97,7 @@ export const Header: React.FC<HeaderProps> = ({
               style={styles.backButton}
               onPress={onBackPress}
               activeOpacity={0.7}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
             >
               <Text style={styles.backIcon}>‹</Text>
             </TouchableOpacity>
@@ -147,17 +153,12 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
 }) => {
   const insets = useSafeAreaInsets();
 
-  const getSubtitleText = () => {
-    if (isTyping) return 'écrit...';
-    if (subtitle) return subtitle;
-    if (isEncrypted) return '🔐 Chiffré E2E';
-    return '';
-  };
+  // WhatsApp-style: only show subtitle when typing or explicit subtitle passed
+  const subtitleText = isTyping ? 'écrit...' : (subtitle || '');
+  const showSubtitle = subtitleText.length > 0;
 
-  // Contenu du header (avatar + titre) qui peut être cliquable
   const headerInfoContent = (
     <>
-      {/* Avatar */}
       {avatar ? (
         <View style={styles.avatarContainer}>
           {avatar}
@@ -166,26 +167,27 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
       ) : (
         <View style={styles.avatarPlaceholder}>
           <Text style={styles.avatarText}>
-            {typeof title === 'string' && title.length > 0 ? title.charAt(0).toUpperCase() : '?'}
+            {typeof title === 'string' && title.length > 0 ? generateAvatarInitials(title) : '?'}
           </Text>
           {isOnline && <View style={styles.onlineIndicator} />}
         </View>
       )}
 
-      {/* Title & Subtitle */}
       <View style={styles.chatHeaderInfo}>
-        <Text style={styles.chatHeaderTitle} numberOfLines={1}>
+        <Text style={[styles.chatHeaderTitle, !showSubtitle && styles.chatHeaderTitleSolo]} numberOfLines={1}>
           {title}
         </Text>
-        <Text 
-          style={[
-            styles.chatHeaderSubtitle,
-            isTyping && styles.chatHeaderTyping,
-          ]} 
-          numberOfLines={1}
-        >
-          {getSubtitleText()}
-        </Text>
+        {showSubtitle && (
+          <Text 
+            style={[
+              styles.chatHeaderSubtitle,
+              isTyping && styles.chatHeaderTyping,
+            ]} 
+            numberOfLines={1}
+          >
+            {subtitleText}
+          </Text>
+        )}
       </View>
     </>
   );
@@ -194,22 +196,21 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
     <View
       style={[
         styles.chatHeader,
-        { paddingTop: insets.top + 4 },
+        { paddingTop: insets.top },
       ]}
     >
       <StatusBar barStyle="light-content" backgroundColor={theme.colors.surface} />
       
       <View style={styles.chatHeaderContent}>
-        {/* Back Button */}
         <TouchableOpacity
           style={styles.chatBackButton}
           onPress={onBackPress}
           activeOpacity={0.7}
+          hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
         >
           <Text style={styles.chatBackIcon}>‹</Text>
         </TouchableOpacity>
 
-        {/* Avatar + Title (optionnellement cliquable) */}
         {onTitlePress ? (
           <TouchableOpacity 
             style={styles.chatHeaderTouchable}
@@ -224,7 +225,6 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
           </View>
         )}
 
-        {/* Right Actions */}
         <View style={styles.chatHeaderActions}>
           {rightActions}
         </View>
@@ -250,7 +250,7 @@ export const SelectionHeader: React.FC<SelectionHeaderProps> = ({
     <View
       style={[
         styles.selectionHeader,
-        { paddingTop: insets.top + 4 },
+        { paddingTop: insets.top },
       ]}
     >
       <StatusBar barStyle="light-content" backgroundColor={theme.colors.primary} />
@@ -316,7 +316,7 @@ export const LargeHeader: React.FC<LargeHeaderProps> = ({
       style={[
         styles.largeHeader,
         {
-          paddingTop: insets.top + 16,
+          paddingTop: insets.top + 12,
           backgroundColor,
         },
       ]}
@@ -341,7 +341,7 @@ const styles = StyleSheet.create({
   // Standard Header
   header: {
     backgroundColor: theme.colors.background,
-    borderBottomWidth: 1,
+    borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: theme.colors.divider,
   },
   headerElevated: {
@@ -352,7 +352,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    height: 52,
+    height: HEADER_CONTENT_HEIGHT,
     paddingHorizontal: 4,
   },
   headerLeft: {
@@ -376,11 +376,12 @@ const styles = StyleSheet.create({
     fontSize: theme.fontSize.lg,
     fontWeight: '600',
     color: theme.colors.text,
+    letterSpacing: -0.3,
   },
   headerSubtitle: {
     fontSize: theme.fontSize.xs,
     color: theme.colors.textSecondary,
-    marginTop: 2,
+    marginTop: 1,
   },
   backButton: {
     width: 44,
@@ -400,18 +401,18 @@ const styles = StyleSheet.create({
   // Chat Header
   chatHeader: {
     backgroundColor: theme.colors.surface,
-    borderBottomWidth: 1,
+    borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: theme.colors.divider,
   },
   chatHeaderContent: {
     flexDirection: 'row',
     alignItems: 'center',
-    height: 56,
+    height: HEADER_CONTENT_HEIGHT,
     paddingRight: 8,
   },
   chatBackButton: {
-    width: 48,
-    height: 56,
+    width: 44,
+    height: HEADER_CONTENT_HEIGHT,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -439,17 +440,18 @@ const styles = StyleSheet.create({
     marginRight: 12,
   },
   avatarText: {
-    fontSize: 18,
+    fontSize: 14,
     fontWeight: '600',
     color: theme.colors.textOnPrimary,
+    letterSpacing: 0.3,
   },
   onlineIndicator: {
     position: 'absolute',
     bottom: 0,
     right: 0,
-    width: 12,
-    height: 12,
-    borderRadius: 6,
+    width: 11,
+    height: 11,
+    borderRadius: 5.5,
     backgroundColor: theme.colors.online,
     borderWidth: 2,
     borderColor: theme.colors.surface,
@@ -459,9 +461,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   chatHeaderTitle: {
-    fontSize: theme.fontSize.lg,
+    fontSize: theme.fontSize.base,
     fontWeight: '600',
     color: theme.colors.text,
+    letterSpacing: -0.2,
+  },
+  chatHeaderTitleSolo: {
+    fontSize: theme.fontSize.lg,
   },
   chatHeaderSubtitle: {
     fontSize: theme.fontSize.xs,
@@ -493,12 +499,12 @@ const styles = StyleSheet.create({
   selectionContent: {
     flexDirection: 'row',
     alignItems: 'center',
-    height: 56,
+    height: HEADER_CONTENT_HEIGHT,
     paddingHorizontal: 4,
   },
   selectionClose: {
     width: 48,
-    height: 56,
+    height: HEADER_CONTENT_HEIGHT,
     alignItems: 'center',
     justifyContent: 'center',
   },

@@ -41,7 +41,7 @@ class InviteWatcher {
       const pendingCount = pendingInviteStore.getPending().length;
       __DEV__ && console.log(`[InviteWatcher] ✅ Started (${pendingCount} pending invitations)`);
     } catch (e) {
-      console.error('[InviteWatcher] ⚠️ Load error during start:', e);
+      __DEV__ && console.error('[InviteWatcher] ⚠️ Load error during start:', e);
     }
     this.schedulePoll(500); // Premier poll rapide
   }
@@ -65,7 +65,7 @@ class InviteWatcher {
   ensureRunning(): void {
     if (!this.running) {
       __DEV__ && console.log('[InviteWatcher] ensureRunning: was NOT running, starting now...');
-      this.start().catch(e => console.error('[InviteWatcher] ensureRunning error:', e));
+      this.start().catch(e => __DEV__ && console.error('[InviteWatcher] ensureRunning error:', e));
     }
   }
 
@@ -83,7 +83,7 @@ class InviteWatcher {
     __DEV__ && console.log(`[InviteWatcher] 📣 Notifying ${this.callbacks.size} listeners`);
     for (const cb of this.callbacks) {
       try { cb(session, invite); }
-      catch (e) { console.error('[InviteWatcher] Callback error:', e); }
+      catch (e) { __DEV__ && console.error('[InviteWatcher] Callback error:', e); }
     }
   }
 
@@ -138,7 +138,7 @@ class InviteWatcher {
         });
 
         if (error) {
-          console.warn('[InviteWatcher] ❌ Poll error:', error.message);
+          __DEV__ && console.warn('[InviteWatcher] ❌ Poll error:', error.message);
           continue;
         }
 
@@ -162,7 +162,7 @@ class InviteWatcher {
         }
       }
     } catch (e: any) {
-      console.warn('[InviteWatcher] ❌ Poll failed:', e.message || e);
+      __DEV__ && console.warn('[InviteWatcher] ❌ Poll failed:', e.message || e);
     }
 
     if (this.running) {
@@ -187,7 +187,7 @@ class InviteWatcher {
           ? JSON.parse(msg.sealed_payload)
           : msg.sealed_payload;
       } catch (parseErr) {
-        console.warn('[InviteWatcher] Could not parse sealed_payload for msg', msg.id);
+        __DEV__ && console.warn('[InviteWatcher] Could not parse sealed_payload for msg', msg.id);
         this.processedIds.add(msg.id);
         return;
       }
@@ -199,7 +199,7 @@ class InviteWatcher {
       }
 
       if (payload.version !== 2) {
-        console.warn(`[InviteWatcher] Unsupported accept version: ${payload.version}`);
+        __DEV__ && console.warn(`[InviteWatcher] Unsupported accept version: ${payload.version}`);
         this.processedIds.add(msg.id);
         return;
       }
@@ -242,7 +242,7 @@ class InviteWatcher {
       __DEV__ && console.log(`[InviteWatcher]   payload.data length: ${payload.data?.length || 0}`);
 
       if (!payload.data) {
-        console.error('[InviteWatcher] ❌ Accept message has no data field!');
+        __DEV__ && console.error('[InviteWatcher] ❌ Accept message has no data field!');
         this.processedIds.add(msg.id);
         return;
       }
@@ -264,11 +264,17 @@ class InviteWatcher {
       this.processedIds.add(msg.id);
       __DEV__ && console.log(`[InviteWatcher] ✅ Session created: ${result.session.id} with ${contactName}`);
 
+      // Envoyer notre push token au nouveau pair via E2E
+      try {
+        const { sendPushTokenToPeer } = require('./api1to1');
+        sendPushTokenToPeer(result.session.id).catch(() => {});
+      } catch {}
+
       // Notifier les listeners (UI)
       this.notifyAccepted(result.session, invite);
 
     } catch (e: any) {
-      console.error(`[InviteWatcher] ❌ Failed to process accept:`, e.message);
+      __DEV__ && console.error(`[InviteWatcher] ❌ Failed to process accept:`, e.message);
       this.processedIds.add(msg.id);
 
       if (e.message?.includes('not found') || e.message?.includes('expired')) {
@@ -277,10 +283,10 @@ class InviteWatcher {
           if (invite && invite.status === 'pending') {
             await pendingInviteStore.markExpired(msg.tag);
             sessionService.unreserveOtpk(invite.oneTimePreKeyId); // [Bug #1] Libérer l'OTPK
-            console.warn(`[InviteWatcher] Invite ${invite.label} marked expired (keys not found)`);
+            __DEV__ && console.warn(`[InviteWatcher] Invite ${invite.label} marked expired (keys not found)`);
           }
         } catch (markErr) {
-          console.error('[InviteWatcher] Failed to mark expired:', markErr);
+          __DEV__ && console.error('[InviteWatcher] Failed to mark expired:', markErr);
         }
       }
     }
@@ -311,7 +317,7 @@ class InviteWatcher {
   forcePoll(): void {
     if (!this.running) {
       __DEV__ && console.log('[InviteWatcher] forcePoll: not running, starting first...');
-      this.start().catch(e => console.error('[InviteWatcher] forcePoll start error:', e));
+      this.start().catch(e => __DEV__ && console.error('[InviteWatcher] forcePoll start error:', e));
       return;
     }
     __DEV__ && console.log('[InviteWatcher] ⚡ Force poll');

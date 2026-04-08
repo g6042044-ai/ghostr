@@ -572,7 +572,7 @@ export function processReceivedBraidPayload(
   
   // Vérifier l'epoch
   if (payload.epoch !== state.epoch) {
-    console.warn(`[Braid] ⚠️ Epoch mismatch: expected ${state.epoch}, got ${payload.epoch}`);
+    __DEV__ && console.warn(`[Braid] ⚠️ Epoch mismatch: expected ${state.epoch}, got ${payload.epoch}`);
     return state;
   }
   
@@ -723,7 +723,7 @@ function combineSecrets(secret1: Uint8Array, secret2: Uint8Array): Uint8Array {
  */
 export function finalizeBraid(state: BraidState): BraidState {
   if (!state.localEncapSecret || !state.remoteDecapSecret) {
-    console.error('[Braid] ❌ Cannot finalize: missing encap or decap secrets');
+    __DEV__ && console.error('[Braid] ❌ Cannot finalize: missing encap or decap secrets');
     return state;
   }
   
@@ -1070,7 +1070,7 @@ export function isBraidExchangeExpired(
  * Réinitialise un échange Braid expiré
  */
 export function resetExpiredBraidExchange(state: BraidState): BraidState {
-  console.warn(`[Braid] ⚠️ Exchange expired, resetting to idle`);
+  __DEV__ && console.warn(`[Braid] ⚠️ Exchange expired, resetting to idle`);
   
   // Cleanup l'ancien état
   cleanupBraidState(state);

@@ -73,7 +73,7 @@ const server = http.createServer((req, res) => {
   // CORS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': 'capacitor://localhost',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': '*',
     });
@@ -85,22 +85,18 @@ const server = http.createServer((req, res) => {
   if (parsedUrl.pathname === '/health') {
     res.writeHead(200, { 
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': 'capacitor://localhost',
     });
-    res.end(JSON.stringify({
-      status: 'ok',
-      type: 'exit-relay',
-      version: CONFIG.version,
-      timestamp: Date.now(),
-      connections: activeConnections,
-    }));
+    // R-07: Ne jamais exposer activeConnections — corrélable avec les appels VoIP actifs.
+    // Un observateur monitorant /health peut déduire les plages d'activité → désanonymisation.
+    res.end(JSON.stringify({ status: 'ok' }));
     return;
   }
 
   // 404
   res.writeHead(404, { 
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': 'capacitor://localhost',
   });
   res.end(JSON.stringify({ error: 'Not found' }));
 });

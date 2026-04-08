@@ -31,7 +31,7 @@ import {
 } from './ratchetStorage';
 import { CallSignal } from './voiceCall';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { deriveTagSeed, getSendTag, getPollingTags, generateDecoyTagsForEpoch, getEpochNumber, csprngShuffle } from './epochTags';
+import { deriveTagSeed, generateDecoyTagsForEpoch, getEpochNumber, csprngShuffle } from './epochTags';
 import { sha256 } from '@noble/hashes/sha256';
 import { secureRpc } from './relayTransport';
 import { enqueueMessage } from './constantTraffic';
@@ -131,10 +131,10 @@ async function loadProcessedIds(): Promise<void> {
     }
     
     isLoaded = true;
-    console.log(`📞 Loaded processed IDs: ${processedSignalIds.size} signal IDs, ${processedDbIds.size} DB IDs`);
+    __DEV__ && console.log(`📞 Loaded processed IDs: ${processedSignalIds.size} signal IDs, ${processedDbIds.size} DB IDs`);
     
   } catch (error) {
-    console.error('📞 Failed to load processed IDs:', error);
+    __DEV__ && console.error('📞 Failed to load processed IDs:', error);
     isLoaded = true;  // Continuer malgré l'erreur
   }
 }
@@ -171,10 +171,10 @@ function scheduleSaveProcessedIds(): void {
         AsyncStorage.setItem(PERSISTENCE_KEY_DB_IDS, JSON.stringify(dbEntries)),
       ]);
       
-      console.log(`📞 Saved processed IDs: ${signalEntries.length} signal IDs, ${dbEntries.length} DB IDs`);
+      __DEV__ && console.log(`📞 Saved processed IDs: ${signalEntries.length} signal IDs, ${dbEntries.length} DB IDs`);
       
     } catch (error) {
-      console.error('📞 Failed to save processed IDs:', error);
+      __DEV__ && console.error('📞 Failed to save processed IDs:', error);
     }
   }, PERSISTENCE_DEBOUNCE_MS);
 }
@@ -329,7 +329,7 @@ export async function sendCallSignal(
     );
 
     if (error) {
-      console.error('Send call signal error:', error);
+      __DEV__ && console.error('Send call signal error:', error);
       return { success: false, error: error.message };
     }
 
@@ -339,11 +339,11 @@ export async function sendCallSignal(
     // Marquer comme traité (pour ne pas le retraiter si on le reçoit)
     markSignalAsProcessed(signalId);
 
-    console.log(`📞 Call signal sent: ${signal.type} for call ${signal.callId.slice(0, 8)}... (ratchet: ${ratchetIndex})${displayName ? ` as "${displayName}"` : ''}`);
+    __DEV__ && console.log(`📞 Call signal sent: ${signal.type} for call ${signal.callId.slice(0, 8)}... (ratchet: ${ratchetIndex})${displayName ? ` as "${displayName}"` : ''}`);
     return { success: true };
 
   } catch (error) {
-    console.error('Send call signal exception:', error);
+    __DEV__ && console.error('Send call signal exception:', error);
     return { success: false, error: String(error) };
   }
 }
@@ -381,7 +381,7 @@ export async function fetchCallSignals(
     });
 
     if (error) {
-      console.error('Fetch call signals error:', error);
+      __DEV__ && console.error('Fetch call signals error:', error);
       return new Map();
     }
 
@@ -396,7 +396,7 @@ export async function fetchCallSignals(
     for (const raw of data as RawCallSignal[]) {
       // v4.0: Vérifier si on a déjà traité ce signal (par ID de DB) avec TTL
       if (isDbIdAlreadyProcessed(raw.id)) {
-        console.log(`📞 Skipping already processed signal (db): ${raw.id.slice(0, 8)}...`);
+        __DEV__ && console.log(`📞 Skipping already processed signal (db): ${raw.id.slice(0, 8)}...`);
         continue;
       }
       
@@ -422,14 +422,14 @@ export async function fetchCallSignals(
         }
       } catch (e) {
         // Log mais ne pas bloquer les autres signaux
-        console.warn('Failed to decrypt call signal:', e);
+        __DEV__ && console.warn('Failed to decrypt call signal:', e);
       }
     }
 
     return signalsByConversation;
 
   } catch (error) {
-    console.error('Fetch call signals exception:', error);
+    __DEV__ && console.error('Fetch call signals exception:', error);
     return new Map();
   }
 }
@@ -452,7 +452,7 @@ async function decryptCallSignal(
     const sealedPayload = JSON.parse(raw.sealed_payload);
 
     if (sealedPayload.type !== 'sealed_call_v1') {
-      console.warn('Unknown call signal payload type:', sealedPayload.type);
+      __DEV__ && console.warn('Unknown call signal payload type:', sealedPayload.type);
       return null;
     }
 
@@ -476,7 +476,7 @@ async function decryptCallSignal(
       
       // v2.2 - Si null, le signal a déjà été traité, le skipper
       if (!keyResult) {
-        console.log(`📞 Skipping old signal (ratchet): already processed`);
+        __DEV__ && console.log(`📞 Skipping old signal (ratchet): already processed`);
         return null;
       }
       
@@ -484,7 +484,7 @@ async function decryptCallSignal(
       updateFn = keyResult.updateFn;
     } catch (e) {
       // Erreur de ratchet (duplicata ou désync)
-      console.warn(`📞 Ratchet error for signal from ${msgSenderToken.slice(0, 8)}...: ${e}`);
+      __DEV__ && console.warn(`📞 Ratchet error for signal from ${msgSenderToken.slice(0, 8)}...: ${e}`);
       return null;
     }
 
@@ -493,7 +493,7 @@ async function decryptCallSignal(
     try {
       decrypted = decryptWithMessageKey(encrypted, nonce, messageKey);
     } catch (e) {
-      console.warn('Decryption failed:', e);
+      __DEV__ && console.warn('Decryption failed:', e);
       return null;
     }
     
@@ -501,18 +501,18 @@ async function decryptCallSignal(
 
     // v4.0: Vérifier si on a déjà traité ce signalId avec TTL
     if (payload.signalId && isSignalAlreadyProcessed(payload.signalId)) {
-      console.log(`📞 Skipping already processed signal: ${payload.signal.type}`);
+      __DEV__ && console.log(`📞 Skipping already processed signal: ${payload.signal.type}`);
       return null; // NE PAS appeler updateFn()
     }
 
     // Vérifier la cohérence
     if (payload.conversationId !== conversationId) {
-      console.warn('Call signal conversation mismatch');
+      __DEV__ && console.warn('Call signal conversation mismatch');
       return null;
     }
 
     if (payload.senderToken !== msgSenderToken) {
-      console.warn('Call signal senderToken mismatch');
+      __DEV__ && console.warn('Call signal senderToken mismatch');
       return null;
     }
 
@@ -526,7 +526,7 @@ async function decryptCallSignal(
 
     // v5.0: Log avec le displayName si présent
     const displayInfo = payload.displayName ? ` ("${payload.displayName}")` : '';
-    console.log(`📞 Received signal: ${payload.signal.type} from ${msgSenderToken.slice(0, 8)}...${displayInfo} (ratchet: ${ratchetIndex})`);
+    __DEV__ && console.log(`📞 Received signal: ${payload.signal.type} from ${msgSenderToken.slice(0, 8)}...${displayInfo} (ratchet: ${ratchetIndex})`);
 
     return {
       signal: payload.signal,
@@ -536,7 +536,7 @@ async function decryptCallSignal(
     };
 
   } catch (error) {
-    console.error('Decrypt call signal error:', error);
+    __DEV__ && console.error('Decrypt call signal error:', error);
     return null;
   }
 }
@@ -582,7 +582,7 @@ export async function startCallSignalPolling(
   performCallSignalPoll();
   scheduleNextCallPoll();
 
-  console.log('📞 Call signal polling started');
+  __DEV__ && console.log('📞 Call signal polling started');
 }
 
 function scheduleNextCallPoll(): void {
@@ -617,7 +617,7 @@ async function performCallSignalPoll(): Promise<void> {
     }
 
   } catch (error) {
-    console.error('Call signal poll error:', error);
+    __DEV__ && console.error('Call signal poll error:', error);
   }
 }
 
@@ -631,7 +631,7 @@ export function stopCallSignalPolling(): void {
 
   pollingState.onSignalReceived = null;
 
-  console.log('📞 Call signal polling stopped');
+  __DEV__ && console.log('📞 Call signal polling stopped');
 }
 
 export async function forceCallSignalPoll(): Promise<void> {
@@ -658,10 +658,10 @@ export async function clearProcessedSignals(): Promise<void> {
       AsyncStorage.removeItem(PERSISTENCE_KEY_DB_IDS),
     ]);
   } catch (error) {
-    console.error('📞 Failed to clear persisted signal IDs:', error);
+    __DEV__ && console.error('📞 Failed to clear persisted signal IDs:', error);
   }
   
-  console.log('📞 Cleared processed signals cache');
+  __DEV__ && console.log('📞 Cleared processed signals cache');
 }
 
 // ============================================
@@ -671,5 +671,5 @@ export async function clearProcessedSignals(): Promise<void> {
 
 export async function initializeCallSignaling(): Promise<void> {
   await loadProcessedIds();
-  console.log('📞 Call signaling initialized');
+  __DEV__ && console.log('📞 Call signaling initialized');
 }

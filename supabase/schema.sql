@@ -121,6 +121,11 @@ CREATE TABLE public.messages (
 );
 
 -- Anti-replay: rejet des doublons au niveau INSERT
+-- R-14: La déduplication par SHA-256(sealed_payload) n'expose PAS de corrélation entre
+-- messages identiques en clair, car la SealedSenderEnvelope intègre un nonce aléatoire
+-- de 24 bytes (nacl.box) → chaque envoi produit un ciphertext UNIQUE même pour le même
+-- plaintext. L'index UNIQUE sert uniquement à rejeter les replay attacks (rejeu d'un
+-- même ciphertext capturé → rejeté avec DO NOTHING).
 CREATE UNIQUE INDEX idx_messages_payload_hash
     ON public.messages (payload_hash);
 
@@ -149,7 +154,10 @@ CREATE TABLE public.rate_limits (
     identifier    TEXT        NOT NULL,
     limit_type    TEXT        DEFAULT 'default' NOT NULL,
     request_count INTEGER     DEFAULT 1 NOT NULL,
-    window_start  TIMESTAMPTZ DEFAULT date_trunc('minute', now()) NOT NULL,
+    -- R-09: Fenêtre glissante réelle — stocke le timestamp de la PREMIÈRE requête
+    -- dans la fenêtre actuelle (pas date_trunc). Cela évite le bypass classique:
+    -- N requêtes à HH:MM:59 + N requêtes à HH:MM+1:00 = 2N requêtes en 1 seconde.
+    window_start  TIMESTAMPTZ DEFAULT now() NOT NULL,
 
     PRIMARY KEY (identifier, limit_type),
 
@@ -157,7 +165,7 @@ CREATE TABLE public.rate_limits (
     CONSTRAINT rate_limits_type_length       CHECK (length(limit_type) <= 32)
 );
 
-COMMENT ON TABLE public.rate_limits IS 'Compteurs rate limiting — fenêtre glissante par minute';
+COMMENT ON TABLE public.rate_limits IS 'Compteurs rate limiting — fenêtre glissante vraie (sliding window, R-09)';
 
 
 -- ── Monitoring blob cleanup ──
@@ -192,7 +200,18 @@ CREATE INDEX idx_rate_limits_window
 -- 4. FONCTIONS INTERNES
 -- ============================================================================
 
--- ── Rate limiter (fenêtre glissante par minute) ──
+-- ── Rate limiter (fenêtre GLISSANTE vraie — R-09) ──
+--
+-- R-09: L'ancienne implémentation utilisait date_trunc('minute', now()) — une FENÊTRE FIXE.
+-- Bypass classique: envoyer p_max requêtes à HH:MM:59 puis p_max à HH:MM+1:00
+-- = 2×p_max requêtes en 2 secondes, soit une explosion DB (ex: 6 000 queries/s).
+--
+-- NOUVELLE IMPLÉMENTATION — Fenêtre glissante (Sliding Window):
+-- window_start stocke le timestamp de la première requête dans la fenêtre courante.
+-- Si now() > window_start + 60s → la fenêtre a expiré → reset count=1 + window_start=now().
+-- Si now() ≤ window_start + 60s → on est dans la même fenêtre → incrémenter count.
+-- Résultat: exactement p_max_per_minute requêtes autorisées par fenêtre de 60 secondes
+-- GLISSANTE, sans possibilité de doubler la limite à la frontière de fenêtre.
 CREATE OR REPLACE FUNCTION public.check_rate_limit(
     p_identifier     TEXT,
     p_limit_type     TEXT,
@@ -203,21 +222,25 @@ SET search_path = public
 SET statement_timeout = '3s'
 AS $$
 DECLARE
-    v_count  INTEGER;
-    v_window TIMESTAMPTZ;
+    v_count     INTEGER;
+    v_now       TIMESTAMPTZ;
+    v_window_ms INTERVAL;
 BEGIN
-    v_window := date_trunc('minute', now());
+    v_now        := clock_timestamp();  -- Précision sub-seconde
+    v_window_ms  := INTERVAL '60 seconds';
 
     INSERT INTO public.rate_limits (identifier, limit_type, request_count, window_start)
-    VALUES (left(p_identifier, 140), left(p_limit_type, 32), 1, v_window)
+    VALUES (left(p_identifier, 140), left(p_limit_type, 32), 1, v_now)
     ON CONFLICT (identifier, limit_type)
     DO UPDATE SET
+        -- Si la fenêtre de 60s a expiré depuis window_start → nouveau cycle (reset)
+        -- Sinon → incrémenter dans la même fenêtre glissante
         request_count = CASE
-            WHEN rate_limits.window_start < v_window THEN 1
+            WHEN v_now - rate_limits.window_start >= v_window_ms THEN 1
             ELSE rate_limits.request_count + 1
         END,
         window_start = CASE
-            WHEN rate_limits.window_start < v_window THEN v_window
+            WHEN v_now - rate_limits.window_start >= v_window_ms THEN v_now
             ELSE rate_limits.window_start
         END
     RETURNING request_count INTO v_count;
@@ -227,7 +250,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.check_rate_limit(TEXT, TEXT, INTEGER)
-    IS 'Rate limiter interne — fenêtre glissante par minute. SECURITY DEFINER, pas d''accès direct.';
+    IS 'R-09: Rate limiter fenêtre glissante vraie (sliding window 60s). Résiste au bypass fixed-window. SECURITY DEFINER.';
 
 
 -- ============================================================================
@@ -436,7 +459,7 @@ BEGIN
     -- Rate limits > 5min (fenêtres expirées)
     WITH d AS (
         DELETE FROM public.rate_limits
-        WHERE window_start < now() - INTERVAL '5 minutes'
+        WHERE window_start < now() - INTERVAL '2 minutes'  -- R-09: sliding window 60s + marge 60s
         RETURNING 1
     ) SELECT count(*) INTO deleted_rates FROM d;
 
@@ -527,20 +550,8 @@ ON CONFLICT (id) DO UPDATE SET
     file_size_limit = EXCLUDED.file_size_limit,
     allowed_mime_types = EXCLUDED.allowed_mime_types;
 
--- ── whisper-media: Legacy médias serveur ──
--- Utilisé par mediaService.ts et voiceMessageService.ts pour les médias
--- chiffrés uploadés via l'ancien système.
-INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-VALUES (
-    'whisper-media',
-    'whisper-media',
-    false,
-    20971520,                            -- 20 MB max
-    ARRAY['application/octet-stream']    -- Blobs chiffrés uniquement
-)
-ON CONFLICT (id) DO UPDATE SET
-    file_size_limit = EXCLUDED.file_size_limit,
-    allowed_mime_types = EXCLUDED.allowed_mime_types;
+-- ── whisper-media: SUPPRIMÉ (P0-A2) ──
+-- Tout le trafic média passe désormais par ghostr-blobs via OHTTP relay.
 
 
 -- ============================================================================
@@ -571,22 +582,7 @@ CREATE POLICY "ghostr_blobs_delete"
     USING (bucket_id = 'ghostr-blobs');
 
 
--- ── whisper-media ──
-
-CREATE POLICY "whisper_media_upload"
-    ON storage.objects FOR INSERT
-    TO anon, authenticated
-    WITH CHECK (bucket_id = 'whisper-media');
-
-CREATE POLICY "whisper_media_download"
-    ON storage.objects FOR SELECT
-    TO anon, authenticated
-    USING (bucket_id = 'whisper-media');
-
-CREATE POLICY "whisper_media_delete"
-    ON storage.objects FOR DELETE
-    TO anon, authenticated
-    USING (bucket_id = 'whisper-media');
+-- ── whisper-media: policies SUPPRIMÉES (P0-A2) ──
 
 
 -- ============================================================================

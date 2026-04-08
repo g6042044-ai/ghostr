@@ -112,7 +112,7 @@ class SecurityLoggerImpl {
       }
       this.loaded = true;
     } catch (error) {
-      console.error('Failed to load security log:', error);
+      __DEV__ && console.error('Failed to load security log:', error);
       this.events = [];
       this.loaded = true;
     }
@@ -271,7 +271,7 @@ class SecurityLoggerImpl {
     ).length;
     
     if (recentCount >= threshold.count) {
-      console.warn(`🚨 Security Alert: ${recentCount} ${event.type} events in ${threshold.windowMs / 1000}s`);
+      __DEV__ && console.warn(`🚨 Security Alert: ${recentCount} ${event.type} events in ${threshold.windowMs / 1000}s`);
       this.onAlert?.(event, recentCount);
     }
   }
@@ -285,7 +285,7 @@ class SecurityLoggerImpl {
       try {
         await AsyncStorage.setItem(SECURITY_LOG_KEY, JSON.stringify(this.events));
       } catch (error) {
-        console.error('Failed to save security log:', error);
+        __DEV__ && console.error('Failed to save security log:', error);
       }
     }, 1000);
   }

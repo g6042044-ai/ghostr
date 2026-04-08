@@ -657,7 +657,7 @@ export function processReceivedChunks(
     if (reconstructed) {
       // P11 fix: Validate reconstructed key size matches ML-KEM-768 spec
       if (reconstructed.length !== KYBER_CONSTANTS.PUBLIC_KEY_SIZE) {
-        console.warn(`[SPQR] Reconstructed EK has invalid size: ${reconstructed.length}, expected ${KYBER_CONSTANTS.PUBLIC_KEY_SIZE}. Discarding.`);
+        __DEV__ && console.warn(`[SPQR] Reconstructed EK has invalid size: ${reconstructed.length}, expected ${KYBER_CONSTANTS.PUBLIC_KEY_SIZE}. Discarding.`);
       } else {
         reconstructedKey = {
           _brand: 'KyberPublicKey',
@@ -672,7 +672,7 @@ export function processReceivedChunks(
     if (reconstructed) {
       // P11 fix: Validate reconstructed ciphertext size matches ML-KEM-768 spec
       if (reconstructed.length !== KYBER_CONSTANTS.CIPHERTEXT_SIZE) {
-        console.warn(`[SPQR] Reconstructed CT has invalid size: ${reconstructed.length}, expected ${KYBER_CONSTANTS.CIPHERTEXT_SIZE}. Discarding.`);
+        __DEV__ && console.warn(`[SPQR] Reconstructed CT has invalid size: ${reconstructed.length}, expected ${KYBER_CONSTANTS.CIPHERTEXT_SIZE}. Discarding.`);
       } else {
         reconstructedCiphertext = {
           _brand: 'KyberCiphertext',
@@ -878,7 +878,7 @@ export function createSPQRMessageMeta(
   if (braidConfig.enabled) {
     // Vérifier si un échange en cours a expiré
     if (isBraidExchangeExpired(state.braid, braidConfig)) {
-      console.warn('[SPQR] Braid exchange expired, resetting');
+      __DEV__ && console.warn('[SPQR] Braid exchange expired, resetting');
       newState.braid = resetExpiredBraidExchange(state.braid);
     }
     
@@ -927,7 +927,7 @@ export function createSPQRMessageMeta(
     }
   } else if (state.pendingPQRotation && !state.myKyberKeyPair) {
     // ASSERTION DÉFENSIVE: pendingPQRotation=true sans keyPair est un état incohérent
-    console.error('[SPQR] ERREUR: pendingPQRotation=true mais myKyberKeyPair est null — état incohérent');
+    __DEV__ && console.error('[SPQR] ERREUR: pendingPQRotation=true mais myKyberKeyPair est null — état incohérent');
   }
   
   // Ajouter les chunks si braid RS activé (legacy)
@@ -1205,6 +1205,11 @@ export interface SerializedSPQRState {
   theirKyberPublicKey?: string;
   pqSecret?: string;
   pendingPQRotation: boolean;
+  // R-12: pqSecretHistory sérialisée explicitement (Map→Array, JSON.stringify(Map) → {})
+  // Permet de déchiffrer les messages hors-ordre après redémarrage si la rotation
+  // SPQR s'est produite mais que certains messages de l'époque précédente arrivent
+  // tardivement. Max MAX_PQ_HISTORY_SIZE entrées (purge automatique des plus anciennes).
+  pqSecretHistory?: Array<[number, string]>; // [epoch, base64(secret)]
   // ML-KEM Braid state
   braid?: SerializedBraidState;
 }
@@ -1235,7 +1240,18 @@ export function serializeSPQRState(state: SPQRState): SerializedSPQRState {
   if (state.pqSecret) {
     result.pqSecret = encodeBase64(state.pqSecret);
   }
-  
+
+  // R-12: Sérialiser pqSecretHistory explicitement via Array (pas JSON.stringify(Map) → {})
+  // On conserve au maximum MAX_PQ_HISTORY_SIZE entrées pour limiter la taille.
+  const MAX_PQ_HISTORY_SIZE = 5;
+  if (state.pqSecretHistory && state.pqSecretHistory.size > 0) {
+    // Trier par époque décroissante et garder les plus récentes
+    const entries = [...state.pqSecretHistory.entries()]
+      .sort((a, b) => b[0] - a[0])
+      .slice(0, MAX_PQ_HISTORY_SIZE);
+    result.pqSecretHistory = entries.map(([epoch, secret]) => [epoch, encodeBase64(secret)]);
+  }
+
   return result;
 }
 
@@ -1274,7 +1290,16 @@ export function deserializeSPQRState(data: SerializedSPQRState): SPQRState {
   if (data.pqSecret) {
     state.pqSecret = decodeBase64(data.pqSecret);
   }
-  
+
+  // R-12: Restaurer pqSecretHistory depuis le format Array sérialisé
+  if (data.pqSecretHistory && Array.isArray(data.pqSecretHistory)) {
+    for (const [epoch, secretB64] of data.pqSecretHistory) {
+      if (typeof epoch === 'number' && typeof secretB64 === 'string') {
+        state.pqSecretHistory.set(epoch, decodeBase64(secretB64));
+      }
+    }
+  }
+
   return state;
 }
 

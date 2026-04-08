@@ -14,14 +14,19 @@ import {
   ActivityIndicator,
   Image,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { sessionService } from '../services/tripleRatchet/sessionService';
+import { sendSessionReset1to1, clearLocalMessages1to1, clearUnreadCount } from '../services/api1to1';
 import { useCall1to1 } from '../hooks/useCall1to1';
+import { isInCall1to1 } from '../services/call1to1Service';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { theme } from '../components/ui/theme';
+import { Avatar } from '../components/Avatar';
+import { generateAvatarInitials } from '../services/crypto';
 
 const COLORS = {
   primary: theme.colors.primary,
@@ -62,12 +67,14 @@ export const ContactInfoScreen: React.FC = () => {
   const navigation = useNavigation<NavigationProp>();
   const route = useRoute<ContactInfoRouteProp>();
   const { sessionId } = route.params;
+  const insets = useSafeAreaInsets();
 
   const [contact, setContact] = useState<ContactData | null>(null);
   const [loading, setLoading] = useState(true);
   const [muted, setMuted] = useState(false);
   const [blocked, setBlocked] = useState(false);
   const [isCallingAudio, setIsCallingAudio] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   // Hook pour les appels 1:1
   const { startCall, isInCall } = useCall1to1();
@@ -141,6 +148,11 @@ export const ContactInfoScreen: React.FC = () => {
   };
 
   const handleDelete = () => {
+    // BUG FIX #5: Bloquer la suppression si un appel est en cours
+    if (isInCall1to1()) {
+      Alert.alert('Appel en cours', 'Terminez l\'appel avant de supprimer la conversation.');
+      return;
+    }
     Alert.alert(
       'Supprimer la conversation',
       'Tous les messages seront supprimés. Cette action est irréversible.',
@@ -151,11 +163,53 @@ export const ContactInfoScreen: React.FC = () => {
           style: 'destructive',
           onPress: async () => {
             try {
+              // BUG FIX #1: Nettoyer TOUTES les données de transport AVANT de supprimer la session
+              await clearLocalMessages1to1(sessionId);
+              await clearUnreadCount(sessionId);
+              try { await AsyncStorage.removeItem(`@ghostr_reactions_${sessionId}`); } catch {}
               await sessionService.deleteSession(sessionId);
               navigation.goBack();
               navigation.goBack();
             } catch (error) {
               Alert.alert('Erreur', 'Impossible de supprimer');
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleResetSession = () => {
+    Alert.alert(
+      'Réinitialiser le chiffrement',
+      'La session de chiffrement sera détruite des deux côtés. ' +
+      'Un nouveau handshake sera nécessaire au prochain message.\n\n' +
+      'Utilisez cette option si :\n' +
+      '• Vous suspectez une compromission de vos clés\n' +
+      '• Un appareil avec cette session a été perdu ou volé\n' +
+      '• Vous souhaitez forcer une rotation complète des clés',
+      [
+        { text: 'Annuler', style: 'cancel' },
+        {
+          text: 'Réinitialiser',
+          style: 'destructive',
+          onPress: async () => {
+            setResetting(true);
+            try {
+              const result = await sendSessionReset1to1(sessionId);
+              if (result.success) {
+                Alert.alert(
+                  'Session réinitialisée',
+                  'Le chiffrement a été réinitialisé. Un nouveau handshake sera établi au prochain message.',
+                  [{ text: 'OK', onPress: () => { navigation.goBack(); navigation.goBack(); } }]
+                );
+              } else {
+                Alert.alert('Erreur', result.error || 'Impossible de réinitialiser la session');
+              }
+            } catch (error) {
+              Alert.alert('Erreur', 'Une erreur est survenue lors de la réinitialisation');
+            } finally {
+              setResetting(false);
             }
           },
         },
@@ -184,7 +238,7 @@ export const ContactInfoScreen: React.FC = () => {
   }
 
   const avatarColor = getAvatarColor(sessionId);
-  const initial = (contact.displayName || '?')[0].toUpperCase();
+  const initial = generateAvatarInitials(contact.displayName);
 
   return (
     <View style={styles.container}>
@@ -201,19 +255,17 @@ export const ContactInfoScreen: React.FC = () => {
         </TouchableOpacity>
       </SafeAreaView>
 
-      <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+      <ScrollView style={styles.scroll} contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 40 }]} showsVerticalScrollIndicator={false}>
         {/* Profile */}
         <View style={styles.profile}>
-          {contact.avatarBase64 ? (
-            <Image
-              source={{ uri: `data:image/jpeg;base64,${contact.avatarBase64}` }}
-              style={styles.avatarImage}
-            />
-          ) : (
-            <View style={[styles.avatar, { backgroundColor: avatarColor }]}>
-              <Text style={styles.avatarText}>{initial}</Text>
-            </View>
-          )}
+          <Avatar
+            displayName={contact.displayName}
+            senderToken={sessionId}
+            avatarUri={contact.avatarBase64}
+            size="xlarge"
+            style={styles.avatarImage}
+            backgroundColor={avatarColor}
+          />
           <Text style={styles.name}>{contact.displayName}</Text>
           <View style={styles.statusRow}>
             <Ionicons name="lock-closed" size={14} color={COLORS.primary} />
@@ -274,7 +326,18 @@ export const ContactInfoScreen: React.FC = () => {
           </View>
         </View>
 
-        {/* Danger */}
+        {/* Sécurité & Danger */}
+        <TouchableOpacity 
+          style={styles.resetBtn} 
+          onPress={handleResetSession}
+          disabled={resetting}
+        >
+          <Ionicons name="refresh-outline" size={20} color={COLORS.primary} />
+          <Text style={styles.resetBtnText}>
+            {resetting ? 'Réinitialisation...' : 'Réinitialiser le chiffrement'}
+          </Text>
+        </TouchableOpacity>
+
         <TouchableOpacity style={styles.dangerBtn} onPress={handleDelete}>
           <Ionicons name="trash-outline" size={20} color={COLORS.danger} />
           <Text style={styles.dangerBtnText}>Supprimer la conversation</Text>
@@ -326,11 +389,11 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
   gradient: { position: 'absolute', top: 0, left: 0, right: 0, height: 300 },
   safeHeader: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 },
-  backBtn: { width: 44, height: 44, margin: 8, borderRadius: 22, backgroundColor: 'rgba(0,0,0,0.25)', justifyContent: 'center', alignItems: 'center' },
+  backBtn: { width: 40, height: 40, margin: 12, borderRadius: 20, backgroundColor: 'rgba(10,15,20,0.45)', justifyContent: 'center', alignItems: 'center' },
   centered: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: COLORS.background },
   errorText: { fontSize: 16, color: COLORS.textSecondary },
   scroll: { flex: 1 },
-  scrollContent: { paddingTop: 100, paddingBottom: 40 },
+  scrollContent: { paddingTop: 100 },
 
   profile: { alignItems: 'center', marginBottom: 24 },
   avatar: { width: 110, height: 110, borderRadius: 55, justifyContent: 'center', alignItems: 'center', marginBottom: 16, borderWidth: 4, borderColor: COLORS.background },
@@ -366,10 +429,14 @@ const styles = StyleSheet.create({
   toggleKnobOff: { alignSelf: 'flex-start' },
   rightText: { fontSize: 14, color: COLORS.primary, fontWeight: '600' },
 
+  resetBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginHorizontal: 16, marginBottom: 12, padding: 16, backgroundColor: COLORS.surfaceLight, borderRadius: 16, gap: 10, borderWidth: 1, borderColor: COLORS.border },
+  resetBtnText: { fontSize: 16, fontWeight: '600', color: COLORS.primary },
+
   dangerBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginHorizontal: 16, marginBottom: 24, padding: 16, backgroundColor: COLORS.dangerLight, borderRadius: 16, gap: 10 },
   dangerBtnText: { fontSize: 16, fontWeight: '600', color: COLORS.danger },
 
   footer: { textAlign: 'center', fontSize: 13, color: COLORS.textTertiary, paddingHorizontal: 20 },
+  footerTagline: { textAlign: 'center', fontSize: 12, fontWeight: '500', color: COLORS.primary, marginTop: 8, marginBottom: 20, opacity: 0.6 },
 });
 
 export default ContactInfoScreen;

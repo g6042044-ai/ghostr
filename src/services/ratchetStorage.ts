@@ -113,7 +113,7 @@ export async function getRatchetStates(conversationId: string): Promise<RatchetS
     // Retourner une copie
     return deepCopyRatchetStates(states);
   } catch (error) {
-    console.error('Failed to get ratchet states:', error);
+    __DEV__ && console.error('Failed to get ratchet states:', error);
     return null;
   }
 }
@@ -135,7 +135,7 @@ export async function saveRatchetStates(
     // Mettre à jour le cache avec une copie
     ratchetCache.set(conversationId, deepCopyRatchetStates(states));
   } catch (error) {
-    console.error('Failed to save ratchet states:', error);
+    __DEV__ && console.error('Failed to save ratchet states:', error);
     throw error;
   }
 }
@@ -149,7 +149,7 @@ export async function deleteRatchetStates(conversationId: string): Promise<void>
     await AsyncStorage.removeItem(key);
     ratchetCache.delete(conversationId);
   } catch (error) {
-    console.error('Failed to delete ratchet states:', error);
+    __DEV__ && console.error('Failed to delete ratchet states:', error);
   }
 }
 
@@ -362,7 +362,7 @@ export async function getMessageKeyForDecrypt(
     // v2.2 - Vérification plus tolérante pour les anciens messages
     if (ratchetIndex < chain.index && !chain.skippedKeys.has(ratchetIndex)) {
       // Ce message a probablement déjà été traité - le skipper silencieusement
-      console.log(
+      __DEV__ && console.log(
         `⏭️ Skipping old message: index ${ratchetIndex} < current ${chain.index} ` +
         `(key not in skippedKeys). Probably already processed.`
       );

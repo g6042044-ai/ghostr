@@ -10,6 +10,8 @@ import {
   TouchableOpacity,
   Animated,
   Easing,
+  Image,
+  BackHandler,
 } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -19,6 +21,8 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { theme } from '../components/ui';
 import { suppressNotification } from '../components/InAppNotification';
+import { generateAvatarInitials } from '../services/crypto';
+import { sendPushTokenToPeer } from '../services/api1to1';
 
 type RootStackParamList = {
   ConversationList: undefined;
@@ -28,6 +32,7 @@ type RootStackParamList = {
     contactName: string;
     inviteLabel: string;
     inviteTag?: string;
+    contactAvatarBase64?: string;
   };
 };
 
@@ -51,7 +56,7 @@ export function ConnectionSuccessScreen() {
   const navigation = useNavigation<NavigationProp>();
   const route = useRoute<ScreenRouteProp>();
   const insets = useSafeAreaInsets();
-  const { sessionId, contactName, inviteLabel, inviteTag } = route.params;
+  const { sessionId, contactName, inviteLabel, inviteTag, contactAvatarBase64 } = route.params;
 
   // Supprimer le toast "Connexion établie" — cet écran affiche déjà l'info
   useEffect(() => {
@@ -59,6 +64,19 @@ export function ConnectionSuccessScreen() {
       suppressNotification(`accept_${inviteTag}`);
     }
   }, [inviteTag]);
+
+  // Bloquer le retour arrière Android — l'utilisateur doit utiliser les boutons
+  useEffect(() => {
+    const backHandler = BackHandler.addEventListener('hardwareBackPress', () => true);
+    return () => backHandler.remove();
+  }, []);
+
+  // Envoyer notre push token au nouveau contact via E2E
+  useEffect(() => {
+    sendPushTokenToPeer(sessionId).catch((err: any) => {
+      __DEV__ && console.warn('[ConnectionSuccess] Push token send failed:', err);
+    });
+  }, [sessionId]);
 
   // ── Animation values ──
   const backdropOpacity = useRef(new Animated.Value(0)).current;
@@ -135,18 +153,28 @@ export function ConnectionSuccessScreen() {
   }, []);
 
   const handleOpenConversation = () => {
-    navigation.replace('Conversation', {
-      conversationId: sessionId,
-      conversationName: contactName,
+    // Reset complet: ConversationList → Conversation
+    // Empêche tout retour vers ConnectionSuccess
+    navigation.reset({
+      index: 1,
+      routes: [
+        { name: 'ConversationList' },
+        { name: 'Conversation', params: { conversationId: sessionId, conversationName: contactName } },
+      ],
     });
   };
 
   const handleLater = () => {
-    navigation.navigate('ConversationList');
+    // Reset complet: retour à ConversationList seul
+    // Empêche tout retour vers ConnectionSuccess
+    navigation.reset({
+      index: 0,
+      routes: [{ name: 'ConversationList' }],
+    });
   };
 
   const accentColor = avatarColor(contactName);
-  const initial = contactName.charAt(0).toUpperCase();
+  const initial = generateAvatarInitials(contactName);
 
   return (
     <Animated.View style={[
@@ -161,10 +189,19 @@ export function ConnectionSuccessScreen() {
       {/* ═══ Visual: Avatar + Check ═══ */}
       <View style={styles.visualCenter}>
         <Animated.View style={[styles.avatar, {
-          backgroundColor: accentColor,
+          backgroundColor: contactAvatarBase64 ? 'transparent' : accentColor,
           transform: [{ scale: avatarScale }],
+          overflow: 'hidden',
         }]}>
-          <Text style={styles.avatarText}>{initial}</Text>
+          {contactAvatarBase64 ? (
+            <Image
+              source={{ uri: contactAvatarBase64 }}
+              style={{ width: 88, height: 88, borderRadius: 44 }}
+              resizeMode="cover"
+            />
+          ) : (
+            <Text style={styles.avatarText}>{initial}</Text>
+          )}
         </Animated.View>
 
         <Animated.View style={[styles.checkBadge, {
@@ -283,9 +320,10 @@ const styles = StyleSheet.create({
     elevation: 12,
   },
   avatarText: {
-    fontSize: 36,
+    fontSize: 30,
     fontWeight: '700',
     color: '#FFFFFF',
+    letterSpacing: 1,
   },
   checkBadge: {
     position: 'absolute',
@@ -325,7 +363,15 @@ const styles = StyleSheet.create({
     color: theme.colors.textMuted,
     textAlign: 'center',
     lineHeight: 22,
-    marginBottom: 32,
+    marginBottom: 8,
+  },
+  tagline: {
+    fontSize: 13,
+    color: theme.colors.primary,
+    fontWeight: '500',
+    textAlign: 'center',
+    marginBottom: 28,
+    opacity: 0.8,
   },
   badges: {
     width: '100%',

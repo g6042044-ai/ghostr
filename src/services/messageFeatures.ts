@@ -87,7 +87,7 @@ export async function getMessageStatus(
     
     return statusMap[messageId] || null;
   } catch (error) {
-    console.error('Failed to get message status:', error);
+    __DEV__ && console.error('Failed to get message status:', error);
     return null;
   }
 }
@@ -107,7 +107,7 @@ export async function getAllMessageStatuses(
     const decrypted = decryptIfNeeded(rawData);
     return JSON.parse(decrypted);
   } catch (error) {
-    console.error('Failed to get message statuses:', error);
+    __DEV__ && console.error('Failed to get message statuses:', error);
     return {};
   }
 }
@@ -139,7 +139,7 @@ export async function updateMessageStatus(
     await AsyncStorage.setItem(key, encrypted);
     
   } catch (error) {
-    console.error('Failed to update message status:', error);
+    __DEV__ && console.error('Failed to update message status:', error);
   }
 }
 
@@ -177,7 +177,7 @@ export async function getMessageReactions(
     const allReactions = await getAllReactions(conversationId);
     return allReactions[messageId] || [];
   } catch (error) {
-    console.error('Failed to get message reactions:', error);
+    __DEV__ && console.error('Failed to get message reactions:', error);
     return [];
   }
 }
@@ -197,7 +197,7 @@ export async function getAllReactions(
     const decrypted = decryptIfNeeded(rawData);
     return JSON.parse(decrypted);
   } catch (error) {
-    console.error('Failed to get reactions:', error);
+    __DEV__ && console.error('Failed to get reactions:', error);
     return {};
   }
 }
@@ -231,7 +231,7 @@ export async function addReaction(
     await AsyncStorage.setItem(key, encrypted);
     
   } catch (error) {
-    console.error('Failed to add reaction:', error);
+    __DEV__ && console.error('Failed to add reaction:', error);
   }
 }
 
@@ -263,7 +263,7 @@ export async function removeReaction(
     await AsyncStorage.setItem(key, encrypted);
     
   } catch (error) {
-    console.error('Failed to remove reaction:', error);
+    __DEV__ && console.error('Failed to remove reaction:', error);
   }
 }
 
@@ -359,6 +359,6 @@ export async function clearConversationFeatures(conversationId: string): Promise
     await AsyncStorage.removeItem(`${MESSAGE_STATUS_PREFIX}${conversationId}`);
     await AsyncStorage.removeItem(`${MESSAGE_REACTIONS_PREFIX}${conversationId}`);
   } catch (error) {
-    console.error('Failed to clear conversation features:', error);
+    __DEV__ && console.error('Failed to clear conversation features:', error);
   }
 }

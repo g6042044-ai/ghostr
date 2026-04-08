@@ -11,7 +11,12 @@
 // NEVER co-locate with the CF Worker or Supabase instance.
 
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
 const nacl = require('tweetnacl');
+
+// Push Notification Integration (Split-Trust)
+const { initPushIntegration, triggerPushNotification } = require('./push-integration');
 
 // P0: Key Transparency — optional, gateway works without it
 let createTransparencyTree = null;
@@ -40,7 +45,9 @@ const KT_PERSIST_PATH = process.env.KT_PERSIST_PATH || '/tmp/kt_data'; // /tmp i
 const ALLOWED_RPCS = new Set([
   // ACTION 01: send_message SUPPRIMÉ — sealed sender uniquement
   'get_messages_by_tags',
-  'send_call_signal',
+  // FIX: send_call_signal RETIRÉ — le client utilise exclusivement
+  // send_sealed_message pour les signaux d'appel (via api1to1.ts).
+  // callSignaling.ts est du code mort. Réduction de surface d'attaque.
   'get_call_signals_by_tags',
   // Audit Fix C-01: Sealed sender RPC
   'send_sealed_message',
@@ -50,6 +57,10 @@ const ALLOWED_RPCS = new Set([
   'kt_register_key',
   'kt_get_proof',
   'kt_get_sth',
+  // ACTION-03 (Phase 1 Security): Blob storage via OHTTP
+  'upload_blob',
+  'download_blob',
+  'delete_blob',
 ]);
 
 // ============================================
@@ -72,7 +83,7 @@ const CERTIFICATE_VALIDITY_MS = 60 * 60 * 1000; // P5 fix: 1h (was 24h)
 // messages before the client must obtain a new one (via PoW).
 // This prevents a single certificate from enabling unlimited tag-rotation DoS.
 
-const MAX_MESSAGES_PER_CERT = 200; // ~3.3 msg/min covers normal + decoy traffic (1h cert)
+const MAX_MESSAGES_PER_CERT = 100; // P1-A1: Réduit de 200 à 100
 const certUsage = new Map(); // nonce_b64 → { count, expiry }
 let lastCertCleanup = Date.now();
 
@@ -115,8 +126,8 @@ function checkCertRateLimit(nonceB64, expiry) {
 // Si le serveur détecte un pic de demandes (>50 certs/min), la difficulté monte
 // temporairement à 24 bits (~15s mobile) pour décourager les attaques par spam.
 
-const POW_BASE_DIFFICULTY = 18;
-const POW_SURGE_DIFFICULTY = 24;
+const POW_BASE_DIFFICULTY = 16;  // 16 bits = ~65K iterations = <1s mobile (pure JS SHA-256)
+const POW_SURGE_DIFFICULTY = 20; // 20 bits = ~1M iterations = ~3s mobile (surge mode)
 const POW_SURGE_THRESHOLD = 50; // Requêtes par minute déclenchant le mode surge
 const POW_TIMESTAMP_WINDOW_MS = 5 * 60 * 1000; // ±5 minutes
 
@@ -154,12 +165,12 @@ function cleanupRecentChallenges() {
 
 /**
  * Verify a Proof-of-Work submitted by the client.
- * Returns true if valid, false otherwise.
+ * Returns { valid, reason } for diagnostic logging.
  */
 function verifyProofOfWork(pow) {
   if (!pow || typeof pow.timestamp !== 'number' || typeof pow.salt !== 'string' ||
       typeof pow.nonce !== 'number' || typeof pow.difficulty !== 'number') {
-    return false;
+    return { valid: false, reason: `type_check_failed: pow=${!!pow}, ts=${typeof pow?.timestamp}, salt=${typeof pow?.salt}, nonce=${typeof pow?.nonce}, diff=${typeof pow?.difficulty}` };
   }
 
   // Get current required difficulty (may be elevated during surge)
@@ -167,20 +178,20 @@ function verifyProofOfWork(pow) {
 
   // Check difficulty meets current requirement
   if (pow.difficulty < requiredDifficulty) {
-    return false;
+    return { valid: false, reason: `difficulty_too_low: client=${pow.difficulty}, required=${requiredDifficulty}` };
   }
 
   // Check timestamp window (anti-replay)
   const now = Date.now();
   if (Math.abs(now - pow.timestamp) > POW_TIMESTAMP_WINDOW_MS) {
-    return false;
+    return { valid: false, reason: `timestamp_expired: client_ts=${pow.timestamp}, server_ts=${now}, drift=${Math.abs(now - pow.timestamp)}ms, window=${POW_TIMESTAMP_WINDOW_MS}ms` };
   }
 
   // Check replay (same challenge used twice)
   cleanupRecentChallenges();
   const challengeId = `${pow.timestamp}:${pow.salt}`;
   if (recentChallenges.has(challengeId)) {
-    return false;
+    return { valid: false, reason: 'replay_detected' };
   }
 
   // Verify the hash has required leading zero bits
@@ -194,17 +205,21 @@ function verifyProofOfWork(pow) {
   const remainingBits = verifyBits % 8;
 
   for (let i = 0; i < fullBytes; i++) {
-    if (hash[i] !== 0) return false;
+    if (hash[i] !== 0) {
+      return { valid: false, reason: `hash_check_failed: byte[${i}]=${hash[i]} (expected 0), hash=${hash.slice(0, 4).toString('hex')}..., input_len=${input.length}` };
+    }
   }
   if (remainingBits > 0) {
     const mask = 0xFF << (8 - remainingBits);
-    if ((hash[fullBytes] & mask) !== 0) return false;
+    if ((hash[fullBytes] & mask) !== 0) {
+      return { valid: false, reason: `hash_check_failed: byte[${fullBytes}]=${hash[fullBytes]}&${mask}=${hash[fullBytes] & mask} (expected 0), hash=${hash.slice(0, 4).toString('hex')}...` };
+    }
   }
 
   // Mark challenge as used with timestamp
   recentChallenges.set(challengeId, now);
 
-  return true;
+  return { valid: true, reason: 'ok' };
 }
 
 let sealedSenderKeyPair = null;
@@ -265,7 +280,7 @@ function issueAnonymousCertificate() {
 }
 
 // ============================================
-// KEY LOADING — ACTION 10: Automatic rotation
+// KEY LOADING — P1-A6: Identity key + signed ephemeral rotation
 // ============================================
 
 let gatewayKeyPair = null;
@@ -273,6 +288,13 @@ let previousGatewayKeyPair = null; // Keep old keys for 1h overlap
 const KEY_ROTATION_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const KEY_OVERLAP_MS = 60 * 60 * 1000; // 1h overlap for in-transit requests
 let keyRotationTimestamp = 0;
+
+// P1-A6: Identity key pair (Ed25519, FIXED, from env vars)
+// La clé d'identité est pinnée côté client. Les clés éphémères sont signées par elle.
+const GATEWAY_IDENTITY_SECRET_KEY = process.env.GATEWAY_IDENTITY_SECRET_KEY; // Base64, 64 bytes Ed25519
+const GATEWAY_IDENTITY_PUBLIC_KEY = process.env.GATEWAY_IDENTITY_PUBLIC_KEY; // Base64, 32 bytes Ed25519
+let gatewayIdentityKeyPair = null;
+let currentEphemeralSignature = null; // Signature de la clé éphémère actuelle
 
 // ACTION 09: Gateway ID for multi-gateway routing
 const GATEWAY_ID = process.env.GATEWAY_ID || 'gw-primary';
@@ -298,7 +320,50 @@ function loadKeys() {
   };
   keyRotationTimestamp = Date.now();
 
+  // P1-A6: Charger la clé d'identité Ed25519 si disponible
+  if (GATEWAY_IDENTITY_SECRET_KEY && GATEWAY_IDENTITY_PUBLIC_KEY) {
+    const idSk = Buffer.from(GATEWAY_IDENTITY_SECRET_KEY, 'base64');
+    const idPk = Buffer.from(GATEWAY_IDENTITY_PUBLIC_KEY, 'base64');
+    if (idSk.length === 64 && idPk.length === 32) {
+      gatewayIdentityKeyPair = {
+        publicKey: new Uint8Array(idPk),
+        secretKey: new Uint8Array(idSk),
+      };
+      // Signer la clé éphémère initiale
+      currentEphemeralSignature = signEphemeralKey(gatewayKeyPair.publicKey);
+      console.log('🔑 P1-A6: Identity key loaded. Ephemeral key signed.');
+      console.log('   Identity pubkey:', GATEWAY_IDENTITY_PUBLIC_KEY.slice(0, 16) + '...');
+    } else {
+      console.warn('⚠️ P1-A6: Invalid identity key lengths (expected 64+32 bytes)');
+    }
+  } else {
+    console.warn('⚠️ P1-A6: GATEWAY_IDENTITY_SECRET_KEY / GATEWAY_IDENTITY_PUBLIC_KEY not set.');
+    console.warn('   Ephemeral key rotation will not be signed. Set these for production.');
+  }
+
   console.log('🔑 Gateway keys loaded. Public key:', GATEWAY_PUBLIC_KEY.slice(0, 16) + '...');
+}
+
+/**
+ * P1-A6: Signe une clé éphémère NaCl avec la clé d'identité Ed25519.
+ * Le client vérifie cette signature pour s'assurer que la clé éphémère
+ * provient bien du gateway légitime (même après rotation).
+ *
+ * Format signé: ephemeralPubKey (32 bytes) || timestamp (8 bytes big-endian)
+ */
+function signEphemeralKey(ephemeralPubKey) {
+  if (!gatewayIdentityKeyPair) return null;
+  // CRITICAL: capturer le timestamp UNE SEULE FOIS — la valeur signée
+  // et la valeur retournée au client DOIVENT être identiques.
+  const ts = Date.now();
+  const tsBuf = Buffer.alloc(8);
+  tsBuf.writeBigUInt64BE(BigInt(ts), 0);
+  const dataToSign = Buffer.concat([Buffer.from(ephemeralPubKey), tsBuf]);
+  const signature = nacl.sign.detached(new Uint8Array(dataToSign), gatewayIdentityKeyPair.secretKey);
+  return {
+    signature: Buffer.from(signature).toString('base64'),
+    timestamp: ts,
+  };
 }
 
 /**
@@ -306,7 +371,7 @@ function loadKeys() {
  * Previous key pair is kept for 1h overlap to handle in-transit requests.
  */
 function rotateGatewayKeys() {
-  console.log('🔑 ACTION 10: Rotating gateway keys...');
+  console.log('🔑 Rotating gateway keys...');
   
   // Archive current keys
   previousGatewayKeyPair = gatewayKeyPair;
@@ -315,7 +380,13 @@ function rotateGatewayKeys() {
   gatewayKeyPair = nacl.box.keyPair();
   keyRotationTimestamp = Date.now();
   
+  // P1-A6: Signer la nouvelle clé éphémère avec la clé d'identité
+  currentEphemeralSignature = signEphemeralKey(gatewayKeyPair.publicKey);
+  
   console.log('🔑 New gateway pubkey:', Buffer.from(gatewayKeyPair.publicKey).toString('base64').slice(0, 16) + '...');
+  if (currentEphemeralSignature) {
+    console.log('🔑 P1-A6: Ephemeral key signed by identity key');
+  }
   
   // Zeroize old keys after overlap period
   setTimeout(() => {
@@ -447,7 +518,7 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalLength = 0;
-    const MAX_SIZE = 22 * 1024 * 1024; // 22MB — couvre 10MB fichier après chiffrement + base64
+    const MAX_SIZE = 25 * 1024 * 1024; // 25MB — couvre 16MB blob paddé en base64 (~21.3MB) + overhead OHTTP (ACTION-03)
 
     req.on('data', chunk => {
       totalLength += chunk.length;
@@ -464,7 +535,43 @@ function readBody(req) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+// ============================================
+// R-05: SERVEUR HTTPS FORCÉ
+// ============================================
+//
+// PROBLÈME: http.createServer() sans TLS exposait les payloads OHTTP décryptés en clair
+// si le gateway était déployé sans reverse-proxy (ex: VPS nu).
+//
+// SOLUTION: Serveur HTTPS natif si TLS_CERT_PATH et TLS_KEY_PATH sont fournis.
+// Fallback vers HTTP avec warning si déployé derrière un reverse-proxy TLS
+// (Cloud Run, Fly.io, Nginx) — configurer TRUST_PROXY=true dans ce cas.
+// Un serveur HTTP séparé sur PORT_HTTP redirige vers HTTPS (301).
+//
+// VARIABLES D'ENVIRONNEMENT:
+//   TLS_CERT_PATH   — Chemin vers le certificat PEM (ex: /etc/ssl/cert.pem)
+//   TLS_KEY_PATH    — Chemin vers la clé privée PEM (ex: /etc/ssl/key.pem)
+//   TRUST_PROXY     — 'true' si déployé derrière un reverse-proxy TLS (Cloud Run, Fly.io)
+//   PORT_HTTP       — Port HTTP pour les redirections (défaut: 3101)
+
+const TLS_CERT_PATH = process.env.TLS_CERT_PATH;
+const TLS_KEY_PATH  = process.env.TLS_KEY_PATH;
+const TRUST_PROXY   = process.env.TRUST_PROXY === 'true';
+const PORT_HTTP     = parseInt(process.env.PORT_HTTP || '3101', 10);
+
+const requestHandler = async (req, res) => {
+  // R-05: Rejeter les connexions HTTP en clair si TLS est activé en natif
+  // (Le header X-Forwarded-Proto est la seule info dispo derrière un proxy)
+  const proto = req.headers['x-forwarded-proto'];
+  const isHttps = proto === 'https' || !TRUST_PROXY; // Sans proxy = on gère TLS nous-mêmes
+  if (TRUST_PROXY && proto && proto !== 'https') {
+    res.writeHead(301, { Location: `https://${req.headers.host}${req.url}` });
+    res.end();
+    return;
+  }
+  return requestHandlerInner(req, res);
+};
+
+async function requestHandlerInner(req, res) {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
@@ -485,64 +592,45 @@ const server = http.createServer(async (req, res) => {
   }
 
   // GET /manifest — ACTION 09: Return gateway identity for multi-gateway routing
+  // P1-A6: Inclut la clé d'identité et la signature de la clé éphémère
   if (req.method === 'GET' && req.url === '/manifest') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    const manifest = {
       id: GATEWAY_ID,
       pubkey: Buffer.from(gatewayKeyPair.publicKey).toString('base64'),
       sealedSenderPubkey: sealedSenderKeyPair 
         ? Buffer.from(sealedSenderKeyPair.publicKey).toString('base64') 
         : null,
-      keyRotatedAt: keyRotationTimestamp,
-      version: '2.0',
-    }));
-    return;
-  }
-
-  // GET /sealed-sender-key — Audit Fix C-01
-  // Returns the sealed sender public key (distinct from OHTTP gateway key)
-  if (req.method === 'GET' && req.url === '/sealed-sender-key') {
-    if (!sealedSenderKeyPair) {
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Sealed sender not configured' }));
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(Buffer.from(sealedSenderKeyPair.publicKey).toString('base64'));
-    return;
-  }
-
-  // POST /certificate — Audit Fix C-01 + CRITIQUE-03 (PoW required)
-  // Issues an anonymous certificate. The request goes through the OHTTP relay,
-  // so the gateway sees the auth token (to verify legitimacy) but NOT the IP.
-  // The certificate itself contains no identity — just a random nonce + HMAC.
-  if (req.method === 'POST' && req.url === '/certificate') {
-    if (!sealedSenderHmacKey) {
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Sealed sender not configured' }));
-      return;
-    }
-    // CRITIQUE-03: Require Proof-of-Work to prevent certificate spam
-    try {
-      const body = await readBody(req);
-      const parsed = JSON.parse(body.toString('utf-8'));
-      if (!parsed.pow || !verifyProofOfWork(parsed.pow)) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        // ACTION 8: Inclure la difficulté requise pour que le client puisse réessayer
-        res.end(JSON.stringify({ 
-          error: 'Invalid or missing proof-of-work',
-          requiredDifficulty: getCurrentDifficulty(),
-        }));
-        return;
+      // GH-16: keyRotatedAt and version REMOVED — facilitates fingerprinting
+    };
+    // P1-A6: Ajouter la clé d'identité et la signature si disponibles
+    if (gatewayIdentityKeyPair) {
+      manifest.identityPubkey = Buffer.from(gatewayIdentityKeyPair.publicKey).toString('base64');
+      if (currentEphemeralSignature) {
+        manifest.ephemeralSignature = currentEphemeralSignature.signature;
+        manifest.ephemeralSignatureTimestamp = currentEphemeralSignature.timestamp;
       }
-    } catch (e) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid request body — JSON with pow required' }));
-      return;
     }
-    const cert = issueAnonymousCertificate();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(cert));
+    res.end(JSON.stringify(manifest));
+    return;
+  }
+
+  // GH-04: /sealed-sender-key endpoint REMOVED — key is distributed via /manifest only
+  if (req.method === 'GET' && req.url === '/sealed-sender-key') {
+    res.writeHead(410, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Endpoint removed. Use /manifest via OHTTP relay.' }));
+    return;
+  }
+
+  // ACTION-02 (Phase 1 Security): Direct /certificate endpoint REMOVED.
+  // Certificate issuance MUST go through the OHTTP tunnel (/relay → get_sealed_certificate RPC)
+  // to prevent the gateway from seeing the client's IP during certificate acquisition.
+  // A direct endpoint allowed IP↔certificate temporal correlation, breaking split-trust.
+  if (req.method === 'POST' && req.url === '/certificate') {
+    res.writeHead(410, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ 
+      error: 'Direct /certificate endpoint removed for anonymity protection. Use OHTTP relay (get_sealed_certificate RPC).',
+    }));
     return;
   }
 
@@ -603,9 +691,11 @@ const server = http.createServer(async (req, res) => {
       if (request.rpc === 'get_sealed_certificate') {
         // CRITIQUE-03: Verify Proof-of-Work before issuing certificate
         const pow = request.params && request.params.pow;
-        if (!verifyProofOfWork(pow)) {
+        const powResult = verifyProofOfWork(pow);
+        if (!powResult.valid) {
+          console.log(`❌ PoW rejected: ${powResult.reason}`);
           const errResp = encryptResponse(
-            JSON.stringify({ data: null, error: 'Invalid or missing proof-of-work' }),
+            JSON.stringify({ data: null, error: `Invalid or missing proof-of-work: ${powResult.reason}` }),
             ephemeralPubKey, usedSecretKey
           );
           res.writeHead(403, { 'Content-Type': 'application/octet-stream' });
@@ -802,6 +892,19 @@ const server = http.createServer(async (req, res) => {
             throw new Error('Certificate message quota exceeded — obtain a new certificate');
           }
 
+          // P1-A1: Verify tag commitment — the sealed inner must commit to the tag
+          // This prevents a certificate from being reused across different tags
+          if (inner.tagCommitment) {
+            const expectedTagCommitment = crypto.createHash('sha256')
+              .update(tag).digest('hex');
+            if (inner.tagCommitment !== expectedTagCommitment) {
+              throw new Error('Tag commitment mismatch — sealed content was crafted for a different tag');
+            }
+          } else {
+            // P1-A1: Reject messages without tag commitment
+            throw new Error('Missing tag commitment in sealed sender envelope');
+          }
+
           // 3. Forward the INNER payload as send_sealed_message
           // ACTION 01+02: send_message has been REMOVED. Forward via send_sealed_message.
           // The Supabase RPC stores the payload without device_id.
@@ -813,6 +916,14 @@ const server = http.createServer(async (req, res) => {
 
           const sealedResp = encryptResponse(JSON.stringify(supabaseResult), ephemeralPubKey, usedSecretKey);
           console.log(`✅ send_sealed_message → unwrapped & forwarded (cert valid, tag: ${tag.slice(0, 12)}...)`);
+          
+          // Push notification: forward le blob opaque au Push Proxy.
+          // Le Gateway ne fait AUCUN lookup — il forward CHAQUE blob.
+          // Vrais blobs et blobs aléatoires sont indistinguables.
+          if (params.p_push_blob) {
+            triggerPushNotification(params.p_push_blob);
+          }
+          
           res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
           res.end(Buffer.from(sealedResp));
 
@@ -827,6 +938,232 @@ const server = http.createServer(async (req, res) => {
         }
         return;
       }
+
+      // ============================================
+      // ACTION-03 (Phase 1 Security): BLOB STORAGE VIA OHTTP
+      // ============================================
+      // Blob uploads/downloads go through the OHTTP tunnel so that:
+      //   - CF Relay sees the IP but NOT the blob UUID (encrypted in OHTTP)
+      //   - Supabase sees the blob UUID but NOT the IP (gateway acts as proxy)
+      //   - No single entity can correlate IP ↔ blob ↔ conversation
+      //
+      // Data format: blobs are base64-encoded in JSON params.
+      // This adds ~33% overhead but preserves the existing OHTTP wire format.
+
+      if (request.rpc === 'upload_blob') {
+        try {
+          const params = request.params || {};
+          const blobB64 = params.blob_data;     // Base64-encoded padded blob
+          const blobPath = params.blob_path;     // e.g. "aBcDeFgH.bin"
+          const contentType = params.content_type || 'application/octet-stream';
+
+          if (!blobB64 || typeof blobB64 !== 'string') {
+            throw new Error('Missing blob_data (base64)');
+          }
+          if (!blobPath || typeof blobPath !== 'string' || !/^[A-Za-z0-9_-]+\.bin$/.test(blobPath)) {
+            throw new Error('Invalid blob_path (must match [A-Za-z0-9_-]+.bin)');
+          }
+
+          const blobBuffer = Buffer.from(blobB64, 'base64');
+          if (blobBuffer.length > 22 * 1024 * 1024) {
+            throw new Error('Blob too large (max 22MB)');
+          }
+
+          // Upload to Supabase Storage using the gateway's service credentials
+          const uploadUrl = `${SUPABASE_URL}/storage/v1/object/ghostr-blobs/${blobPath}`;
+          const uploadResp = await fetch(uploadUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': contentType,
+              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+              'apikey': SUPABASE_ANON_KEY,
+              'x-upsert': 'false',
+            },
+            body: blobBuffer,
+          });
+
+          if (!uploadResp.ok) {
+            const errText = await uploadResp.text();
+            throw new Error(`Supabase Storage ${uploadResp.status}: ${errText}`);
+          }
+
+          const resp = encryptResponse(
+            JSON.stringify({ data: { path: blobPath }, error: null }),
+            ephemeralPubKey, usedSecretKey
+          );
+          console.log(`✅ upload_blob → ${blobPath.slice(0, 16)}... (${Math.round(blobBuffer.length / 1024)}KB)`);
+          res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+          res.end(Buffer.from(resp));
+        } catch (e) {
+          console.error(`❌ upload_blob failed: ${e.message}`);
+          const errResp = encryptResponse(
+            JSON.stringify({ data: null, error: e.message }),
+            ephemeralPubKey, usedSecretKey
+          );
+          res.writeHead(400, { 'Content-Type': 'application/octet-stream' });
+          res.end(Buffer.from(errResp));
+        }
+        return;
+      }
+
+      if (request.rpc === 'download_blob') {
+        try {
+          const params = request.params || {};
+          const blobPath = params.blob_path; // e.g. "aBcDeFgH.bin"
+
+          if (!blobPath || typeof blobPath !== 'string' || !/^[A-Za-z0-9_-]+\.bin$/.test(blobPath)) {
+            throw new Error('Invalid blob_path');
+          }
+
+          // Download from Supabase Storage
+          const downloadUrl = `${SUPABASE_URL}/storage/v1/object/ghostr-blobs/${blobPath}`;
+          const dlResp = await fetch(downloadUrl, {
+            method: 'GET',
+            headers: {
+              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+              'apikey': SUPABASE_ANON_KEY,
+            },
+          });
+
+          if (!dlResp.ok) {
+            throw new Error(`Supabase Storage ${dlResp.status}`);
+          }
+
+          const blobBuffer = Buffer.from(await dlResp.arrayBuffer());
+          const blobB64 = blobBuffer.toString('base64');
+
+          const resp = encryptResponse(
+            JSON.stringify({ data: { blob_data: blobB64 }, error: null }),
+            ephemeralPubKey, usedSecretKey
+          );
+          console.log(`✅ download_blob → ${blobPath.slice(0, 16)}... (${Math.round(blobBuffer.length / 1024)}KB)`);
+          res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+          res.end(Buffer.from(resp));
+        } catch (e) {
+          console.error(`❌ download_blob failed: ${e.message}`);
+          const errResp = encryptResponse(
+            JSON.stringify({ data: null, error: e.message }),
+            ephemeralPubKey, usedSecretKey
+          );
+          res.writeHead(400, { 'Content-Type': 'application/octet-stream' });
+          res.end(Buffer.from(errResp));
+        }
+        return;
+      }
+
+      if (request.rpc === 'delete_blob') {
+        try {
+          const params = request.params || {};
+          const blobPath = params.blob_path;
+
+          if (!blobPath || typeof blobPath !== 'string' || !/^[A-Za-z0-9_-]+\.bin$/.test(blobPath)) {
+            throw new Error('Invalid blob_path');
+          }
+
+          // Delete from Supabase Storage
+          const deleteUrl = `${SUPABASE_URL}/storage/v1/object/ghostr-blobs/${blobPath}`;
+          const delResp = await fetch(deleteUrl, {
+            method: 'DELETE',
+            headers: {
+              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+              'apikey': SUPABASE_ANON_KEY,
+            },
+          });
+
+          // Accept 200, 204, and 404 (already deleted) as success
+          const success = delResp.ok || delResp.status === 404;
+          const resp = encryptResponse(
+            JSON.stringify({ data: { deleted: success }, error: null }),
+            ephemeralPubKey, usedSecretKey
+          );
+          res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+          res.end(Buffer.from(resp));
+        } catch (e) {
+          const errResp = encryptResponse(
+            JSON.stringify({ data: null, error: e.message }),
+            ephemeralPubKey, usedSecretKey
+          );
+          res.writeHead(400, { 'Content-Type': 'application/octet-stream' });
+          res.end(Buffer.from(errResp));
+        }
+        return;
+      }
+
+      // ============================================
+      // END BLOB STORAGE RPCs
+      // ============================================
+
+      // ============================================
+      // ACTION-01 (Phase 1 Security): LEGACY MEDIA DOWNLOAD VIA OHTTP
+      // ============================================
+      // Old media was stored at whisper-media/<tag>/<fileId><suffix>.enc
+      // The tag in the storage path allowed CF Relay to correlate IP ↔ conversation.
+      // This RPC proxies downloads through the OHTTP tunnel so the CF Relay
+      // sees only an opaque encrypted blob, not the tag/fileId.
+
+      if (request.rpc === 'download_legacy_media') {
+        try {
+          const params = request.params || {};
+          const storagePath = params.storage_path;  // The tag (conversation identifier)
+          const fileId = params.file_id;            // Anonymous file UUID
+          const suffix = params.suffix || '';        // '' or '_thumb' or '_voice'
+
+          // Validate inputs to prevent path traversal
+          if (!storagePath || typeof storagePath !== 'string' || storagePath.length < 8 || storagePath.length > 128) {
+            throw new Error('Invalid storage_path');
+          }
+          if (!fileId || typeof fileId !== 'string' || fileId.length < 10 || fileId.length > 64) {
+            throw new Error('Invalid file_id');
+          }
+          if (suffix && !['_thumb', '_voice'].includes(suffix)) {
+            throw new Error('Invalid suffix');
+          }
+          // Block path traversal
+          if (storagePath.includes('..') || storagePath.includes('/') || storagePath.includes('\\') ||
+              fileId.includes('..') || fileId.includes('/') || fileId.includes('\\')) {
+            throw new Error('Path traversal detected');
+          }
+
+          const objectPath = `${storagePath}/${fileId}${suffix}.enc`;
+          const downloadUrl = `${SUPABASE_URL}/storage/v1/object/whisper-media/${objectPath}`;
+
+          const dlResp = await fetch(downloadUrl, {
+            method: 'GET',
+            headers: {
+              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+              'apikey': SUPABASE_ANON_KEY,
+            },
+          });
+
+          if (!dlResp.ok) {
+            throw new Error(`Supabase Storage ${dlResp.status}`);
+          }
+
+          const mediaBuffer = Buffer.from(await dlResp.arrayBuffer());
+          const mediaB64 = mediaBuffer.toString('base64');
+
+          const resp = encryptResponse(
+            JSON.stringify({ data: { media_data: mediaB64 }, error: null }),
+            ephemeralPubKey, usedSecretKey
+          );
+          console.log(`✅ download_legacy_media → ${objectPath.slice(0, 30)}... (${Math.round(mediaBuffer.length / 1024)}KB)`);
+          res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+          res.end(Buffer.from(resp));
+        } catch (e) {
+          console.error(`❌ download_legacy_media failed: ${e.message}`);
+          const errResp = encryptResponse(
+            JSON.stringify({ data: null, error: e.message }),
+            ephemeralPubKey, usedSecretKey
+          );
+          res.writeHead(400, { 'Content-Type': 'application/octet-stream' });
+          res.end(Buffer.from(errResp));
+        }
+        return;
+      }
+
+      // ============================================
+      // END LEGACY MEDIA RPCs
+      // ============================================
 
       // Forward to Supabase
       const supabaseResult = await forwardToSupabase(request.rpc, request.params || {});
@@ -859,7 +1196,58 @@ const server = http.createServer(async (req, res) => {
   // 404 for everything else
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
-});
+} // end requestHandlerInner
+
+// ============================================
+// R-05: Création du serveur (HTTPS ou HTTP selon la config)
+// ============================================
+
+let server;
+
+if (TLS_CERT_PATH && TLS_KEY_PATH) {
+  // Mode HTTPS natif — idéal pour VPS sans reverse-proxy
+  let tlsOptions;
+  try {
+    tlsOptions = {
+      cert: fs.readFileSync(TLS_CERT_PATH),
+      key: fs.readFileSync(TLS_KEY_PATH),
+    };
+  } catch (e) {
+    console.error(`❌ R-05: Impossible de lire les certificats TLS: ${e.message}`);
+    console.error(`   TLS_CERT_PATH=${TLS_CERT_PATH}, TLS_KEY_PATH=${TLS_KEY_PATH}`);
+    process.exit(1);
+  }
+
+  server = https.createServer(tlsOptions, requestHandler);
+
+  // Serveur HTTP séparé uniquement pour les redirections 301 → HTTPS
+  const httpRedirect = http.createServer((req, res) => {
+    res.writeHead(301, {
+      Location: `https://${req.headers.host || 'localhost'}${req.url}`,
+      'Strict-Transport-Security': 'max-age=63072000; includeSubDomains',
+    });
+    res.end();
+  });
+  httpRedirect.listen(PORT_HTTP, () => {
+    console.log(`🔀 R-05: HTTP→HTTPS redirect listening on port ${PORT_HTTP}`);
+  });
+
+  console.log(`🔒 R-05: HTTPS natif activé (cert: ${TLS_CERT_PATH})`);
+
+} else if (TRUST_PROXY) {
+  // Mode proxy TLS (Cloud Run, Fly.io, Nginx) — HTTP local uniquement
+  server = http.createServer(requestHandler);
+  console.log(`🔒 R-05: Mode TRUST_PROXY — TLS géré par le reverse-proxy en amont`);
+
+} else {
+  // Mode développement uniquement — HTTP sans TLS
+  server = http.createServer(requestHandler);
+  if (process.env.NODE_ENV === 'production') {
+    console.error('❌ R-05: PRODUCTION sans TLS ! Configurer TLS_CERT_PATH/TLS_KEY_PATH ou TRUST_PROXY=true');
+    process.exit(1);
+  }
+  console.warn('⚠️  R-05: HTTP sans TLS (développement uniquement). Configurer TLS avant déploiement.');
+}
 
 // ============================================
 // STARTUP
@@ -928,4 +1316,7 @@ server.listen(PORT, () => {
   console.log(`🔒 GHOSTR OHTTP Gateway listening on port ${PORT}`);
   console.log(`   Supabase: ${SUPABASE_URL}`);
   console.log(`   Allowed RPCs: ${[...ALLOWED_RPCS].join(', ')}`);
+  
+  // Initialize push notification integration
+  initPushIntegration();
 });

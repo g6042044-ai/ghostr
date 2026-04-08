@@ -338,7 +338,8 @@ export async function pqxdhInitiator(
   const ephemeralKeyPair = generateX25519KeyPair();
   
   // 4. Convertir l'Identity Key de Bob en X25519
-  const theirIdentityDHKey = ed25519PublicKeyToX25519(theirBundle.identityKey);
+  // R-11: await — ed25519PublicKeyToX25519 utilise libsodium (constant-time, async)
+  const theirIdentityDHKey = await ed25519PublicKeyToX25519(theirBundle.identityKey);
   
   // 5. Calculer les DH classiques
   const dh1 = x25519(
@@ -486,7 +487,8 @@ export async function pqxdhResponder(
   initialMessage: PQXDHInitialMessage
 ): Promise<SymmetricKey> {
   // 1. Convertir l'Identity Key d'Alice en X25519
-  const theirIdentityDHKey = ed25519PublicKeyToX25519(initialMessage.identityKey);
+  // R-11: await — ed25519PublicKeyToX25519 utilise libsodium (constant-time, async)
+  const theirIdentityDHKey = await ed25519PublicKeyToX25519(initialMessage.identityKey);
   
   // 2. Calculer les DH classiques (ordre inverse d'Alice)
   const dh1 = x25519(
@@ -730,8 +732,24 @@ export function deserializePQPreKeyBundle(data: SerializedPQPreKeyBundle): PQPre
 /**
  * Sérialise un message initial PQXDH
  */
+/**
+ * Sérialise un message initial PQXDH
+ *
+ * R-06: Padding du premier message PQXDH pour masquer la création de session.
+ *
+ * Le message PQXDH contient le ciphertext ML-KEM-768 (1088 bytes → ~1452 chars base64),
+ * ce qui le rend ~2KB plus grand qu'un message Triple Ratchet ordinaire.
+ * Un observateur réseau peut détecter la création d'une nouvelle session même si le
+ * contenu est chiffré.
+ *
+ * SOLUTION: Ajouter un champ `_p` (padding) avec des bytes aléatoires encodés en base64
+ * pour aligner le JSON sérialisé sur la taille du tier small des messages normaux
+ * (~6000 chars, correspondant aux ~5981-6525 chars observés au serveur).
+ *
+ * Le champ `_p` est ignoré lors de la désérialisation.
+ */
 export function serializePQXDHMessage(message: PQXDHInitialMessage): string {
-  return JSON.stringify({
+  const obj: Record<string, unknown> = {
     v: 2,
     ik: serializePublicKey(message.identityKey),
     ek: serializePublicKey(message.ephemeralKey),
@@ -742,7 +760,28 @@ export function serializePQXDHMessage(message: PQXDHInitialMessage): string {
     ct: encodeBase64(message.ciphertext),
     // Audit Fix C-03: deniableMAC DOIT être transmis pour que Bob puisse vérifier
     dmac: message.deniableMAC ? encodeBase64(message.deniableMAC) : undefined,
-  });
+  };
+
+  // R-06: Calculer le padding nécessaire pour atteindre la taille cible.
+  // Taille cible: 4096 chars de JSON (après outer sealed sender + OHTTP → ~6000 chars,
+  // aligné sur le tier small des messages normaux).
+  const TARGET_JSON_CHARS = 4096;
+  const PADDING_OVERHEAD = 8; // `,"_p":"` + `"` = environ 8 chars overhead
+  const base = JSON.stringify(obj);
+  if (base.length < TARGET_JSON_CHARS) {
+    const paddingNeeded = TARGET_JSON_CHARS - base.length - PADDING_OVERHEAD;
+    if (paddingNeeded > 0) {
+      // Calculer combien de bytes aléatoires donnent paddingNeeded chars en base64
+      // base64: 4 chars = 3 bytes → bytes = floor(paddingNeeded * 3 / 4)
+      const paddingBytes = Math.floor(paddingNeeded * 3 / 4);
+      if (paddingBytes > 0) {
+        const randomPad = getSecureRandomBytes(paddingBytes);
+        obj._p = encodeBase64(randomPad);
+      }
+    }
+  }
+
+  return JSON.stringify(obj);
 }
 
 /**

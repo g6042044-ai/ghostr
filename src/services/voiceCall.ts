@@ -178,7 +178,7 @@ export function getNextSequenceNumber(): number {
  */
 export function resetSequenceCounter(): void {
   mySequenceCounter = 0;
-  console.log('📞 Sequence counter reset');
+  __DEV__ && console.log('📞 Sequence counter reset');
 }
 
 /**
@@ -203,7 +203,7 @@ export function shouldProcessSignal(callId: string, senderToken: string, sequenc
   
   // Signal out-of-order (ancien)
   if (sequenceNumber <= lastSeq) {
-    console.log(`📞 SECURITY: Out-of-order signal ignored (seq=${sequenceNumber}, lastSeq=${lastSeq}) from ${senderToken.slice(0, 8)}...`);
+    __DEV__ && console.log(`📞 SECURITY: Out-of-order signal ignored (seq=${sequenceNumber}, lastSeq=${lastSeq}) from ${senderToken.slice(0, 8)}...`);
     return false;
   }
   
@@ -240,7 +240,7 @@ export function clearSequenceTrackingForCall(callId: string): void {
     lastReceivedSequence.delete(key);
     sequenceTrackingTimestamps.delete(key);
   }
-  console.log(`📞 Cleared sequence tracking for call ${callId.slice(0, 8)}... (${keysToDelete.length} entries)`);
+  __DEV__ && console.log(`📞 Cleared sequence tracking for call ${callId.slice(0, 8)}... (${keysToDelete.length} entries)`);
 }
 
 // ============================================
@@ -317,7 +317,7 @@ function cleanupProcessedCallIds(): void {
 
 export function clearProcessedCallId(callId: string): void {
   processedCallIdsMap.delete(callId);
-  console.log(`📞 Cleared callId ${callId.slice(0, 8)}... from processedCallIds`);
+  __DEV__ && console.log(`📞 Cleared callId ${callId.slice(0, 8)}... from processedCallIds`);
 }
 
 // ============================================
@@ -327,7 +327,7 @@ export function clearProcessedCallId(callId: string): void {
 function updateState(newState: CallState): void {
   if (state.currentSession) {
     state.currentSession.state = newState;
-    console.log(`📞 Call state: ${newState}`);
+    __DEV__ && console.log(`📞 Call state: ${newState}`);
     state.onStateChange?.(newState);
   }
 }
@@ -368,7 +368,7 @@ function startRingTimeout(): void {
   state.ringTimeout = setTimeout(() => {
     if (state.currentSession?.state === 'ringing' || 
         state.currentSession?.state === 'initiating') {
-      console.log('📞 Call timeout - no answer');
+      __DEV__ && console.log('📞 Call timeout - no answer');
       endCallSession('timeout');
     }
   }, state.config.ringTimeout);
@@ -386,14 +386,14 @@ function startKeyRotationTimer(): void {
     
     // Ne pas rotater si la session se termine
     if (state.currentSession.isEnding) {
-      console.log('📞 Session ending, not rotating SenderKey');
+      __DEV__ && console.log('📞 Session ending, not rotating SenderKey');
       return;
     }
     
     try {
       const keys = await getConversationKeys(state.currentSession.conversationId);
       if (!keys) {
-        console.warn('📞 Cannot rotate SenderKey: no conversation keys');
+        __DEV__ && console.warn('📞 Cannot rotate SenderKey: no conversation keys');
         return;
       }
       
@@ -418,10 +418,10 @@ function startKeyRotationTimer(): void {
       };
       
       state.onRotationSignal?.(rotationSignal);
-      console.log(`📞 Key rotated: ${oldKeyId} -> ${newKey.keyId}`);
+      __DEV__ && console.log(`📞 Key rotated: ${oldKeyId} -> ${newKey.keyId}`);
       
     } catch (error) {
-      console.error('Key rotation error:', error);
+      __DEV__ && console.error('Key rotation error:', error);
     }
   }, state.config.keyRotationInterval);
 }
@@ -441,7 +441,7 @@ function endCallSession(reason: CallEndReason): void {
   if (!state.currentSession) return;
   
   if (state.currentSession.isEnding) {
-    console.log('📞 Session already ending, ignored');
+    __DEV__ && console.log('📞 Session already ending, ignored');
     return;
   }
   
@@ -461,7 +461,7 @@ function endCallSession(reason: CallEndReason): void {
   
   state.currentSession.remoteSenderKeys.clear();
   
-  console.log(`📞 Call ended: ${reason}`);
+  __DEV__ && console.log(`📞 Call ended: ${reason}`);
   state.onStateChange?.('ended');
   
   setTimeout(() => {
@@ -576,7 +576,7 @@ export async function startCall(
       timestamp: Date.now(),
     };
     
-    console.log(`📞 Starting call: ${callId}`);
+    __DEV__ && console.log(`📞 Starting call: ${callId}`);
     
     return {
       success: true,
@@ -587,7 +587,7 @@ export async function startCall(
     };
     
   } catch (error) {
-    console.error('Start call error:', error);
+    __DEV__ && console.error('Start call error:', error);
     return { success: false, error: String(error) };
   }
 }
@@ -610,7 +610,7 @@ export async function handleIncomingCall(
     cleanupProcessedCallIds();
     
     if (hasProcessedCallId(signal.callId)) {
-      console.log(`📞 Ignoring duplicate call-offer: ${signal.callId.slice(0, 8)}...`);
+      __DEV__ && console.log(`📞 Ignoring duplicate call-offer: ${signal.callId.slice(0, 8)}...`);
       return { success: true };
     }
     
@@ -627,7 +627,7 @@ export async function handleIncomingCall(
         const theirCallId = signal.callId;
         
         if (theirCallId < myCallId) {
-          console.log(`📞 TIE-BREAKING: Switching to their call`);
+          __DEV__ && console.log(`📞 TIE-BREAKING: Switching to their call`);
           markCallIdAsProcessed(myCallId);
           return { 
             success: true, 
@@ -635,13 +635,13 @@ export async function handleIncomingCall(
             newCallId: theirCallId
           };
         } else {
-          console.log(`📞 TIE-BREAKING: Keeping my call`);
+          __DEV__ && console.log(`📞 TIE-BREAKING: Keeping my call`);
           markCallIdAsProcessed(theirCallId);
           return { success: true };
         }
       }
       
-      console.log(`📞 Already in call, ignoring new offer`);
+      __DEV__ && console.log(`📞 Already in call, ignoring new offer`);
       return { success: false, error: 'Already in a call' };
     }
     
@@ -657,7 +657,7 @@ export async function handleIncomingCall(
     const mySenderToken = await getConversationSenderToken(conversationId);
     
     if (callerSenderToken === mySenderToken) {
-      console.log(`📞 Ignoring my own call-offer`);
+      __DEV__ && console.log(`📞 Ignoring my own call-offer`);
       return { success: true };
     }
     
@@ -698,7 +698,7 @@ export async function handleIncomingCall(
     
     // Traiter SenderKeys en attente
     if (state.pendingSenderKeys.size > 0) {
-      console.log(`📞 Processing ${state.pendingSenderKeys.size} pending SenderKeys...`);
+      __DEV__ && console.log(`📞 Processing ${state.pendingSenderKeys.size} pending SenderKeys...`);
       for (const [token, pending] of state.pendingSenderKeys) {
         await receiveSenderKeyFromPeer(pending.senderToken, pending.signal, pending.conversationId, pending.displayName, pending.avatarBase64);
       }
@@ -707,12 +707,12 @@ export async function handleIncomingCall(
     
     state.onIncomingCall?.(conversationId, signal.callId, callerSenderToken);
     
-    console.log(`📞 Incoming call: ${signal.callId} from ${callerSenderToken.slice(0, 8)}...`);
+    __DEV__ && console.log(`📞 Incoming call: ${signal.callId} from ${callerSenderToken.slice(0, 8)}...`);
     
     return { success: true };
     
   } catch (error) {
-    console.error('Handle incoming call error:', error);
+    __DEV__ && console.error('Handle incoming call error:', error);
     return { success: false, error: String(error) };
   }
 }
@@ -750,12 +750,12 @@ export async function acceptCall(): Promise<{
       timestamp: Date.now(),
     };
     
-    console.log(`📞 Call accepted: ${state.currentSession.callId}`);
+    __DEV__ && console.log(`📞 Call accepted: ${state.currentSession.callId}`);
     
     return { success: true, signal: callSignal };
     
   } catch (error) {
-    console.error('Accept call error:', error);
+    __DEV__ && console.error('Accept call error:', error);
     return { success: false, error: String(error) };
   }
 }
@@ -772,7 +772,7 @@ export async function joinCallById(
   error?: string;
 }> {
   try {
-    console.log(`📞 joinCallById: Starting for call ${callId.slice(0, 8)}...`);
+    __DEV__ && console.log(`📞 joinCallById: Starting for call ${callId.slice(0, 8)}...`);
     
     // v15.0: Réinitialiser le compteur de séquence pour un rejoin
     resetSequenceCounter();
@@ -792,7 +792,7 @@ export async function joinCallById(
         state.currentSession.state !== 'ended' &&
         !state.currentSession.isEnding) {
       if (state.currentSession.callId === callId) {
-        console.log(`📞 Already in this call: ${callId.slice(0, 8)}...`);
+        __DEV__ && console.log(`📞 Already in this call: ${callId.slice(0, 8)}...`);
         return { success: true };
       }
       return { success: false, error: 'Already in a different call' };
@@ -838,11 +838,11 @@ export async function joinCallById(
     markCallIdAsProcessed(callId);
     updateState('connecting');
     
-    console.log(`📞 Joining existing call: ${callId.slice(0, 8)}...`);
+    __DEV__ && console.log(`📞 Joining existing call: ${callId.slice(0, 8)}...`);
     
     // Traiter SenderKeys en attente
     if (state.pendingSenderKeys.size > 0) {
-      console.log(`📞 Processing ${state.pendingSenderKeys.size} pending SenderKeys...`);
+      __DEV__ && console.log(`📞 Processing ${state.pendingSenderKeys.size} pending SenderKeys...`);
       for (const [token, pending] of state.pendingSenderKeys) {
         await receiveSenderKeyFromPeer(pending.senderToken, pending.signal, pending.conversationId, pending.displayName, pending.avatarBase64);
       }
@@ -852,7 +852,7 @@ export async function joinCallById(
     return { success: true };
     
   } catch (error) {
-    console.error('Join call by ID error:', error);
+    __DEV__ && console.error('Join call by ID error:', error);
     return { success: false, error: String(error) };
   }
 }
@@ -883,12 +883,12 @@ export async function declineCall(): Promise<{
     
     endCallSession('declined');
     
-    console.log(`📞 Call declined`);
+    __DEV__ && console.log(`📞 Call declined`);
     
     return { success: true, signal: callSignal };
     
   } catch (error) {
-    console.error('Decline call error:', error);
+    __DEV__ && console.error('Decline call error:', error);
     return { success: false, error: String(error) };
   }
 }
@@ -908,7 +908,7 @@ export async function hangUp(): Promise<{
     }
     
     if (state.currentSession.isEnding) {
-      console.log('📞 Session already ending, hangUp ignored');
+      __DEV__ && console.log('📞 Session already ending, hangUp ignored');
       return { success: true };
     }
     
@@ -930,12 +930,12 @@ export async function hangUp(): Promise<{
     
     endCallSession('user_hangup');
     
-    console.log(`📞 Left the call (sent call-leave, seq=${callSignal.sequenceNumber})`);
+    __DEV__ && console.log(`📞 Left the call (sent call-leave, seq=${callSignal.sequenceNumber})`);
     
     return { success: true, signal: callSignal };
     
   } catch (error) {
-    console.error('Hang up error:', error);
+    __DEV__ && console.error('Hang up error:', error);
     return { success: false, error: String(error) };
   }
 }
@@ -957,12 +957,12 @@ export async function createRejoinSignal(conversationId: string, callId: string)
       sequenceNumber: getNextSequenceNumber(),
     };
     
-    console.log(`📞 Created call-rejoin signal for ${mySenderToken.slice(0, 8)}... (seq=${signal.sequenceNumber})`);
+    __DEV__ && console.log(`📞 Created call-rejoin signal for ${mySenderToken.slice(0, 8)}... (seq=${signal.sequenceNumber})`);
     
     return signal;
     
   } catch (error) {
-    console.error('Create rejoin signal error:', error);
+    __DEV__ && console.error('Create rejoin signal error:', error);
     return null;
   }
 }
@@ -985,7 +985,7 @@ export async function handleCallSignal(
   error?: string;
 }> {
   try {
-    console.log(`📞 Received signal: ${signal.type} from ${senderToken.slice(0, 8)}...`);
+    __DEV__ && console.log(`📞 Received signal: ${signal.type} from ${senderToken.slice(0, 8)}...`);
     
     switch (signal.type) {
       case 'call-offer':
@@ -1013,7 +1013,7 @@ export async function handleCallSignal(
     }
     
   } catch (error) {
-    console.error('Handle call signal error:', error);
+    __DEV__ && console.error('Handle call signal error:', error);
     return { success: false, error: String(error) };
   }
 }
@@ -1031,7 +1031,7 @@ async function handleCallAnswer(signal: CallSignal): Promise<{ success: boolean;
   updateState('connecting');
   startKeyRotationTimer();
   
-  console.log(`📞 Call answered`);
+  __DEV__ && console.log(`📞 Call answered`);
   
   return { success: true };
 }
@@ -1047,7 +1047,7 @@ async function handleCallDecline(signal: CallSignal): Promise<{ success: boolean
   
   endCallSession('declined');
   
-  console.log(`📞 Call declined by remote`);
+  __DEV__ && console.log(`📞 Call declined by remote`);
   
   return { success: true };
 }
@@ -1061,11 +1061,11 @@ async function handleCallLeave(signal: CallSignal, senderToken: string, conversa
       
       // Valider le token d'abord
       if (signal.leavingParticipant && signal.leavingParticipant !== senderToken) {
-        console.warn(`📞 SECURITY: call-leave token mismatch (no session)`);
+        __DEV__ && console.warn(`📞 SECURITY: call-leave token mismatch (no session)`);
         return { success: false, error: 'Token mismatch' };
       }
       
-      console.log(`📞 Received call-leave from ${leavingToken.slice(0, 8)}... (no local session)`);
+      __DEV__ && console.log(`📞 Received call-leave from ${leavingToken.slice(0, 8)}... (no local session)`);
       await removeParticipantFromCall(conversationId, leavingToken, signal.callId);
     }
     return { success: true };
@@ -1076,18 +1076,18 @@ async function handleCallLeave(signal: CallSignal, senderToken: string, conversa
   // v15.0: SÉCURITÉ - Valider que le token dans le signal correspond au senderToken de l'enveloppe
   // Ceci empêche l'usurpation: un attaquant ne peut pas forger un call-leave pour un autre utilisateur
   if (signal.leavingParticipant && signal.leavingParticipant !== senderToken) {
-    console.warn(`📞 SECURITY: call-leave token mismatch! leavingParticipant=${signal.leavingParticipant.slice(0, 8)}... != senderToken=${senderToken.slice(0, 8)}...`);
-    console.warn(`📞 SECURITY: Ignoring potentially forged call-leave signal`);
+    __DEV__ && console.warn(`📞 SECURITY: call-leave token mismatch! leavingParticipant=${signal.leavingParticipant.slice(0, 8)}... != senderToken=${senderToken.slice(0, 8)}...`);
+    __DEV__ && console.warn(`📞 SECURITY: Ignoring potentially forged call-leave signal`);
     return { success: false, error: 'Token mismatch - potential forgery' };
   }
   
   // v15.0: Vérifier le numéro de séquence pour éviter les signaux out-of-order
   if (!shouldProcessSignal(signal.callId, senderToken, signal.sequenceNumber)) {
-    console.log(`📞 Ignoring out-of-order call-leave from ${senderToken.slice(0, 8)}...`);
+    __DEV__ && console.log(`📞 Ignoring out-of-order call-leave from ${senderToken.slice(0, 8)}...`);
     return { success: true }; // Pas une erreur, juste ignoré
   }
   
-  console.log(`📞 Participant ${leavingToken.slice(0, 8)}... left the call (seq=${signal.sequenceNumber || 'none'})`);
+  __DEV__ && console.log(`📞 Participant ${leavingToken.slice(0, 8)}... left the call (seq=${signal.sequenceNumber || 'none'})`);
   
   // v15.0 FIX: Utiliser removeParticipantFromCall pour RETIRER le participant de participantTokens
   // Pas juste markParticipantAsLeft qui ne fait que marquer
@@ -1118,8 +1118,8 @@ async function handleCallRejoin(signal: CallSignal, senderToken: string): Promis
   // v15.0: SÉCURITÉ - Valider que le token dans le signal correspond au senderToken de l'enveloppe
   // Ceci empêche l'usurpation: un attaquant ne peut pas forger un call-rejoin pour un autre utilisateur
   if (signal.rejoiningParticipant && signal.rejoiningParticipant !== senderToken) {
-    console.warn(`📞 SECURITY: call-rejoin token mismatch! rejoiningParticipant=${signal.rejoiningParticipant.slice(0, 8)}... != senderToken=${senderToken.slice(0, 8)}...`);
-    console.warn(`📞 SECURITY: Ignoring potentially forged call-rejoin signal`);
+    __DEV__ && console.warn(`📞 SECURITY: call-rejoin token mismatch! rejoiningParticipant=${signal.rejoiningParticipant.slice(0, 8)}... != senderToken=${senderToken.slice(0, 8)}...`);
+    __DEV__ && console.warn(`📞 SECURITY: Ignoring potentially forged call-rejoin signal`);
     return { success: false, error: 'Token mismatch - potential forgery' };
   }
   
@@ -1131,10 +1131,10 @@ async function handleCallRejoin(signal: CallSignal, senderToken: string): Promis
     const oldSeq = lastReceivedSequence.get(key);
     lastReceivedSequence.set(key, signal.sequenceNumber);
     sequenceTrackingTimestamps.set(key, Date.now());
-    console.log(`📞 call-rejoin: Reset sequence tracking for ${senderToken.slice(0, 8)}... (was ${oldSeq || 'none'}, now ${signal.sequenceNumber})`);
+    __DEV__ && console.log(`📞 call-rejoin: Reset sequence tracking for ${senderToken.slice(0, 8)}... (was ${oldSeq || 'none'}, now ${signal.sequenceNumber})`);
   }
   
-  console.log(`📞 Participant ${rejoiningToken.slice(0, 8)}... rejoined the call (seq=${signal.sequenceNumber || 'none'})`);
+  __DEV__ && console.log(`📞 Participant ${rejoiningToken.slice(0, 8)}... rejoined the call (seq=${signal.sequenceNumber || 'none'})`);
   
   // Marquer comme rejoint via callHeartbeat (SOURCE UNIQUE)
   // Ceci annule tout call-leave précédent
@@ -1172,32 +1172,32 @@ async function receiveSenderKeyFromPeer(
       // Réinitialiser à 0 pour accepter les futurs signaux
       lastReceivedSequence.delete(key);
       sequenceTrackingTimestamps.delete(key);
-      console.log(`📞 SenderKey received: Reset sequence tracking for ${senderToken.slice(0, 8)}... (was ${oldSeq})`);
+      __DEV__ && console.log(`📞 SenderKey received: Reset sequence tracking for ${senderToken.slice(0, 8)}... (was ${oldSeq})`);
     }
   }
   
   // Si participant était marqué comme parti, le marquer comme rejoint
   if (hasParticipantRecentlyLeft(senderToken, signal.callId)) {
-    console.log(`📞 Participant ${senderToken.slice(0, 8)}... sent SenderKey - marking as rejoined`);
+    __DEV__ && console.log(`📞 Participant ${senderToken.slice(0, 8)}... sent SenderKey - marking as rejoined`);
     markParticipantAsRejoined(senderToken, signal.callId);
   }
   
   // Si pas de session, mettre en attente (incluant l'avatar)
   if (!state.currentSession) {
     state.pendingSenderKeys.set(senderToken, { signal, senderToken, conversationId, displayName, avatarBase64 });
-    console.log(`📞 SenderKey queued (no session): ${senderToken.slice(0, 8)}...`);
+    __DEV__ && console.log(`📞 SenderKey queued (no session): ${senderToken.slice(0, 8)}...`);
     return { success: true };
   }
   
   // Vérifier le callId
   if (signal.callId !== state.currentSession.callId) {
-    console.log(`📞 SenderKey from different call, ignoring`);
+    __DEV__ && console.log(`📞 SenderKey from different call, ignoring`);
     return { success: true };
   }
   
   // Ne pas traiter si la session se termine
   if (state.currentSession.isEnding) {
-    console.log(`📞 Session ending, ignoring SenderKey from ${senderToken.slice(0, 8)}...`);
+    __DEV__ && console.log(`📞 Session ending, ignoring SenderKey from ${senderToken.slice(0, 8)}...`);
     return { success: true };
   }
   
@@ -1212,7 +1212,7 @@ async function receiveSenderKeyFromPeer(
       e2eKey = keys.e2eKey;
     } else {
       // No keys available — refuse to proceed with insecure fallback
-      console.error('[VoiceCall] No conversation keys available for sender key distribution');
+      __DEV__ && console.error('[VoiceCall] No conversation keys available for sender key distribution');
       return { success: false, error: 'No conversation keys available' };
     }
     
@@ -1256,8 +1256,8 @@ async function receiveSenderKeyFromPeer(
       state.currentSession.participants.set(newPeerId, newParticipant);
       state.onParticipantJoined?.(newParticipant);
       
-      console.log(`📞 New participant from SenderKey: ${displayName || senderToken.slice(0, 8)}... (avatar: ${avatarBase64 ? 'yes' : 'no'})`);
-      console.log(`📞 Total participants: ${state.currentSession.participants.size}`);
+      __DEV__ && console.log(`📞 New participant from SenderKey: ${displayName || senderToken.slice(0, 8)}... (avatar: ${avatarBase64 ? 'yes' : 'no'})`);
+      __DEV__ && console.log(`📞 Total participants: ${state.currentSession.participants.size}`);
     } else {
       // Mettre à jour la SenderKey et éventuellement l'avatar
       existingParticipant.senderKeyId = senderKey.keyId;
@@ -1270,26 +1270,26 @@ async function receiveSenderKeyFromPeer(
       }
     }
     
-    console.log(`📞 Received SenderKey from ${senderToken.slice(0, 8)}...: ${senderKey.keyId}`);
-    console.log(`📞 Total remoteSenderKeys: ${state.currentSession.remoteSenderKeys.size}`);
+    __DEV__ && console.log(`📞 Received SenderKey from ${senderToken.slice(0, 8)}...: ${senderKey.keyId}`);
+    __DEV__ && console.log(`📞 Total remoteSenderKeys: ${state.currentSession.remoteSenderKeys.size}`);
     
     return { success: true };
     
   } catch (error) {
-    console.error('Receive SenderKey error:', error);
+    __DEV__ && console.error('Receive SenderKey error:', error);
     return { success: false, error: String(error) };
   }
 }
 
 export async function distributeMySenderKey(): Promise<CallSignal | null> {
   if (!state.currentSession?.mySenderKey || !state.currentSession.conversationId) {
-    console.warn('📞 Cannot distribute SenderKey: no session or key');
+    __DEV__ && console.warn('📞 Cannot distribute SenderKey: no session or key');
     return null;
   }
   
   // Ne pas distribuer si la session se termine
   if (state.currentSession.isEnding) {
-    console.log('📞 Session ending, not distributing SenderKey');
+    __DEV__ && console.log('📞 Session ending, not distributing SenderKey');
     return null;
   }
   
@@ -1327,12 +1327,12 @@ export async function distributeMySenderKey(): Promise<CallSignal | null> {
       timestamp: Date.now(),
     };
     
-    console.log(`📞 Distributing my SenderKey: ${state.currentSession.mySenderKey.keyId}`);
+    __DEV__ && console.log(`📞 Distributing my SenderKey: ${state.currentSession.mySenderKey.keyId}`);
     
     return signal;
     
   } catch (error) {
-    console.error('Distribute sender key error:', error);
+    __DEV__ && console.error('Distribute sender key error:', error);
     return null;
   }
 }
@@ -1354,7 +1354,7 @@ export function encryptOutgoingAudio(audioData: Uint8Array): { encrypted: Uint8A
       keyId: state.currentSession.mySenderKey.keyId,
     };
   } catch (error) {
-    console.error('Encrypt audio error:', error);
+    __DEV__ && console.error('Encrypt audio error:', error);
     return null;
   }
 }
@@ -1374,7 +1374,7 @@ export function decryptIncomingAudio(encryptedData: Uint8Array, senderToken: str
     // CORRECTIF: Arguments dans le bon ordre (senderKey, encryptedData)
     return decryptAudioPacket(senderKey, encryptedData);
   } catch (error) {
-    console.error(`📞 decryptAudioPacket error:`, error);
+    __DEV__ && console.error(`📞 decryptAudioPacket error:`, error);
     return null;
   }
 }
@@ -1451,7 +1451,7 @@ export function removeParticipantBySenderToken(senderToken: string): boolean {
       state.onParticipantLeft?.(peerId);
       state.onRemoteParticipantLeft?.(senderToken);
       removed = true;
-      console.log(`📞 Removed participant ${senderToken.slice(0, 8)}... from voiceCall session`);
+      __DEV__ && console.log(`📞 Removed participant ${senderToken.slice(0, 8)}... from voiceCall session`);
       break;
     }
   }
@@ -1553,7 +1553,7 @@ export function cleanupCallService(): void {
   // v15.0: Nettoyer le tracking des séquences
   cleanupSequenceTracking();
   
-  console.log('📞 Call service cleaned up');
+  __DEV__ && console.log('📞 Call service cleaned up');
 }
 
 export async function resetCallService(): Promise<void> {
@@ -1565,12 +1565,12 @@ export async function resetCallService(): Promise<void> {
   // v15.0: Réinitialiser le compteur de séquence
   resetSequenceCounter();
   
-  console.log('📞 Call service reset');
+  __DEV__ && console.log('📞 Call service reset');
 }
 
 export async function initializeCallService(): Promise<void> {
   cleanupProcessedCallIds();
   // v15.0: Nettoyer le tracking des séquences au démarrage
   cleanupSequenceTracking();
-  console.log('📞 Call service initialized');
+  __DEV__ && console.log('📞 Call service initialized');
 }

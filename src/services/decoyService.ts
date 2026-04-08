@@ -11,6 +11,7 @@
 import { encodeBase64, secureRandomIntRange } from './crypto';
 import { secureRpc } from './relayTransport';
 import { createSealedSenderEnvelope, isSealedSenderReady } from './sealedSender';
+import { generateRandomPushBlob } from './pushNotificationService';
 import * as Crypto from 'expo-crypto';
 import { AppState, AppStateStatus } from 'react-native';
 
@@ -276,14 +277,18 @@ async function sendDecoyMessage(forceTier?: 'small' | 'medium'): Promise<boolean
     // Wrapper dans une enveloppe sealed sender (identique aux vrais messages)
     const envelope = createSealedSenderEnvelope(tag, payload);
     
+    // SÉCURITÉ: Inclure un p_push_blob ALÉATOIRE de même taille que les vrais.
+    // Le Gateway forward chaque blob au Push Proxy sans distinction.
+    // Le Push Proxy ne peut pas déchiffrer → ignoré silencieusement.
     const { error } = await secureRpc('send_sealed_message', {
       p_tag: envelope.tag,
       p_sealed_content: envelope.sealedContent,
       p_version: envelope.version,
+      p_push_blob: generateRandomPushBlob(),
     });
 
     if (error) {
-      console.warn('[Decoy] ❌ RPC error:', error.message);
+      __DEV__ && console.warn('[Decoy] ❌ RPC error:', error.message);
       return false;
     }
 
@@ -293,7 +298,7 @@ async function sendDecoyMessage(forceTier?: 'small' | 'medium'): Promise<boolean
     return true;
 
   } catch (e) {
-    console.error('[Decoy] ❌ Exception:', e);
+    __DEV__ && console.error('[Decoy] ❌ Exception:', e);
     return false;
   }
 }

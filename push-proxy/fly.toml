@@ -1,0 +1,16 @@
+app = 'ghostr-push-proxy'
+primary_region = 'cdg'
+
+[build]
+
+[http_service]
+  internal_port = 3200
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1

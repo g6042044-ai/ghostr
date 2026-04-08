@@ -77,7 +77,10 @@ class CallCryptoService {
   private currentSessionId: string | null = null;
   private signalCallback: SignalCallback | null = null;
   
-  // Signal crypto de l'initiator en attente (reçu avant acceptCall)
+  // Signal crypto de l'initiateur en attente (reçu avant acceptCall).
+  // Le répondant peut recevoir le crypto_init AVANT d'appeler acceptCall().
+  // On stocke le signal complet (clés dérivées de l'initiateur) pour l'appliquer
+  // dès que initialize() est appelé côté répondant.
   private pendingInitiatorInit: SerializedCallRatchetInit | null = null;
   private pendingCallId: string | null = null;
   
@@ -141,73 +144,58 @@ class CallCryptoService {
     __DEV__ && console.log('[CallCrypto] 🔐 Initializing for call:', callId.slice(0, 16) + '...');
     
     try {
-      // Récupérer l'état de la session Triple Ratchet
-      const session = sessionService.getSession(sessionId);
-      if (!session) {
-        console.error('[CallCrypto] ❌ Session not found:', sessionId);
-        return { success: false, error: 'Session not found' };
-      }
-      
-      // CAS RESPONDER: Vérifier si on a reçu le signal de l'initiator en attente
+      // CAS RÉPONDANT: si on a reçu le signal de l'initiateur en attente,
+      // l'utiliser directement pour garantir des clés identiques.
+      // Le répondant peut avoir un rootKey Triple Ratchet différent de celui
+      // de l'initiateur (la session avance à chaque message), donc on ne peut
+      // pas dériver indépendamment — on utilise les clés de l'initiateur inversées.
       if (!isInitiator && this.pendingInitiatorInit && this.pendingCallId === callId) {
-        __DEV__ && console.log('[CallCrypto] 🔄 Using pending initiator keys (received before accept)');
+        __DEV__ && console.log('[CallCrypto] 🔄 Using initiator keys (received before accept)');
         
-        // Utiliser les clés de l'initiator (inversées) au lieu de dériver nos propres clés
         this.currentState = initializeCallRatchetFromInit(this.pendingInitiatorInit, callId);
         this.currentSessionId = sessionId;
-        
-        // Effacer le signal en attente
         this.pendingInitiatorInit = null;
         this.pendingCallId = null;
         
-        // Reset des compteurs
         this.encryptCount = 0;
         this.decryptCount = 0;
         this.decryptFailCount = 0;
         
         __DEV__ && console.log('[CallCrypto] ✅ Initialized as responder (using initiator keys)');
-        
-        // Envoyer notre init à l'autre partie (pour la clé DH publique)
-        await this.sendCryptoInit();
-        
-        // v1.1: Flusher les paquets audio reçus pendant l'attente d'initialisation
+        this.sendCryptoInit();
         this.flushPendingAudioPackets();
-        
         return { success: true };
       }
       
-      // CAS INITIATOR ou pas de signal en attente: Dériver nos propres clés
-      const sharedSecret = await this.getSharedSecretFromSession(sessionId);
-      if (!sharedSecret) {
-        console.error('[CallCrypto] ❌ Could not get shared secret');
+      // CAS INITIATEUR (ou répondant sans signal en attente):
+      // Dériver les clés depuis l'état session courant.
+      const secretResult = await this.getSharedSecretFromSession(sessionId);
+      if (!secretResult) {
+        __DEV__ && console.error('[CallCrypto] ❌ Could not get shared secret');
         return { success: false, error: 'Could not derive call keys' };
       }
       
-      // Initialiser l'état Call Ratchet
       this.currentState = await initializeCallRatchetFromSecret(
-        sharedSecret,
+        secretResult.sharedSecret,
         callId,
-        isInitiator
+        isInitiator,
+        secretResult.pqSecret ?? undefined
       );
       this.currentSessionId = sessionId;
       
-      // Reset des compteurs
       this.encryptCount = 0;
       this.decryptCount = 0;
       this.decryptFailCount = 0;
       
       __DEV__ && console.log('[CallCrypto] ✅ Initialized as', isInitiator ? 'initiator' : 'responder');
       
-      // Envoyer notre init à l'autre partie
-      await this.sendCryptoInit();
-      
-      // v1.1: Flusher les paquets audio reçus pendant l'attente d'initialisation
+      // Envoyer nos clés (+ DH public key) à l'autre partie
+      this.sendCryptoInit();
       this.flushPendingAudioPackets();
-      
       return { success: true };
       
     } catch (error) {
-      console.error('[CallCrypto] ❌ Initialize error:', error);
+      __DEV__ && console.error('[CallCrypto] ❌ Initialize error:', error);
       return { success: false, error: String(error) };
     }
   }
@@ -216,7 +204,10 @@ class CallCryptoService {
    * Récupère le secret partagé depuis la session pour dérivation
    * Utilise la rootKey de la session comme base
    */
-  private async getSharedSecretFromSession(sessionId: string): Promise<Uint8Array | null> {
+  private async getSharedSecretFromSession(sessionId: string): Promise<{
+    sharedSecret: Uint8Array;
+    pqSecret: Uint8Array | null;
+  } | null> {
     try {
       const session = sessionService.getSession(sessionId);
       if (!session || !session.tripleRatchetState) {
@@ -225,33 +216,54 @@ class CallCryptoService {
       
       // La rootKey est dans l'état sérialisé
       const serializedState = session.tripleRatchetState;
-      if (serializedState.rootKey) {
-        return decodeBase64(serializedState.rootKey);
+      if (!serializedState.rootKey) {
+        return null;
       }
       
-      return null;
+      const sharedSecret = decodeBase64(serializedState.rootKey);
+      
+      // P2 FIX: Extraire le pqSecret SPQR pour protection post-quantique.
+      // Sans ça, initializeCallRatchetFromSecret dérive les clés d'appel
+      // uniquement à partir du rootKey classique (X25519), ce qui est
+      // vulnérable à un adversaire avec un ordinateur quantique.
+      // Avec pqSecret, le matériel ML-KEM est mixé dans la dérivation.
+      let pqSecret: Uint8Array | null = null;
+      if (serializedState.spqr?.pqSecret) {
+        pqSecret = decodeBase64(serializedState.spqr.pqSecret);
+        __DEV__ && console.log('[CallCrypto] 🔐 PQ secret available from SPQR state');
+      } else {
+        __DEV__ && console.log('[CallCrypto] ⚠️ No PQ secret in SPQR — call will use classical keys only');
+      }
+      
+      return { sharedSecret, pqSecret };
     } catch (error) {
-      console.error('[CallCrypto] Error getting shared secret:', error);
+      __DEV__ && console.error('[CallCrypto] Error getting shared secret:', error);
       return null;
     }
   }
   
   /**
-   * Envoie les données d'initialisation crypto à l'autre partie
+   * Envoie les données d'initialisation crypto à l'autre partie.
+   * FIRE-AND-FORGET: Don't await the network round-trip.
+   * The crypto init just shares our DH key — we already have the shared secret
+   * and can encrypt/decrypt audio immediately.
    */
-  private async sendCryptoInit(): Promise<void> {
+  private sendCryptoInit(): void {
     if (!this.currentState || !this.currentSessionId || !this.signalCallback) {
       return;
     }
     
     const initData = createCallRatchetInit(this.currentState);
     
-    await this.signalCallback(this.currentSessionId, {
+    // Fire-and-forget — don't block on OHTTP round-trip
+    this.signalCallback(this.currentSessionId, {
       type: 'call_crypto_init',
       init: initData,
+    }).then(() => {
+      __DEV__ && console.log('[CallCrypto] ✅ Crypto init sent');
+    }).catch(err => {
+      __DEV__ && console.warn('[CallCrypto] ⚠️ Crypto init send failed (non-blocking):', err);
     });
-    
-    __DEV__ && console.log('[CallCrypto] ✅ Crypto init sent');
   }
   
   // ============================================
@@ -263,7 +275,7 @@ class CallCryptoService {
    */
   encryptAudio(audioData: Uint8Array): Uint8Array | null {
     if (!this.currentState) {
-      console.warn('[CallCrypto] No state for encryption');
+      __DEV__ && console.warn('[CallCrypto] No state for encryption');
       return null;
     }
     
@@ -284,7 +296,7 @@ class CallCryptoService {
       return packet;
       
     } catch (error) {
-      console.error('[CallCrypto] ❌ Encrypt error:', error);
+      __DEV__ && console.error('[CallCrypto] ❌ Encrypt error:', error);
       return null;
     }
   }
@@ -311,7 +323,7 @@ class CallCryptoService {
         // Buffer plein, on doit dropper
         this.pendingAudioDroppedCount++;
         if (this.pendingAudioDroppedCount === 1 || this.pendingAudioDroppedCount % 10 === 0) {
-          console.warn(`[CallCrypto] ⚠️ Audio buffer full, dropped ${this.pendingAudioDroppedCount} packets`);
+          __DEV__ && console.warn(`[CallCrypto] ⚠️ Audio buffer full, dropped ${this.pendingAudioDroppedCount} packets`);
         }
       }
       return null;
@@ -346,14 +358,14 @@ class CallCryptoService {
         
         // Log des échecs
         if (this.decryptFailCount % 10 === 1) {
-          console.warn(`[CallCrypto] ⚠️ Decrypt failures: ${this.decryptFailCount}`);
+          __DEV__ && console.warn(`[CallCrypto] ⚠️ Decrypt failures: ${this.decryptFailCount}`);
         }
       }
       
       return audioData;
       
     } catch (error) {
-      console.error('[CallCrypto] ❌ Decrypt error:', error);
+      __DEV__ && console.error('[CallCrypto] ❌ Decrypt error:', error);
       this.decryptFailCount++;
       return null;
     }
@@ -372,7 +384,7 @@ class CallCryptoService {
     }
     
     if (!this.currentState) {
-      console.warn('[CallCrypto] ⚠️ Cannot flush: no state');
+      __DEV__ && console.warn('[CallCrypto] ⚠️ Cannot flush: no state');
       return;
     }
     
@@ -393,7 +405,7 @@ class CallCryptoService {
           try {
             this.onDecryptedAudio(result);
           } catch (e) {
-            console.error('[CallCrypto] ❌ onDecryptedAudio callback error:', e);
+            __DEV__ && console.error('[CallCrypto] ❌ onDecryptedAudio callback error:', e);
           }
         }
       } else {
@@ -431,23 +443,28 @@ class CallCryptoService {
     if (shouldRotateDH(this.currentState)) {
       __DEV__ && console.log('[CallCrypto] 🔄 DH+PQ rotation needed (initiator ping-pong v5.0)');
       
-      const { message, newState } = prepareDHRotation(this.currentState);
-      this.currentState = newState;
+      // SECURITY FIX P3: Sauvegarder l'état PRÉ-rotation avant de l'appliquer.
+      // Si l'envoi du signal échoue, on ROLLBACK vers l'état sauvegardé.
+      // Sans ça : état local avancé (rotationPendingResponse=true) mais le pair
+      // n'a jamais reçu la rotation → désynchronisation permanente des clés,
+      // forward secrecy dégradée jusqu'au prochain restart.
+      const stateBeforeRotation = this.currentState;
       
-      // v5.0: Envoi de la rotation REQUEST. Le responder répondra automatiquement
-      // via handleSignal → processDHRotation → responseMessage.
+      const { message, newState } = prepareDHRotation(this.currentState);
+      this.currentState = newState; // Application optimiste
+      
       try {
         await this.signalCallback(this.currentSessionId, {
           type: 'call_crypto_dh_rotation',
           rotation: message,
         });
         __DEV__ && console.log('[CallCrypto] ✅ DH+PQ rotation REQUEST sent, keyId:', message.keyId);
+        // Envoi OK — on garde le nouvel état
       } catch (error) {
-        // La rotation locale est appliquée (rotationPendingResponse=true).
-        // L'initiator ne re-déclenchera pas tant que rotationPendingResponse est true.
-        // Si le signal ne passe pas, la rotation sera relancée quand le timer re-trigger
-        // après que rotationPendingResponse ait été manuellement reset (ou app restart).
-        console.warn('[CallCrypto] ⚠️ DH rotation REQUEST send failed:', error);
+        // ROLLBACK : annuler la rotation locale pour rester synchronisé avec le pair
+        __DEV__ && console.warn('[CallCrypto] ⚠️ DH rotation REQUEST failed — rolling back local state:', error);
+        this.currentState = stateBeforeRotation;
+        // La prochaine invocation de shouldRotateDH re-déclenchera la rotation
       }
     }
   }
@@ -464,56 +481,64 @@ class CallCryptoService {
       case 'call_crypto_init':
         __DEV__ && console.log('[CallCrypto] 📨 Received crypto init from', signal.init.isInitiator ? 'initiator' : 'responder');
         
-        // Si on reçoit l'init de l'INITIATOR
         if (signal.init.isInitiator) {
-          // Récupérer le callId depuis le signal si pas fourni
           const effectiveCallId = callId || signal.init.callId;
           
-          // CAS 1: On n'a pas encore d'état (signal reçu avant acceptCall)
-          // Stocker le signal en attente pour l'utiliser dans initialize()
           if (!this.currentState) {
+            // Répondant pas encore initialisé — stocker pour initialize()
             __DEV__ && console.log('[CallCrypto] 📦 Storing initiator init for later (no state yet)');
             this.pendingInitiatorInit = signal.init;
             this.pendingCallId = effectiveCallId;
             return;
           }
           
-          // CAS 2: On a déjà un état mais on reçoit les clés de l'initiator
-          // Cela peut arriver si le signal arrive après initialize() du responder
-          // Dans ce cas, on doit remplacer notre état avec les clés de l'initiator
+          // v30.1 FIX: If state exists but belongs to a DIFFERENT call (old call
+          // still being cleaned up), store as pending instead of replacing.
+          // The old call's cleanup will clear currentState but preserve
+          // pendingInitiatorInit (via FIX #7). Then initialize() for the
+          // new call will pick up the correct initiator keys.
+          //
+          // BEFORE: This path tried to replace the old call's state with the
+          // new call's init data. But initializeCallRatchetFromInit() validates
+          // that the callId matches → CallId mismatch error. Even if it succeeded,
+          // cleanup would immediately destroy the replaced state.
+          if (effectiveCallId && this.currentState.callId !== effectiveCallId) {
+            __DEV__ && console.log('[CallCrypto] 📦 Storing initiator init for later (state belongs to different call:', this.currentState.callId.slice(0, 16), '→', effectiveCallId.slice(0, 16), ')');
+            this.pendingInitiatorInit = signal.init;
+            this.pendingCallId = effectiveCallId;
+            return;
+          }
+          
+          // État déjà initialisé mais init de l'initiateur reçu après
+          // (rare — peut arriver si le signal arrive après acceptCall)
           if (!effectiveCallId) {
-            console.error('[CallCrypto] ❌ No callId for init processing');
+            __DEV__ && console.error('[CallCrypto] ❌ No callId for init processing');
             return;
           }
           
           try {
-            __DEV__ && console.log('[CallCrypto] 🔄 Replacing state with initiator keys');
+            __DEV__ && console.log('[CallCrypto] 🔄 Replacing state with initiator keys (late arrival)');
             cleanupCallRatchetState(this.currentState);
-            
-            // Créer le nouvel état avec les clés de l'initiator (inversées)
             this.currentState = initializeCallRatchetFromInit(signal.init, effectiveCallId);
             __DEV__ && console.log('[CallCrypto] ✅ State synchronized with initiator keys');
-            
-            // v1.1: Flusher les paquets audio bufferisés
             this.flushPendingAudioPackets();
           } catch (error) {
-            console.error('[CallCrypto] ❌ Failed to process initiator init:', error);
+            __DEV__ && console.error('[CallCrypto] ❌ Failed to process initiator init:', error);
           }
         } else {
-          // Le signal vient du responder, on est l'initiator
-          // Juste mettre à jour theirDHKey
+          // Signal du répondant → on est l'initiateur, mettre à jour la clé DH
           if (this.currentState) {
             this.currentState = processCallRatchetInit(this.currentState, signal.init);
             __DEV__ && console.log('[CallCrypto] ✅ Updated with responder DH key');
           } else {
-            console.warn('[CallCrypto] ⚠️ Received responder init but no state');
+            __DEV__ && console.warn('[CallCrypto] ⚠️ Received responder init but no state');
           }
         }
         break;
         
       case 'call_crypto_dh_rotation':
         if (!this.currentState) {
-          console.warn('[CallCrypto] No state for DH rotation');
+          __DEV__ && console.warn('[CallCrypto] No state for DH rotation');
           return;
         }
         __DEV__ && console.log('[CallCrypto] 📨 Received DH rotation, keyId:', signal.rotation.keyId,
@@ -533,7 +558,7 @@ class CallCryptoService {
             });
             __DEV__ && console.log('[CallCrypto] ✅ DH+PQ rotation RESPONSE sent, keyId:', responseMessage.keyId);
           } catch (error) {
-            console.warn('[CallCrypto] ⚠️ DH rotation response send failed:', error);
+            __DEV__ && console.warn('[CallCrypto] ⚠️ DH rotation response send failed:', error);
           }
         }
         break;
@@ -647,7 +672,7 @@ class CallCryptoService {
       this.currentSessionId = sessionId;
       return true;
     } catch (error) {
-      console.error('[CallCrypto] Failed to restore state:', error);
+      __DEV__ && console.error('[CallCrypto] Failed to restore state:', error);
       return false;
     }
   }
@@ -683,7 +708,7 @@ export function handleCallCryptoSignal(signal: CallCryptoSignal, callId?: string
   // v5.0: handleSignal is now async (sends DH rotation responses).
   // Fire-and-forget is safe: errors are caught inside handleSignal.
   callCryptoService.handleSignal(signal, callId).catch(err => {
-    console.warn('[CallCrypto] handleSignal error:', err);
+    __DEV__ && console.warn('[CallCrypto] handleSignal error:', err);
   });
 }
 

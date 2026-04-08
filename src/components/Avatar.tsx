@@ -21,6 +21,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import { generateColorFromToken, generateAvatarInitials, AVATAR_COLORS } from '../services/crypto';
+import { Ionicons } from '@expo/vector-icons';
 
 // ============================================
 // TYPES
@@ -33,7 +34,7 @@ interface AvatarProps {
   avatarUri?: string;           // URL ou base64 de l'image
   
   // Style
-  size?: 'tiny' | 'small' | 'medium' | 'large' | 'xlarge';
+  size?: 'tiny' | 'small' | 'medium' | 'large' | 'xlarge' | 'call';
   style?: ViewStyle;
   
   // États
@@ -58,6 +59,7 @@ const SIZES = {
   medium: { container: 40, text: 15, badge: 14, onlineBadge: 12, border: 2 },
   large: { container: 52, text: 20, badge: 16, onlineBadge: 14, border: 2.5 },
   xlarge: { container: 80, text: 28, badge: 20, onlineBadge: 18, border: 3 },
+  call: { container: 110, text: 38, badge: 22, onlineBadge: 20, border: 3 },
 };
 
 // Palette WhatsApp-like pour les avatars
@@ -95,16 +97,22 @@ export function Avatar({
   borderColor,
 }: AvatarProps) {
   const dimensions = SIZES[size];
-  const [imageLoading, setImageLoading] = useState(true);
+  const [imageLoading, setImageLoading] = useState(false);
   const [imageError, setImageError] = useState(false);
   const pulseAnim = React.useRef(new Animated.Value(1)).current;
   
   // v27.1: Reset l'état d'erreur quand l'URI change.
   // Sans ça, si le chargement précédent échouait, le nouvel avatar
   // ne s'affichait jamais (imageError restait true → fallback initiales).
+  //
+  // FIX: NE PAS remettre imageLoading=true ici.
+  // Pour les data URIs base64, l'image se charge depuis la mémoire (quasi-instant).
+  // Le cycle est: mount → Image render → onLoadEnd (sync) → useEffect (async, après paint).
+  // Si on met setImageLoading(true) dans useEffect, il s'exécute APRÈS que onLoadEnd
+  // ait mis imageLoading=false → le spinner réapparaît et plus rien ne le désactive.
+  // onLoadStart gère déjà le passage à true quand une nouvelle image commence à charger.
   useEffect(() => {
     setImageError(false);
-    setImageLoading(true);
   }, [avatarUri]);
   
   // Animation de pulsation pour le typing
@@ -168,9 +176,9 @@ export function Avatar({
             style={[
               styles.image,
               {
-                width: dimensions.container,
-                height: dimensions.container,
-                borderRadius: dimensions.container / 2,
+                width: '100%',
+                height: '100%',
+                borderRadius: 9999,
               },
             ]}
             onLoadStart={() => setImageLoading(true)}
@@ -363,7 +371,7 @@ export function EditableAvatar({
             },
           ]}
         >
-          <Text style={styles.editIcon}>📷</Text>
+          <Ionicons name="camera" size={14} color="#FFFFFF" />
         </View>
       )}
     </View>

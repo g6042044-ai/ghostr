@@ -79,6 +79,7 @@ export function InviteDetailScreen() {
           contactName,
           inviteLabel: acceptedInvite.label,
           inviteTag: acceptedInvite.tag,
+          contactAvatarBase64: session.theirProfile.avatarBase64,
         });
       }
     });
@@ -180,7 +181,7 @@ export function InviteDetailScreen() {
 
       <ScrollView
         style={styles.scroll}
-        contentContainerStyle={styles.scrollContent}
+        contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 24 }]}
         showsVerticalScrollIndicator={false}
       >
         {/* QR Code */}
@@ -235,6 +236,7 @@ export function InviteDetailScreen() {
             </View>
           ))}
         </View>
+
       </ScrollView>
     </View>
   );
@@ -243,7 +245,7 @@ export function InviteDetailScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: theme.colors.background },
   scroll: { flex: 1 },
-  scrollContent: { paddingBottom: 40 },
+  scrollContent: {},
 
   header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, gap: 12 },
   backButton: { width: 36, height: 36, borderRadius: 18, backgroundColor: theme.colors.surface, alignItems: 'center', justifyContent: 'center' },
@@ -287,6 +289,15 @@ const styles = StyleSheet.create({
   securityTitle: { fontSize: 13, fontWeight: '700', color: theme.colors.textSecondary, marginBottom: 14 },
   securityRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, marginBottom: 10 },
   securityText: { fontSize: 13, color: theme.colors.textMuted, flex: 1, lineHeight: 18 },
+
+  inviteTagline: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: theme.colors.primary,
+    textAlign: 'center',
+    marginTop: 24,
+    opacity: 0.6,
+  },
 });
 
 export default InviteDetailScreen;

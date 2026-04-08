@@ -27,16 +27,19 @@ import { sessionService, StoredSession } from '../services/tripleRatchet';
 import { pendingInviteStore, PendingInvite } from '../services/pendingInvites';
 import { inviteWatcher } from '../services/inviteWatcher';
 import { showInAppNotification } from '../components/InAppNotification';
-import { subscribeToAllMessages1to1, getAllUnreadCounts, pollAllSessions, getLocalMessages1to1 } from '../services/api1to1';
+import { subscribeToAllMessages1to1, getAllUnreadCounts, pollAllSessions, getLocalMessages1to1, clearLocalMessages1to1, clearUnreadCount } from '../services/api1to1';
 import { getDeviceId } from '../services/storage';
+import { isInCall1to1 } from '../services/call1to1Service';
 import {
   theme,
   ActionSheet,
   AlertModal,
 } from '../components/ui';
+import { getAvatarColor } from '../components/ui/theme';
 import { CallIndicator } from '../components/CallIndicator';
 import { startHeartbeatService, hasActiveCall } from '../services/callHeartbeat';
 import { formatCallDuration } from '../services/callMessages';
+import { generateAvatarInitials } from '../services/crypto';
 
 type RootStackParamList = {
   ConversationList: undefined;
@@ -45,6 +48,7 @@ type RootStackParamList = {
   Join1to1: undefined;
   Invitations: undefined;
   InviteDetail: { tag: string };
+  ConnectionSuccess: { sessionId: string; contactName: string; inviteLabel: string; inviteTag?: string; contactAvatarBase64?: string };
   Settings: undefined;
 };
 
@@ -89,6 +93,57 @@ interface ConversationItem {
   avatarBase64?: string;
   lastMessage?: LastMessageInfo;
 }
+
+// ============================================
+// PERF: Fonctions et composants purs extraits au niveau module.
+// Définis à l'intérieur du composant, ils étaient recréés à chaque render,
+// ce qui forçait FlatList à re-rendre TOUTES les lignes à chaque changement
+// d'état (ex: ouverture du menu FAB → re-render de 10+ lignes).
+// ============================================
+
+function formatTime(timestamp?: number): string {
+  if (!timestamp) return '';
+  const date = new Date(timestamp);
+  const now = new Date();
+  const diff = now.getTime() - date.getTime();
+  
+  if (diff < 60000) return 'À l\'instant';
+  if (diff < 3600000) return `${Math.floor(diff / 60000)} min`;
+  if (diff < 86400000) return date.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  if (diff < 604800000) return date.toLocaleDateString('fr-FR', { weekday: 'short' });
+  return date.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' });
+}
+
+const MessageStatusIcon = React.memo(({ status }: { status?: string }) => {
+  switch (status) {
+    case 'read':
+      return (
+        <View style={_statusStyles.icon}>
+          <Ionicons name="checkmark-done" size={16} color="#53BDEB" />
+        </View>
+      );
+    case 'delivered':
+      return (
+        <View style={_statusStyles.icon}>
+          <Ionicons name="checkmark-done" size={16} color={theme.colors.textMuted} />
+        </View>
+      );
+    case 'sent':
+    case 'sending':
+    default:
+      return (
+        <View style={_statusStyles.icon}>
+          <Ionicons name="checkmark" size={16} color={theme.colors.textMuted} />
+        </View>
+      );
+  }
+});
+
+const _statusStyles = StyleSheet.create({
+  icon: { marginRight: 4, marginTop: 1 },
+});
+
+const _keyExtractor = (item: ConversationItem) => item.id;
 
 export function ConversationListScreen() {
   const navigation = useNavigation<NavigationProp>();
@@ -161,6 +216,76 @@ export function ConversationListScreen() {
     return () => unsub();
   }, []);
 
+  // PERF A6: Cache du dernier message par session.
+  // Au lieu de charger TOUS les messages de TOUTES les sessions (O(n×m)) à chaque refresh,
+  // on maintient un cache qui est rempli une seule fois puis mis à jour incrémentalement
+  // par subscribeToAllMessages1to1. loadConversations passe de O(n×m) à O(n).
+  const lastMessageCacheRef = useRef<Map<string, LastMessageInfo>>(new Map());
+  const cacheFilledRef = useRef(false);
+
+  // Helper: convertit un message brut en LastMessageInfo pour le cache/affichage
+  const messageToLastInfo = useCallback((msg: any): LastMessageInfo => {
+    let msgType: 'text' | 'image' | 'file' | 'voice' | 'call' = 'text';
+    let content = msg.content || '';
+
+    if (msg.messageType === 'image' || msg.imageData) {
+      msgType = 'image';
+      content = '📷 Photo';
+    } else if (msg.messageType === 'file' || msg.fileData) {
+      msgType = 'file';
+      content = '📎 ' + (msg.fileName || 'Fichier');
+    } else if (msg.messageType === 'voice' || msg.voiceData) {
+      msgType = 'voice';
+      content = '🎤 Message vocal';
+    } else {
+      // Tenter de parser comme message d'appel
+      const trimmed = (msg.content || '').trim();
+      if (trimmed.startsWith('{') && trimmed.includes('type')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed.type === 'call') {
+            msgType = 'call';
+            if (parsed.status === 'ended' && parsed.duration > 0) {
+              content = `📞 Appel vocal (${formatCallDuration(parsed.duration)})`;
+            } else if (parsed.status === 'missed') {
+              content = '📞 Appel manqué';
+            } else if (parsed.status === 'declined') {
+              content = '📞 Appel refusé';
+            } else if (parsed.status === 'cancelled') {
+              content = '📞 Appel annulé';
+            } else {
+              content = '📞 Appel vocal';
+            }
+          }
+        } catch {
+          // Fallback regex pour les JSON malformés
+          if (trimmed.includes('call')) {
+            const statusMatch = trimmed.match(/status\s*[":]\s*["']?(\w+)["']?/i);
+            const status = statusMatch ? statusMatch[1].toLowerCase() : '';
+            if (status === 'missed') { msgType = 'call'; content = '📞 Appel manqué'; }
+            else if (status === 'declined') { msgType = 'call'; content = '📞 Appel refusé'; }
+            else if (status === 'cancelled') { msgType = 'call'; content = '📞 Appel annulé'; }
+            else if (status === 'ended') {
+              msgType = 'call';
+              const durMatch = trimmed.match(/duration\s*[":]\s*(\d+)/i);
+              content = durMatch && parseInt(durMatch[1]) > 0
+                ? `📞 Appel vocal (${formatCallDuration(parseInt(durMatch[1]))})`
+                : '📞 Appel vocal';
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      content,
+      timestamp: msg.timestamp,
+      isMine: msg.isMine,
+      status: msg.status as 'sent' | 'delivered' | 'read' | undefined,
+      type: msgType,
+    };
+  }, []);
+
   // v16.0: Charger les conversations avec le dernier message
   const loadConversations = useCallback(async () => {
     try {
@@ -170,118 +295,33 @@ export function ConversationListScreen() {
       // v6.1: Charger les compteurs de messages non lus
       const unreadCounts = await getAllUnreadCounts();
       
-      // v16.0: Charger le dernier message pour chaque session
+      // PERF A6: Utiliser le cache du dernier message quand il est rempli.
+      // Premier appel (cacheFilledRef.current === false) :
+      //   → Charger les messages de chaque session depuis AsyncStorage (O(n×m))
+      //   → Remplir le cache
+      // Appels suivants (cacheFilledRef.current === true) :
+      //   → Utiliser directement le cache (O(n))
+      //   → Le cache est mis à jour incrémentalement par subscribeToAllMessages1to1
+      const needsFullLoad = !cacheFilledRef.current;
+      
       const convsPromises = sessions.map(async (session) => {
         let lastMessage: LastMessageInfo | undefined;
         
-        try {
-          const messages = await getLocalMessages1to1(session.id);
-          if (messages.length > 0) {
-            // Trier par timestamp desc et prendre le premier
-            const sorted = messages.sort((a, b) => b.timestamp - a.timestamp);
-            const last = sorted[0];
-            
-            // Déterminer le type de message
-            let msgType: 'text' | 'image' | 'file' | 'voice' | 'call' = 'text';
-            let content = last.content;
-            
-            // v19.1: Fonction helper pour parser les messages d'appel 1:1
-            const tryParseCallMessage1to1 = (messageContent: string): { isCall: boolean; formatted: string } => {
-              if (!messageContent) {
-                return { isCall: false, formatted: messageContent || '' };
-              }
-              
-              const trimmed = messageContent.trim();
-              
-              // Vérifier si ça ressemble à un JSON d'appel
-              if (!trimmed.startsWith('{') || !trimmed.includes('type')) {
-                return { isCall: false, formatted: messageContent };
-              }
-              
-              try {
-                const parsed = JSON.parse(trimmed);
-                if (parsed.type === 'call') {
-                  let formatted = '📞 Appel vocal';
-                  
-                  if (parsed.status === 'ended' && parsed.duration > 0) {
-                    formatted = `📞 Appel vocal (${formatCallDuration(parsed.duration)})`;
-                  } else if (parsed.status === 'missed') {
-                    formatted = '📞 Appel manqué';
-                  } else if (parsed.status === 'declined') {
-                    formatted = '📞 Appel refusé';
-                  } else if (parsed.status === 'cancelled') {
-                    formatted = '📞 Appel annulé';
-                  } else if (parsed.status === 'ended') {
-                    formatted = '📞 Appel vocal';
-                  }
-                  
-                  return { isCall: true, formatted };
-                }
-              } catch {
-                // v19.2: Si JSON.parse échoue, essayer de détecter manuellement avec regex
-                // Format possible: {"type" : "call", "status" : "declined", ...}
-                if (trimmed.includes('type') && trimmed.includes('call')) {
-                  // Extraire le status avec une regex flexible
-                  const statusMatch = trimmed.match(/status\s*[":]\s*["']?(\w+)["']?/i);
-                  const status = statusMatch ? statusMatch[1].toLowerCase() : '';
-                  
-                  if (status === 'missed') {
-                    return { isCall: true, formatted: '📞 Appel manqué' };
-                  } else if (status === 'declined') {
-                    return { isCall: true, formatted: '📞 Appel refusé' };
-                  } else if (status === 'cancelled') {
-                    return { isCall: true, formatted: '📞 Appel annulé' };
-                  } else if (status === 'ended') {
-                    // Essayer d'extraire la durée
-                    const durationMatch = trimmed.match(/duration\s*[":]\s*(\d+)/i);
-                    if (durationMatch && parseInt(durationMatch[1]) > 0) {
-                      return { isCall: true, formatted: `📞 Appel vocal (${formatCallDuration(parseInt(durationMatch[1]))})` };
-                    }
-                    return { isCall: true, formatted: '📞 Appel vocal' };
-                  } else {
-                    return { isCall: true, formatted: '📞 Appel vocal' };
-                  }
-                }
-              }
-              
-              return { isCall: false, formatted: messageContent };
-            };
-            
-            if (last.messageType === 'image' || last.imageData) {
-              msgType = 'image';
-              content = '📷 Photo';
-            } else if (last.messageType === 'file' || last.fileData) {
-              msgType = 'file';
-              content = '📎 ' + (last.fileName || 'Fichier');
-            } else if (last.messageType === 'voice' || last.voiceData) {
-              msgType = 'voice';
-              content = '🎤 Message vocal';
-            } else if (last.messageType === 'call' || last.messageType === 'system') {
-              // v19.1: Messages de type call ou system - parser le JSON
-              const callResult = tryParseCallMessage1to1(last.content);
-              if (callResult.isCall) {
-                msgType = 'call';
-                content = callResult.formatted;
-              }
-            } else {
-              // v19.1: Essayer de parser comme message d'appel (fallback pour tout type)
-              const callResult = tryParseCallMessage1to1(last.content);
-              if (callResult.isCall) {
-                msgType = 'call';
-                content = callResult.formatted;
-              }
+        if (needsFullLoad) {
+          // Premier chargement : lire depuis le stockage et remplir le cache
+          try {
+            const messages = await getLocalMessages1to1(session.id);
+            if (messages.length > 0) {
+              const sorted = messages.sort((a, b) => b.timestamp - a.timestamp);
+              lastMessage = messageToLastInfo(sorted[0]);
+              lastMessageCacheRef.current.set(session.id, lastMessage);
             }
-            
-            lastMessage = {
-              content,
-              timestamp: last.timestamp,
-              isMine: last.isMine,
-              status: last.status as 'sent' | 'delivered' | 'read' | undefined,
-              type: msgType,
-            };
+          } catch (e) {
+            // Ignorer les erreurs de chargement de messages
           }
-        } catch (e) {
-          // Ignorer les erreurs de chargement de messages
+        } else {
+          // Appels suivants : utiliser le cache (instantané)
+          lastMessage = lastMessageCacheRef.current.get(session.id);
         }
         
         return {
@@ -299,12 +339,17 @@ export function ConversationListScreen() {
       const convs = await Promise.all(convsPromises);
       convs.sort((a, b) => (b.lastMessageAt || b.createdAt) - (a.lastMessageAt || a.createdAt));
       setConversations(convs);
+      
+      if (needsFullLoad) {
+        cacheFilledRef.current = true;
+      }
+      
       return convs;
     } catch (error) {
       console.error('[ConversationList] Error loading:', error);
       return [];
     }
-  }, []);
+  }, [messageToLastInfo]);
 
   // S'assurer que l'inviteWatcher tourne et réagir aux acceptations
   useEffect(() => {
@@ -313,23 +358,15 @@ export function ConversationListScreen() {
     const unsub = inviteWatcher.onAccepted((session, invite) => {
       console.log(`[ConversationList] 🎉 Invite accepted: ${invite.label} → ${session.theirProfile.displayName}`);
       loadConversations();
+      
+      // Naviguer vers l'écran de célébration (pas de notification toast)
       const contactName = session.theirProfile.displayName || 'Contact';
-      const colors = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#A78BFA','#F7DC6F','#DDA0DD','#FF8C42','#6BCB77','#4D96FF'];
-      let h = 0;
-      for (let i = 0; i < contactName.length; i++) h = contactName.charCodeAt(i) + ((h << 5) - h);
-      showInAppNotification({
-        id: `accept_${invite.tag}`,
-        title: 'Connexion établie',
-        body: `${contactName} a rejoint via ${invite.label}`,
-        avatarInitial: contactName.charAt(0).toUpperCase(),
-        avatarColor: colors[Math.abs(h) % colors.length],
-        showCheckBadge: true,
-        onPress: () => {
-          navigation.navigate('Conversation', {
-            conversationId: session.id,
-            conversationName: contactName,
-          });
-        },
+      navigation.navigate('ConnectionSuccess', {
+        sessionId: session.id,
+        contactName,
+        inviteLabel: invite.label,
+        inviteTag: invite.tag,
+        contactAvatarBase64: session.theirProfile.avatarBase64,
       });
     });
     return () => unsub();
@@ -342,6 +379,11 @@ export function ConversationListScreen() {
       inviteWatcher.ensureRunning();
       inviteWatcher.forcePoll();
 
+      // PERF A5: Un seul poll au focus, pas de setInterval.
+      // Le polling continu est déjà assuré par constantTraffic.ts (5s via OHTTP).
+      // Le rafraîchissement de la liste est déclenché par subscribeToAllMessages1to1
+      // (useEffect ligne ~377) qui appelle loadConversations() à chaque nouveau message.
+      // L'ancien setInterval(3000) doublait les requêtes OHTTP → supprimé.
       const initAndLoad = async () => {
         try {
           await pollAllSessions();
@@ -354,17 +396,18 @@ export function ConversationListScreen() {
       
       initAndLoad();
       
-      const pollInterval = setInterval(async () => {
-        try {
-          await pollAllSessions();
-          await loadConversations();
-        } catch (e) {
-          console.error('[ConversationList] Poll error:', e);
-        }
-      }, 3000);
-      
       return () => {
-        clearInterval(pollInterval);
+        // PERF A6 FIX: Invalider le cache quand l'écran perd le focus.
+        // Quand l'utilisateur navigue vers ConversationScreen et envoie un message,
+        // ce message est sauvegardé localement via saveLocalMessage1to1 mais ne passe
+        // PAS par subscribeToAllMessages1to1 (qui ne notifie que les messages du poll
+        // serveur). Sans cette invalidation, le cache conserverait l'ancien dernier
+        // message et le message envoyé n'apparaîtrait pas au retour.
+        //
+        // Le cache reste utile pour les rafraîchissements rapides déclenchés par
+        // les messages entrants pendant que l'écran EST visible (subscribe callback
+        // met à jour le cache → loadConversations utilise le cache = instantané).
+        cacheFilledRef.current = false;
       };
     }, [loadConversations])
   );
@@ -379,7 +422,16 @@ export function ConversationListScreen() {
     const SILENT_TYPES = new Set(['read_receipt', 'delivered_receipt', 'typing', 'call_signal', 'handshake_ack', 'reaction']);
     
     const unsubscribe = subscribeToAllMessages1to1((sessionId, message) => {
-      console.log('[ConversationList] New message received, refreshing...');
+      // PERF A6: Mettre à jour le cache du dernier message AVANT de rafraîchir la liste.
+      // Cela évite que loadConversations recharge tous les messages depuis AsyncStorage.
+      // Le cache est mis à jour si ce message est plus récent que l'entrée actuelle.
+      if (!SILENT_TYPES.has(message.messageType as string)) {
+        const cached = lastMessageCacheRef.current.get(sessionId);
+        if (!cached || message.timestamp >= cached.timestamp) {
+          lastMessageCacheRef.current.set(sessionId, messageToLastInfo(message));
+        }
+      }
+      
       loadConversations();
       
       // Notification in-app pour les messages entrants visibles uniquement
@@ -421,8 +473,10 @@ export function ConversationListScreen() {
         id: `msg_${message.id}`,
         title: contactName,
         body,
-        avatarInitial: contactName.charAt(0).toUpperCase(),
+        avatarInitial: generateAvatarInitials(contactName),
         avatarColor: colors[Math.abs(h) % colors.length],
+        avatarUri: message.senderAvatarBase64 || sessionService.getSession(sessionId)?.theirProfile?.avatarBase64 || undefined,
+        playSound: true,
         duration: 4000,
         onPress: () => {
           navigation.navigate('Conversation', {
@@ -436,7 +490,7 @@ export function ConversationListScreen() {
     return () => {
       unsubscribe();
     };
-  }, [loadConversations, navigation]);
+  }, [loadConversations, messageToLastInfo, navigation]);
 
   useEffect(() => {
     Animated.spring(fabRotation, {
@@ -449,68 +503,47 @@ export function ConversationListScreen() {
 
   const handleRefresh = async () => {
     setRefreshing(true);
+    // PERF A6: Invalider le cache pour forcer un rechargement complet depuis AsyncStorage.
+    // Le pull-to-refresh est le seul moyen pour l'utilisateur de demander un refresh total.
+    cacheFilledRef.current = false;
+    lastMessageCacheRef.current.clear();
     await loadConversations();
     setRefreshing(false);
   };
 
-  const handleConversationPress = (conv: ConversationItem) => {
+  const handleConversationPress = useCallback((conv: ConversationItem) => {
     navigation.navigate('Conversation', {
       conversationId: conv.id,
       conversationName: conv.name,
     });
-  };
+  }, [navigation]);
 
-  const handleConversationLongPress = (conv: ConversationItem) => {
+  const handleConversationLongPress = useCallback((conv: ConversationItem) => {
     setConversationToDelete(conv);
     setShowDeleteConfirm(true);
-  };
+  }, []);
 
 
   const handleDelete = async () => {
     if (conversationToDelete) {
+      // BUG FIX #5: Bloquer la suppression si un appel est en cours avec ce contact
+      if (isInCall1to1()) {
+        Alert.alert('Appel en cours', 'Terminez l\'appel avant de supprimer la conversation.');
+        setShowDeleteConfirm(false);
+        return;
+      }
+      // BUG FIX #1: Nettoyer TOUTES les données de transport AVANT de supprimer la session
+      // Sans cela, les processedIds/messages/statuts orphelins persistent et polluent
+      // une éventuelle reconnexion (même sessionId déterministe).
+      await clearLocalMessages1to1(conversationToDelete.id);
+      await clearUnreadCount(conversationToDelete.id);
+      try { await AsyncStorage.removeItem(`@ghostr_reactions_${conversationToDelete.id}`); } catch {}
+      // PERF A6: Nettoyer le cache du dernier message pour cette session
+      lastMessageCacheRef.current.delete(conversationToDelete.id);
       await sessionService.deleteSession(conversationToDelete.id);
       await loadConversations();
       setShowDeleteConfirm(false);
       setConversationToDelete(null);
-    }
-  };
-
-  const formatTime = (timestamp?: number) => {
-    if (!timestamp) return '';
-    const date = new Date(timestamp);
-    const now = new Date();
-    const diff = now.getTime() - date.getTime();
-    
-    if (diff < 60000) return 'À l\'instant';
-    if (diff < 3600000) return `${Math.floor(diff / 60000)} min`;
-    if (diff < 86400000) return date.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
-    if (diff < 604800000) return date.toLocaleDateString('fr-FR', { weekday: 'short' });
-    return date.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' });
-  };
-
-  // v16.0: Composant d'icône de statut style WhatsApp
-  const MessageStatusIcon = ({ status }: { status?: string }) => {
-    switch (status) {
-      case 'read':
-        return (
-          <View style={styles.statusIcon}>
-            <Ionicons name="checkmark-done" size={16} color="#53BDEB" />
-          </View>
-        );
-      case 'delivered':
-        return (
-          <View style={styles.statusIcon}>
-            <Ionicons name="checkmark-done" size={16} color={theme.colors.textMuted} />
-          </View>
-        );
-      case 'sent':
-      case 'sending':
-      default:
-        return (
-          <View style={styles.statusIcon}>
-            <Ionicons name="checkmark" size={16} color={theme.colors.textMuted} />
-          </View>
-        );
     }
   };
 
@@ -519,7 +552,9 @@ export function ConversationListScreen() {
   const hasAnyContent = conversations.length > 0 || pendingCount > 0;
 
   // v16.0: Rendu unifié des conversations 1:1
-  const renderConversation = ({ item }: { item: ConversationItem }) => {
+  // PERF: useCallback empêche la FlatList de re-rendre toutes les lignes
+  // quand un état non lié change (ex: showNewMenu, showDeleteConfirm).
+  const renderConversation = useCallback(({ item }: { item: ConversationItem }) => {
     const hasUnread = item.unreadCount > 0;
     
     // Formater l'aperçu du dernier message avec "Vous:" si c'est le mien
@@ -544,7 +579,7 @@ export function ConversationListScreen() {
       >
         {/* Avatar rond */}
         <View style={styles.avatarContainer}>
-          <View style={[styles.avatar, styles.avatarRound]}>
+          <View style={[styles.avatar, styles.avatarRound, !item.avatarBase64 && { backgroundColor: getAvatarColor(item.id) }]}>
             {item.avatarBase64 ? (
               <Image 
                 source={{ uri: item.avatarBase64 }} 
@@ -552,7 +587,7 @@ export function ConversationListScreen() {
               />
             ) : (
               <Text style={styles.avatarText}>
-                {item.name.charAt(0).toUpperCase()}
+                {generateAvatarInitials(item.name)}
               </Text>
             )}
           </View>
@@ -607,7 +642,7 @@ export function ConversationListScreen() {
         </View>
       </TouchableOpacity>
     );
-  };
+  }, [handleConversationPress, handleConversationLongPress]);
 
   const renderEmptyState = () => (
     <View style={styles.emptyState}>
@@ -619,9 +654,9 @@ export function ConversationListScreen() {
           />
         </Animated.View>
       </View>
-      <Text style={styles.emptyTitle}>Aucune conversation</Text>
+      <Text style={styles.emptyTitle}>Bienvenue sur Ghostr</Text>
       <Text style={styles.emptySubtitle}>
-        Créez une conversation privée{'\n'}et discutez en toute confidentialité
+        Créez une invitation ou rejoignez{'\n'}un contact pour commencer
       </Text>
       
       <View style={styles.emptyActions}>
@@ -630,7 +665,7 @@ export function ConversationListScreen() {
           onPress={() => navigation.navigate('Create1to1')}
           activeOpacity={0.8}
         >
-          <Text style={styles.emptyButtonIcon}>✨</Text>
+          <Ionicons name="add-circle-outline" size={20} color={theme.colors.textOnPrimary} />
           <Text style={styles.emptyButtonTextPrimary}>Créer</Text>
         </TouchableOpacity>
         
@@ -639,10 +674,12 @@ export function ConversationListScreen() {
           onPress={() => navigation.navigate('Join1to1')}
           activeOpacity={0.8}
         >
-          <Text style={styles.emptyButtonIcon}>🔗</Text>
+          <Ionicons name="scan-outline" size={20} color={theme.colors.text} />
           <Text style={styles.emptyButtonTextSecondary}>Rejoindre</Text>
         </TouchableOpacity>
       </View>
+
+
     </View>
   );
 
@@ -656,7 +693,7 @@ export function ConversationListScreen() {
   return (
     <View style={[styles.container, { paddingBottom: insets.bottom }]}>
       {/* Header */}
-      <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
+      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
         <View style={styles.headerContent}>
           <View style={styles.brandContainer}>
             <Animated.View style={[styles.logoContainer, { transform: [{ translateY: logoFloat }] }]}>
@@ -665,10 +702,7 @@ export function ConversationListScreen() {
             
             <View style={styles.titleContainer}>
               <Text style={styles.title}>Ghostr</Text>
-              <View style={styles.subtitleRow}>
-                <View style={styles.subtitleDot} />
-                <Text style={styles.subtitle}>Messagerie privée</Text>
-              </View>
+
             </View>
           </View>
           
@@ -691,7 +725,10 @@ export function ConversationListScreen() {
       <FlatList
         data={conversations}
         renderItem={renderConversation}
-        keyExtractor={(item) => item.id}
+        keyExtractor={_keyExtractor}
+        removeClippedSubviews={true}
+        maxToRenderPerBatch={10}
+        windowSize={7}
         contentContainerStyle={!hasAnyContent ? styles.emptyListContent : styles.listContent}
         ListEmptyComponent={hasAnyContent ? null : renderEmptyState}
         ListHeaderComponent={pendingCount > 0 ? (
@@ -749,7 +786,7 @@ export function ConversationListScreen() {
             onPress={() => setShowNewMenu(true)}
             activeOpacity={0.8}
           >
-            <Text style={styles.fabIcon}>+</Text>
+            <Ionicons name="chatbubble-ellipses" size={24} color={theme.colors.textOnPrimary} />
           </TouchableOpacity>
         </Animated.View>
       )}
@@ -758,11 +795,11 @@ export function ConversationListScreen() {
       <ActionSheet
         visible={showNewMenu}
         onClose={() => setShowNewMenu(false)}
-        title="Nouvelle conversation"
         items={[
           {
-            title: 'Créer une conversation',
-            icon: <Text style={{ fontSize: 20 }}>✨</Text>,
+            title: 'Créer une invitation',
+            subtitle: 'Générez un QR code ou lien à partager',
+            icon: <Ionicons name="add-circle-outline" size={24} color={theme.colors.primary} />,
             onPress: () => {
               setShowNewMenu(false);
               navigation.navigate('Create1to1');
@@ -770,7 +807,8 @@ export function ConversationListScreen() {
           },
           {
             title: 'Rejoindre une conversation',
-            icon: <Text style={{ fontSize: 20 }}>🔗</Text>,
+            subtitle: 'Scannez un QR code ou collez un lien',
+            icon: <Ionicons name="scan-outline" size={24} color={theme.colors.primary} />,
             onPress: () => {
               setShowNewMenu(false);
               navigation.navigate('Join1to1');
@@ -825,18 +863,23 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   logoContainer: {
-    marginRight: 14,
+    marginRight: 12,
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   logo: {
-    width: 48,
-    height: 48,
-    borderRadius: 12,
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    resizeMode: 'contain',
   },
   titleContainer: {
     flex: 1,
   },
   title: {
-    fontSize: 26,
+    fontSize: 24,
     fontWeight: '700',
     color: theme.colors.text,
     letterSpacing: -0.5,
@@ -844,36 +887,36 @@ const styles = StyleSheet.create({
   subtitleRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginTop: 2,
+    marginTop: 1,
   },
   subtitleDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
+    width: 5,
+    height: 5,
+    borderRadius: 2.5,
     backgroundColor: theme.colors.primary,
-    marginRight: 8,
+    marginRight: 6,
   },
   subtitle: {
-    fontSize: 14,
+    fontSize: 12,
     color: theme.colors.textSecondary,
+    letterSpacing: 0.1,
   },
   settingsButton: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     backgroundColor: theme.colors.surface,
     alignItems: 'center',
     justifyContent: 'center',
   },
   headerDivider: {
-    height: 1,
-    marginTop: 16,
+    height: StyleSheet.hairlineWidth,
+    marginTop: 12,
   },
   headerDividerGradient: {
     flex: 1,
-    height: 1,
+    height: StyleSheet.hairlineWidth,
     backgroundColor: theme.colors.divider,
-    opacity: 0.6,
   },
   listContent: {
     paddingTop: 8,
@@ -945,8 +988,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingVertical: 13,
     backgroundColor: theme.colors.background,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: theme.colors.divider,
   },
   conversationItemNew: {
     backgroundColor: 'rgba(0, 217, 166, 0.05)',
@@ -971,9 +1016,10 @@ const styles = StyleSheet.create({
     borderRadius: 16,
   },
   avatarText: {
-    fontSize: 22,
+    fontSize: 19,
     fontWeight: '600',
-    color: theme.colors.text,
+    color: '#FFFFFF',
+    letterSpacing: 0.5,
   },
   avatarImage: {
     width: 56,
@@ -1021,9 +1067,10 @@ const styles = StyleSheet.create({
   },
   conversationName: {
     fontSize: 16,
-    fontWeight: '500',
+    fontWeight: '600',
     color: theme.colors.text,
     flexShrink: 1,
+    letterSpacing: -0.2,
   },
   conversationNameUnread: {
     fontWeight: '700',
@@ -1049,6 +1096,7 @@ const styles = StyleSheet.create({
   timestamp: {
     fontSize: 12,
     color: theme.colors.textMuted,
+    marginLeft: 8,
   },
   timestampUnread: {
     color: theme.colors.primary,
@@ -1068,7 +1116,8 @@ const styles = StyleSheet.create({
   messagePreview: {
     flex: 1,
     fontSize: 14,
-    color: theme.colors.textSecondary,
+    color: theme.colors.textMuted,
+    lineHeight: 19,
   },
   messagePreviewUnread: {
     color: theme.colors.text,
@@ -1092,7 +1141,7 @@ const styles = StyleSheet.create({
   },
   unreadBadge: {
     backgroundColor: theme.colors.primary,
-    borderRadius: 12,
+    borderRadius: 11,
     minWidth: 22,
     height: 22,
     justifyContent: 'center',
@@ -1102,41 +1151,51 @@ const styles = StyleSheet.create({
   unreadBadgeText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#000',
+    color: theme.colors.textOnPrimary,
   },
   emptyState: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    paddingHorizontal: 24,
-    paddingBottom: 80,
+    paddingHorizontal: 32,
+    paddingBottom: 60,
   },
   emptyIconWrapper: {
-    width: 140,
-    height: 140,
-    borderRadius: 70,
+    width: 120,
+    height: 120,
+    borderRadius: 60,
     backgroundColor: theme.colors.surface,
     justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 28,
+    marginBottom: 24,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
   },
   emptyLogo: {
-    width: 90,
-    height: 90,
-    borderRadius: 20,
+    width: 72,
+    height: 72,
+    borderRadius: 18,
   },
   emptyTitle: {
     fontSize: 24,
     fontWeight: '700',
     color: theme.colors.text,
+    marginBottom: 6,
+    letterSpacing: -0.4,
+  },
+  emptyTagline: {
+    fontSize: 15,
+    fontWeight: '500',
+    color: theme.colors.primary,
     marginBottom: 12,
+    letterSpacing: 0.1,
   },
   emptySubtitle: {
-    fontSize: 16,
+    fontSize: 15,
     color: theme.colors.textSecondary,
     textAlign: 'center',
-    lineHeight: 24,
-    marginBottom: 36,
+    lineHeight: 22,
+    marginBottom: 32,
   },
   emptyActions: {
     flexDirection: 'row',
@@ -1149,9 +1208,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: theme.colors.primary,
-    paddingVertical: 16,
-    borderRadius: 16,
+    paddingVertical: 15,
+    borderRadius: 14,
     gap: 8,
+    ...theme.shadow.glow,
   },
   emptyButtonSecondary: {
     flex: 1,
@@ -1159,14 +1219,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: theme.colors.surface,
-    paddingVertical: 16,
-    borderRadius: 16,
+    paddingVertical: 15,
+    borderRadius: 14,
     gap: 8,
-    borderWidth: 1.5,
+    borderWidth: 1,
     borderColor: theme.colors.border,
-  },
-  emptyButtonIcon: {
-    fontSize: 18,
   },
   emptyButtonTextPrimary: {
     fontSize: 16,
@@ -1178,26 +1235,38 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: theme.colors.text,
   },
+  emptySecurityBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 24,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    backgroundColor: 'rgba(0, 217, 166, 0.08)',
+    borderRadius: 20,
+  },
+  emptySecurityText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: theme.colors.primary,
+    opacity: 0.8,
+  },
   fab: {
     position: 'absolute',
     right: 20,
-    width: 60,
-    height: 60,
-    borderRadius: 30,
+    width: 58,
+    height: 58,
+    borderRadius: 29,
     backgroundColor: theme.colors.primary,
     justifyContent: 'center',
     alignItems: 'center',
+    ...theme.shadow.glow,
   },
   fabTouchable: {
-    width: 60,
-    height: 60,
+    width: 58,
+    height: 58,
     justifyContent: 'center',
     alignItems: 'center',
-  },
-  fabIcon: {
-    fontSize: 32,
-    color: theme.colors.textOnPrimary,
-    fontWeight: '300',
   },
 });
 

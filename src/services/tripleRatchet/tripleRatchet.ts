@@ -106,9 +106,12 @@ const TRIPLE_RATCHET_CONSTANTS = {
   // Version du protocole (v2 avec Header Encryption)
   PROTOCOL_VERSION: 2,
   
-  MAX_SKIP: 1000,
+  // P2-A4: Réduit de 200 à 50. En mode 1-to-1 avec peu de latence,
+  // 50 messages sautés couvrent largement les réordonnements réseau.
+  // Réduit l'impact DoS par messages craftés avec messageNumber élevé.
+  MAX_SKIP: 50,
   
-  SKIPPED_KEY_TTL_MS: 48 * 60 * 60 * 1000, // P13 fix: 48h (was 7 days)
+  SKIPPED_KEY_TTL_MS: 24 * 60 * 60 * 1000, // P2-A4: Réduit de 48h à 24h
   
   HEADER_SIZE: 80,
   
@@ -434,9 +437,9 @@ export async function tripleRatchetEncrypt(
   message: TripleRatchetMessage;
   newState: TripleRatchetState;
 }> {
-  let currentState = { ...state };
-  
-  // P13 fix: Cleanup expired skipped keys during encrypt too
+  // R-04: Deep copy pour éviter la mutation de l'état original.
+  // { ...state } (shallow spread) mute la Map skippedKeys et pqSecretHistory.
+  let currentState = deepCopyTripleRatchetState(state);
   // (not just decrypt) so keys don't linger if user only sends
   currentState = cleanupExpiredSkippedKeys(currentState);
   
@@ -631,12 +634,16 @@ function tryDecryptHeader(
 
 /**
  * Déchiffre l'en-tête en essayant différentes clés
- * 
+ *
+ * R-10: Toutes les clés sont essayées sans early-exit pour éviter un canal
+ * auxiliaire de timing (la position de la clé correcte était observable).
+ * On collecte tous les résultats et on sélectionne le premier non-null.
+ *
  * Ordre d'essai:
  * 1. receivingHeaderKey (cas normal)
  * 2. nextReceivingHeaderKey (nouveau DH ratchet)
  * 3. Clés des messages sautés
- * 
+ *
  * @returns L'en-tête et la clé utilisée, ou lance une erreur
  */
 function decryptHeaderWithFallback(
@@ -645,41 +652,36 @@ function decryptHeaderWithFallback(
 ): HeaderDecryptResult {
   const encryptedHeader = decodeBase64(message.encryptedHeader);
   const headerNonce = decodeBase64(message.headerNonce);
-  
-  // 1. Essayer avec la header key actuelle
+
+  // R-10: Construire la liste COMPLÈTE des clés à essayer, dans l'ordre de priorité.
+  // Toutes sont testées pour éviter la fuite de timing par early-exit.
+  const candidates: Array<{ headerKey: HeaderKey; triggeredDHRatchet: boolean }> = [];
+
   if (state.receivingHeaderKey) {
-    const header = tryDecryptHeader(encryptedHeader, headerNonce, state.receivingHeaderKey);
-    if (header) {
+    candidates.push({ headerKey: state.receivingHeaderKey, triggeredDHRatchet: false });
+  }
+  candidates.push({ headerKey: state.nextReceivingHeaderKey, triggeredDHRatchet: true });
+
+  for (const [, entry] of state.skippedKeys) {
+    candidates.push({ headerKey: entry.headerKey, triggeredDHRatchet: false });
+  }
+
+  // Essayer TOUTES les clés (pas de early-exit)
+  const results: Array<TripleRatchetHeader | null> = candidates.map(({ headerKey }) =>
+    tryDecryptHeader(encryptedHeader, headerNonce, headerKey)
+  );
+
+  // Sélectionner le premier résultat valide
+  for (let i = 0; i < results.length; i++) {
+    if (results[i] !== null) {
       return {
-        header,
-        usedHeaderKey: state.receivingHeaderKey,
-        triggeredDHRatchet: false,
+        header: results[i]!,
+        usedHeaderKey: candidates[i].headerKey,
+        triggeredDHRatchet: candidates[i].triggeredDHRatchet,
       };
     }
   }
-  
-  // 2. Essayer avec la prochaine header key (indique un DH ratchet)
-  const headerWithNext = tryDecryptHeader(encryptedHeader, headerNonce, state.nextReceivingHeaderKey);
-  if (headerWithNext) {
-    return {
-      header: headerWithNext,
-      usedHeaderKey: state.nextReceivingHeaderKey,
-      triggeredDHRatchet: true,
-    };
-  }
-  
-  // 3. Essayer avec les header keys des messages sautés
-  for (const [skipKey, entry] of state.skippedKeys) {
-    const header = tryDecryptHeader(encryptedHeader, headerNonce, entry.headerKey);
-    if (header) {
-      return {
-        header,
-        usedHeaderKey: entry.headerKey,
-        triggeredDHRatchet: false,
-      };
-    }
-  }
-  
+
   throw new Error('Triple Ratchet: Header decryption failed with all available keys');
 }
 
@@ -704,9 +706,8 @@ export async function tripleRatchetDecrypt(
   result: TripleRatchetDecryptResult;
   newState: TripleRatchetState;
 }> {
-  let currentState = { ...state };
-  
-  // 1. DÉCHIFFRER L'EN-TÊTE avec fallback sur différentes clés
+  // R-04: Deep copy — même raison que dans tripleRatchetEncrypt.
+  let currentState = deepCopyTripleRatchetState(state);
   const { header, usedHeaderKey, triggeredDHRatchet } = decryptHeaderWithFallback(
     message,
     currentState
@@ -859,12 +860,68 @@ export async function tripleRatchetDecrypt(
 }
 
 // ============================================
-// FONCTIONS AUXILIAIRES
+// R-04: DEEP COPY DE L'ÉTAT
 // ============================================
+// { ...state } (shallow spread) ne clone PAS:
+//   - skippedKeys: Map<string, ...> → mutée par skipMessageKeysWithHE
+//   - spqr.pqSecretHistory: Map<number, Uint8Array> → mutée par SPQR rotation
+//
+// Sans deep copy, currentState.skippedKeys.set() mutait la Map de l'état
+// original, corrompant l'état si l'appelant conservait une référence à state.
+//
+// INVARIANT: Toute fonction qui retourne newState doit partir d'une copie profonde.
 
 /**
- * Dérive une clé de message depuis une chaîne
+ * Clone profond de l'état Triple Ratchet.
+ * Clone explicitement les Maps et objets imbriqués.
  */
+function deepCopyTripleRatchetState(state: TripleRatchetState): TripleRatchetState {
+  // GH-12: Clone Uint8Array-backed keys to prevent zeroize() cross-contamination
+  const cloneKey = <T extends { bytes: Uint8Array }>(k: T): T =>
+    ({ ...k, bytes: new Uint8Array(k.bytes) } as T);
+
+  // Clone Maps (reference types)
+  const skippedKeysCopy = new Map<string, { key: MessageKey; headerKey: HeaderKey; timestamp: number }>();
+  for (const [k, v] of state.skippedKeys) {
+    skippedKeysCopy.set(k, { key: cloneKey(v.key), headerKey: cloneKey(v.headerKey), timestamp: v.timestamp });
+  }
+
+  const pqSecretHistoryCopy = new Map<number, Uint8Array>();
+  for (const [k, v] of state.spqr.pqSecretHistory) {
+    pqSecretHistoryCopy.set(k, new Uint8Array(v));
+  }
+
+  const braidCopy = state.spqr.braid ? {
+    ...state.spqr.braid,
+    remoteEKBodyChunks: new Map<number, Uint8Array>(state.spqr.braid.remoteEKBodyChunks),
+    remoteCTChunks: new Map<number, Uint8Array>(state.spqr.braid.remoteCTChunks),
+    localEKBodyChunks: [...(state.spqr.braid.localEKBodyChunks ?? [])],
+    localCTChunks: [...(state.spqr.braid.localCTChunks ?? [])],
+  } : state.spqr.braid;
+
+  return {
+    ...state,
+    // GH-12: Clone critical Uint8Array-backed keys
+    rootKey: cloneKey(state.rootKey),
+    sendingChainKey: state.sendingChainKey ? cloneKey(state.sendingChainKey) : null,
+    receivingChainKey: state.receivingChainKey ? cloneKey(state.receivingChainKey) : null,
+    sendingHeaderKey: state.sendingHeaderKey ? cloneKey(state.sendingHeaderKey) : null,
+    receivingHeaderKey: state.receivingHeaderKey ? cloneKey(state.receivingHeaderKey) : null,
+    nextSendingHeaderKey: cloneKey(state.nextSendingHeaderKey),
+    nextReceivingHeaderKey: cloneKey(state.nextReceivingHeaderKey),
+    skippedKeys: skippedKeysCopy,
+    spqr: {
+      ...state.spqr,
+      pqSecret: state.spqr.pqSecret ? new Uint8Array(state.spqr.pqSecret) : state.spqr.pqSecret,
+      pqSecretHistory: pqSecretHistoryCopy,
+      pendingChunks: [...(state.spqr.pendingChunks ?? [])],
+      outgoingChunks: [...(state.spqr.outgoingChunks ?? [])],
+      braid: braidCopy,
+    },
+  };
+}
+
+
 async function deriveMessageKey(
   chainKey: ChainKey,
   pqSecret?: Uint8Array | null
@@ -1085,7 +1142,8 @@ async function skipMessageKeys(
     throw new Error('Triple Ratchet: Too many skipped messages');
   }
   
-  let currentState = { ...state };
+  // R-04: Deep copy — skipMessageKeys ajoute à skippedKeys
+  let currentState = deepCopyTripleRatchetState(state);
   let chainKey = state.receivingChainKey;
   
   while (currentState.messageNumberReceive < until) {
@@ -1135,9 +1193,10 @@ async function skipMessageKeysWithHE(
     throw new Error('Triple Ratchet: Too many skipped messages');
   }
   
-  let currentState = { ...state };
+  // R-04: Deep copy — skipMessageKeysWithHE mutait la Map skippedKeys originale
+  let currentState = deepCopyTripleRatchetState(state);
   let chainKey = state.receivingChainKey;
-  
+
   while (currentState.messageNumberReceive < until) {
     // CRITIQUE: Le pqSecret est TOUJOURS mixé même pour les clés sautées
     const { messageKey, nextChainKey } = await deriveMessageKey(

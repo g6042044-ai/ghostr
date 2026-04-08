@@ -114,7 +114,7 @@ export async function sendImageMessage1to1(
     }
     return result;
   } catch (error: any) {
-    console.error('[media1to1] ❌ Exception:', error);
+    __DEV__ && console.error('[media1to1] ❌ Exception:', error);
     return { success: false, error: error.message || 'Erreur lors de l\'envoi de l\'image' };
   }
 }
@@ -181,7 +181,7 @@ export async function sendFileMessage1to1(
     }
     return result;
   } catch (error: any) {
-    console.error('[media1to1] ❌ Exception:', error);
+    __DEV__ && console.error('[media1to1] ❌ Exception:', error);
     return { success: false, error: error.message || 'Erreur lors de l\'envoi du fichier' };
   }
 }
@@ -244,7 +244,7 @@ export async function sendVoiceMessage1to1(
     }
     return result;
   } catch (error: any) {
-    console.error('[media1to1] ❌ Exception:', error);
+    __DEV__ && console.error('[media1to1] ❌ Exception:', error);
     return { success: false, error: error.message || 'Erreur lors de l\'envoi du message vocal' };
   }
 }
@@ -291,7 +291,7 @@ export async function downloadMediaBlob(
 
     return { success: true, base64Data };
   } catch (error: any) {
-    console.error('[media1to1] ❌ Download error:', error);
+    __DEV__ && console.error('[media1to1] ❌ Download error:', error);
     return { success: false, error: error.message || 'Erreur lors du téléchargement' };
   }
 }

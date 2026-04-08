@@ -10,7 +10,6 @@
 // - Pas de hash stocké (vérification par déchiffrement)
 
 import * as SecureStore from 'expo-secure-store';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 import { 
@@ -80,8 +79,9 @@ const STORAGE_KEYS = {
   LOCK_DATA: 'whisper_lock_data_v6',
   LOCK_DATA_V5: 'whisper_lock_data_v5',
   LOCK_DATA_V4: 'whisper_lock_data_v4',
-  FAILED_ATTEMPTS: 'whisper_failed_attempts',
-  LOCKOUT_UNTIL: 'whisper_lockout_until',
+  FAILED_ATTEMPTS: 'whisper_failed_attempts_v2',
+  LOCKOUT_UNTIL: 'whisper_lockout_until_v2',
+  AUTO_WIPE_ENABLED: 'whisper_auto_wipe_enabled',
   // Legacy keys pour migration
   LEGACY_V3_DATA: 'whisper_lock_data_v3',
   LEGACY_ENABLED: 'whisper_lock_enabled',
@@ -154,6 +154,190 @@ function getLockoutForAttempts(attempts: number): number {
     }
   }
   return lockoutSeconds;
+}
+
+// ============================================
+// ACTION 1: Secure counter management (SecureStore)
+// ============================================
+
+async function resetBruteForceCounters(): Promise<void> {
+  try {
+    await SecureStore.deleteItemAsync(STORAGE_KEYS.FAILED_ATTEMPTS);
+    await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCKOUT_UNTIL);
+  } catch {
+    // Non-critical
+  }
+}
+
+// ============================================
+// ACTION 3: Password strength estimation
+// ============================================
+
+export interface PasswordStrength {
+  score: number;        // 0-4 (0=very weak, 4=very strong)
+  entropy: number;      // Estimated bits of entropy
+  crackTime: string;    // Human readable crack time
+  isAcceptable: boolean; // Meets minimum requirements
+  feedback: string[];   // Suggestions to improve
+}
+
+/**
+ * Estime la force d'un mot de passe sans dépendance externe.
+ * Utilise l'entropie Shannon + détection de patterns faibles.
+ */
+export function estimatePasswordStrength(password: string): PasswordStrength {
+  const feedback: string[] = [];
+  
+  if (password.length < 8) {
+    return {
+      score: 0,
+      entropy: 0,
+      crackTime: 'instantané',
+      isAcceptable: false,
+      feedback: ['Minimum 8 caractères requis'],
+    };
+  }
+  
+  // Calculate charset size
+  let charsetSize = 0;
+  const hasLower = /[a-z]/.test(password);
+  const hasUpper = /[A-Z]/.test(password);
+  const hasDigits = /[0-9]/.test(password);
+  const hasSpecial = /[^a-zA-Z0-9]/.test(password);
+  
+  if (hasLower) charsetSize += 26;
+  if (hasUpper) charsetSize += 26;
+  if (hasDigits) charsetSize += 10;
+  if (hasSpecial) charsetSize += 32;
+  
+  // Base entropy: log2(charsetSize) * length
+  let entropy = Math.log2(charsetSize) * password.length;
+  
+  // Penalty for pure numeric (PIN-like)
+  const isPureNumeric = /^\d+$/.test(password);
+  if (isPureNumeric) {
+    entropy = Math.log2(10) * password.length;
+    feedback.push('Ajoutez des lettres pour augmenter la sécurité');
+  }
+  
+  // Penalty for sequential/repeated patterns
+  const hasSequential = /(?:012|123|234|345|456|567|678|789|890|abc|bcd|cde|def)/i.test(password);
+  if (hasSequential) {
+    entropy *= 0.7;
+    feedback.push('Évitez les séquences (123, abc...)');
+  }
+  
+  const hasRepeated = /(.)\1{2,}/.test(password);
+  if (hasRepeated) {
+    entropy *= 0.7;
+    feedback.push('Évitez les caractères répétés');
+  }
+  
+  // Common passwords penalty
+  const commonPatterns = [
+    'password', 'qwerty', 'azerty', 'motdepasse', 'ghostr',
+    '000000', '111111', '123456', '654321', 'abcdef',
+  ];
+  const lowerPw = password.toLowerCase();
+  if (commonPatterns.some(p => lowerPw.includes(p))) {
+    entropy *= 0.3;
+    feedback.push('Ce mot de passe est trop commun');
+  }
+  
+  // Determine score
+  let score: number;
+  let crackTime: string;
+  
+  // With Argon2id at 64 MiB, ~60ms/attempt on GPU → ~17 attempts/sec
+  // Offline attacker with $10k hardware: ~1000 attempts/sec
+  const attemptsPerSec = 1000;
+  const totalAttempts = Math.pow(2, entropy);
+  const secondsToCrack = totalAttempts / attemptsPerSec / 2; // average case
+  
+  if (secondsToCrack < 60) {
+    score = 0;
+    crackTime = 'moins d\'une minute';
+  } else if (secondsToCrack < 3600) {
+    score = 1;
+    crackTime = `~${Math.round(secondsToCrack / 60)} minutes`;
+  } else if (secondsToCrack < 86400 * 30) {
+    score = 2;
+    crackTime = `~${Math.round(secondsToCrack / 86400)} jours`;
+  } else if (secondsToCrack < 86400 * 365 * 100) {
+    score = 3;
+    crackTime = `~${Math.round(secondsToCrack / (86400 * 365))} ans`;
+  } else {
+    score = 4;
+    crackTime = 'des siècles';
+  }
+  
+  // Suggestions
+  if (password.length < 12) {
+    feedback.push('Un mot de passe de 12+ caractères est recommandé');
+  }
+  if (!hasLower || !hasUpper) {
+    feedback.push('Mélangez majuscules et minuscules');
+  }
+  if (!hasSpecial && !hasDigits) {
+    feedback.push('Ajoutez des chiffres ou caractères spéciaux');
+  }
+  
+  // Minimum acceptable: score >= 2 (at least days to crack with Argon2id)
+  const isAcceptable = score >= 2;
+  
+  return { score, entropy: Math.round(entropy), crackTime, isAcceptable, feedback };
+}
+
+// ============================================
+// ACTION 4: Auto-wipe on brute-force
+// ============================================
+
+/**
+ * Active/désactive le wipe automatique après 20 tentatives échouées
+ */
+export async function setAutoWipeEnabled(enabled: boolean): Promise<void> {
+  await SecureStore.setItemAsync(
+    STORAGE_KEYS.AUTO_WIPE_ENABLED,
+    enabled ? 'true' : 'false'
+  );
+  __DEV__ && console.log(`🔒 Auto-wipe ${enabled ? 'ENABLED' : 'DISABLED'}`);
+}
+
+/**
+ * Vérifie si le wipe automatique est activé
+ */
+export async function isAutoWipeEnabled(): Promise<boolean> {
+  try {
+    const value = await SecureStore.getItemAsync(STORAGE_KEYS.AUTO_WIPE_ENABLED);
+    return value === 'true';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Effectue un wipe complet de sécurité (toutes les données)
+ * Appelé par le système anti-brute-force quand auto-wipe est activé
+ */
+async function performSecurityWipe(): Promise<void> {
+  try {
+    // Use the nuclearReset from storage.ts 
+    const { nuclearReset } = await import('./storage');
+    await nuclearReset();
+    __DEV__ && console.log('☢️ Security wipe completed');
+  } catch (error) {
+    __DEV__ && console.error('☢️ Security wipe error:', error);
+    // Fallback: at minimum clear SecureStore lock data so the attacker can't retry
+    try {
+      await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA);
+      await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA_V5);
+      await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA_V4);
+      const AsyncStorageFallback = (await import('@react-native-async-storage/async-storage')).default;
+      await AsyncStorageFallback.clear();
+    } catch {
+      // Last resort
+    }
+  }
 }
 
 // ============================================
@@ -262,8 +446,8 @@ export async function getLockSettings(): Promise<LockSettings> {
  */
 export async function getLockState(): Promise<LockState> {
   try {
-    const attemptsStr = await AsyncStorage.getItem(STORAGE_KEYS.FAILED_ATTEMPTS);
-    const lockoutStr = await AsyncStorage.getItem(STORAGE_KEYS.LOCKOUT_UNTIL);
+    const attemptsStr = await SecureStore.getItemAsync(STORAGE_KEYS.FAILED_ATTEMPTS);
+    const lockoutStr = await SecureStore.getItemAsync(STORAGE_KEYS.LOCKOUT_UNTIL);
     
     const failedAttempts = attemptsStr ? parseInt(attemptsStr, 10) : 0;
     const lockoutUntil = lockoutStr ? parseInt(lockoutStr, 10) : null;
@@ -353,8 +537,8 @@ export async function setupLock(
   onProgress?: (progress: number) => void
 ): Promise<boolean> {
   try {
-    if (password.length < 6) {
-      console.warn('Mot de passe trop court (minimum 6 caractères)');
+    if (password.length < 8) {
+      __DEV__ && console.warn('Mot de passe trop court (minimum 8 caractères)');
       return false;
     }
     
@@ -386,10 +570,7 @@ export async function setupLock(
     await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(lockData));
     
     // 6. Réinitialiser les compteurs
-    await AsyncStorage.multiRemove([
-      STORAGE_KEYS.FAILED_ATTEMPTS,
-      STORAGE_KEYS.LOCKOUT_UNTIL,
-    ]);
+    await resetBruteForceCounters();
     
     // 7. Nettoyer les anciennes versions
     await cleanupLegacyData();
@@ -401,7 +582,7 @@ export async function setupLock(
     __DEV__ && console.log('✅ Verrouillage v6 configuré');
     return true;
   } catch (e) {
-    console.error('setupLock error:', e);
+    __DEV__ && console.error('setupLock error:', e);
     return false;
   }
 }
@@ -424,10 +605,7 @@ export async function disableLock(password: string): Promise<boolean> {
     // Supprimer toutes les données de verrouillage
     await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA);
     await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA_V4);
-    await AsyncStorage.multiRemove([
-      STORAGE_KEYS.FAILED_ATTEMPTS,
-      STORAGE_KEYS.LOCKOUT_UNTIL,
-    ]);
+    await resetBruteForceCounters();
     
     // Nettoyer les anciennes versions
     await cleanupLegacyData();
@@ -435,7 +613,7 @@ export async function disableLock(password: string): Promise<boolean> {
     __DEV__ && console.log('✅ Verrouillage désactivé');
     return true;
   } catch (e) {
-    console.error('disableLock error:', e);
+    __DEV__ && console.error('disableLock error:', e);
     return false;
   }
 }
@@ -483,7 +661,7 @@ export async function changePassword(
   onProgress?: (progress: number) => void
 ): Promise<boolean> {
   try {
-    if (newPassword.length < 6) return false;
+    if (newPassword.length < 8) return false;
     
     // Récupérer les clés avec l'ancien mot de passe
     const keys = await getEncryptionKeys(currentPassword, (p) => onProgress?.(p * 0.3));
@@ -521,7 +699,7 @@ export async function changePassword(
     derivedKeyOld.fill(0);
     
     if (!masterKey) {
-      console.error('Failed to decrypt master key');
+      __DEV__ && console.error('Failed to decrypt master key');
       return false;
     }
     
@@ -555,10 +733,7 @@ export async function changePassword(
     await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA_V4);
     
     // Réinitialiser les compteurs
-    await AsyncStorage.multiRemove([
-      STORAGE_KEYS.FAILED_ATTEMPTS,
-      STORAGE_KEYS.LOCKOUT_UNTIL,
-    ]);
+    await resetBruteForceCounters();
     
     onProgress?.(1);
     
@@ -571,7 +746,7 @@ export async function changePassword(
     __DEV__ && console.log('✅ Mot de passe changé');
     return true;
   } catch (e) {
-    console.error('changePassword error:', e);
+    __DEV__ && console.error('changePassword error:', e);
     return false;
   }
 }
@@ -658,7 +833,7 @@ export async function getEncryptionKeysWithInfo(
     // Essayer legacy
     return await unlockLegacyAndMigrate(password);
   } catch (e) {
-    console.error('getEncryptionKeys error:', e);
+    __DEV__ && console.error('getEncryptionKeys error:', e);
     await handleFailedAttempt();
     return { keys: null, securityInfo: null, migrated: false };
   }
@@ -699,10 +874,7 @@ async function unlockV6(
   }
   
   // Succès ! Réinitialiser les compteurs
-  await AsyncStorage.multiRemove([
-    STORAGE_KEYS.FAILED_ATTEMPTS,
-    STORAGE_KEYS.LOCKOUT_UNTIL,
-  ]);
+  await resetBruteForceCounters();
   
   // Dériver les sous-clés
   const localKey = await deriveSubKey(masterKey, KEY_CONTEXTS.LOCAL_ENCRYPTION);
@@ -778,10 +950,7 @@ async function unlockV4AndMigrate(
   await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA_V4);
   
   // Réinitialiser les compteurs
-  await AsyncStorage.multiRemove([
-    STORAGE_KEYS.FAILED_ATTEMPTS,
-    STORAGE_KEYS.LOCKOUT_UNTIL,
-  ]);
+  await resetBruteForceCounters();
   
   onProgress?.(1);
   
@@ -859,10 +1028,7 @@ async function unlockV3AndMigrate(
   await SecureStore.deleteItemAsync(STORAGE_KEYS.LEGACY_V3_DATA);
   
   // Réinitialiser les compteurs
-  await AsyncStorage.multiRemove([
-    STORAGE_KEYS.FAILED_ATTEMPTS,
-    STORAGE_KEYS.LOCKOUT_UNTIL,
-  ]);
+  await resetBruteForceCounters();
   
   onProgress?.(1);
   
@@ -992,10 +1158,7 @@ async function unlockV5AndMigrate(
   await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA_V5);
   
   // Réinitialiser les compteurs
-  await AsyncStorage.multiRemove([
-    STORAGE_KEYS.FAILED_ATTEMPTS,
-    STORAGE_KEYS.LOCKOUT_UNTIL,
-  ]);
+  await resetBruteForceCounters();
   
   onProgress?.(1);
   
@@ -1045,7 +1208,7 @@ async function migrateKdfParams(
     const masterKey = decryptWithKey(currentLockData.encryptedMasterKey, currentLockData.nonce, oldDerivedKey);
     
     if (!masterKey) {
-      console.error('Migration KDF: impossible de déchiffrer la clé maître');
+      __DEV__ && console.error('Migration KDF: impossible de déchiffrer la clé maître');
       return;
     }
     
@@ -1075,7 +1238,7 @@ async function migrateKdfParams(
     __DEV__ && console.log('✅ Migration KDF silencieuse terminée');
   } catch (e) {
     // Ne pas faire échouer le déverrouillage si la migration échoue
-    console.error('Migration KDF silencieuse échouée (non bloquant):', e);
+    __DEV__ && console.error('Migration KDF silencieuse échouée (non bloquant):', e);
   }
 }
 
@@ -1085,10 +1248,10 @@ async function migrateKdfParams(
 
 async function handleFailedAttempt(): Promise<void> {
   try {
-    const attemptsStr = await AsyncStorage.getItem(STORAGE_KEYS.FAILED_ATTEMPTS);
+    const attemptsStr = await SecureStore.getItemAsync(STORAGE_KEYS.FAILED_ATTEMPTS);
     const attempts = (attemptsStr ? parseInt(attemptsStr, 10) : 0) + 1;
     
-    await AsyncStorage.setItem(STORAGE_KEYS.FAILED_ATTEMPTS, attempts.toString());
+    await SecureStore.setItemAsync(STORAGE_KEYS.FAILED_ATTEMPTS, attempts.toString());
     
     // Logger la tentative échouée
     await securityLogger.logPinAttempt(false, attempts);
@@ -1096,21 +1259,30 @@ async function handleFailedAttempt(): Promise<void> {
     const lockoutSeconds = getLockoutForAttempts(attempts);
     
     if (lockoutSeconds === -1) {
-      console.warn('⚠️ Trop de tentatives - données à risque');
+      __DEV__ && console.warn('⚠️ Trop de tentatives - vérification auto-wipe');
       // Logger la tentative de brute-force
       await securityLogger.log('BRUTE_FORCE_ATTEMPT', {
         source: 'appLock',
         count: attempts,
       });
-      // Note: Le wipe automatique est désactivé pour éviter la perte de données accidentelle
-      // L'utilisateur peut le faire manuellement depuis les paramètres
+      
+      // ACTION 4: Auto-wipe si activé par l'utilisateur
+      const autoWipeEnabled = await SecureStore.getItemAsync(STORAGE_KEYS.AUTO_WIPE_ENABLED);
+      if (autoWipeEnabled === 'true') {
+        __DEV__ && console.warn('☢️ AUTO-WIPE TRIGGERED — erasing all data');
+        await securityLogger.log('AUTO_WIPE_TRIGGERED', {
+          source: 'appLock',
+          attempts,
+        });
+        await performSecurityWipe();
+      }
     } else if (lockoutSeconds > 0) {
       const lockoutUntil = Date.now() + (lockoutSeconds * 1000);
-      await AsyncStorage.setItem(STORAGE_KEYS.LOCKOUT_UNTIL, lockoutUntil.toString());
+      await SecureStore.setItemAsync(STORAGE_KEYS.LOCKOUT_UNTIL, lockoutUntil.toString());
       __DEV__ && console.log(`Lockout: ${lockoutSeconds}s (${attempts} tentatives)`);
     }
   } catch (e) {
-    console.error('handleFailedAttempt error:', e);
+    __DEV__ && console.error('handleFailedAttempt error:', e);
   }
 }
 

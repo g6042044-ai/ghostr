@@ -52,7 +52,7 @@ async function generateRelayHmacToken(roomTag: string, peerId: string, authToken
     
     return `${hmacB64}:${timestamp}`;
   } catch (error) {
-    console.warn('🔌 Failed to generate relay HMAC token:', error);
+    __DEV__ && console.warn('🔌 Failed to generate relay HMAC token:', error);
     return null;
   }
 }
@@ -93,6 +93,17 @@ type OnAudioReceivedCallback = (senderTokenHash: string, encryptedAudioData: Uin
 // ============================================
 
 const ENTRY_RELAY_URL = process.env.EXPO_PUBLIC_ENTRY_RELAY_URL || '';
+
+// P2 FIX: Avertissement de sécurité visible au démarrage si le relay d'anonymisation IP
+// n'est pas configuré. Sans relay, le SFU voit les vraies IPs des participants.
+if (!ENTRY_RELAY_URL) {
+  __DEV__ && console.warn('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  __DEV__ && console.warn('🚨 SECURITY WARNING: EXPO_PUBLIC_ENTRY_RELAY_URL is not set!');
+  __DEV__ && console.warn('   Voice calls will connect DIRECTLY to the SFU.');
+  __DEV__ && console.warn('   Participant IP addresses will be visible to the SFU.');
+  __DEV__ && console.warn('   Set EXPO_PUBLIC_ENTRY_RELAY_URL in .env to enable double-hop relay.');
+  __DEV__ && console.warn('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+}
 
 export type RelayRegion = 'eu-west' | 'eu-central' | 'us-east' | 'us-west' | 'asia' | 'auto';
 
@@ -181,7 +192,7 @@ const state: WebRTCState = {
 
 export function setDoubleHopEnabled(enabled: boolean): void {
   if (!ENTRY_RELAY_URL && enabled) {
-    console.warn('🔌 Cannot enable double-hop: ENTRY_RELAY_URL not configured');
+    __DEV__ && console.warn('🔌 Cannot enable double-hop: ENTRY_RELAY_URL not configured');
     return;
   }
   state.useDoubleHop = enabled;
@@ -211,35 +222,17 @@ export function getOptimalRegion(countryCode?: string): RelayRegion {
 // HEALTHCHECK DU RELAY
 // ============================================
 
+/**
+ * GH-05: Health check via direct HTTP fetch REMOVED — it leaked the client IP
+ * to the entry relay outside the WebSocket context.
+ * 
+ * The relay availability is now detected passively:
+ *   - If ENTRY_RELAY_URL is configured → assume available
+ *   - If the WebSocket connection fails → handle at connection time
+ */
 async function checkRelayHealth(): Promise<boolean> {
-  if (!ENTRY_RELAY_URL) return false;
-  
-  try {
-    // Convertir l'URL WebSocket en URL HTTP pour le healthcheck
-    const healthUrl = ENTRY_RELAY_URL
-      .replace(/^wss?:\/\//, 'https://')
-      .replace(/\/$/, '') + '/health';
-      
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), HEALTHCHECK_TIMEOUT_MS);
-    
-    const response = await fetch(healthUrl, {
-      method: 'GET',
-      signal: controller.signal,
-    });
-    
-    clearTimeout(timeoutId);
-    
-    if (response.ok) {
-      const data = await response.json();
-      __DEV__ && console.log(`🔌 Relay health check: ${data.status} (v${data.version})`);
-      return data.status === 'ok';
-    }
-    return false;
-  } catch (error) {
-    console.warn('🔌 Relay health check failed:', error);
-    return false;
-  }
+  // Simply check configuration — actual availability is detected at WebSocket connect time
+  return !!ENTRY_RELAY_URL;
 }
 
 // ============================================
@@ -356,13 +349,15 @@ export async function connectToSfu(
       state.roomTag = roomTag;
       state.authToken = authToken || null;
       state.audioSequence = 0;
+      audioReceiveCount = 0;
+      audioSendCount = 0;
       state.sfuUrl = sfuUrl;
       
       // Vérifier la santé du relay si double-hop activé
       if (state.useDoubleHop && ENTRY_RELAY_URL) {
         const relayHealthy = await checkRelayHealth();
         if (!relayHealthy) {
-          console.error('🔌 Relay unhealthy — refusing connection to protect IP anonymity');
+          __DEV__ && console.error('🔌 Relay unhealthy — refusing connection to protect IP anonymity');
           updateConnectionState('failed');
           resolve(false);
           return;
@@ -378,21 +373,29 @@ export async function connectToSfu(
       __DEV__ && console.log(`   PeerId: ${peerId.slice(0, 16)}...`);
       
       // Créer la WebSocket
-      state.ws = new WebSocket(wsUrl);
+      // BUGFIX P0: Capturer l'instance dans une variable locale.
+      // Le handler onclose vérifie que c'est toujours la WS active avant d'agir.
+      // Sans ça, le onclose différé de l'ancien appel (ws1) se déclenche après
+      // que connectToSfu() a déjà créé ws2, corrompant l'état du 2ème appel.
+      const wsInstance = new WebSocket(wsUrl);
+      state.ws = wsInstance;
       
       // Timeout de connexion
       const connectionTimeout = setTimeout(() => {
-        if (state.connectionState === 'connecting') {
-          console.error('🔌 Connection timeout');
-          state.ws?.close();
+        if (state.connectionState === 'connecting' && state.ws === wsInstance) {
+          __DEV__ && console.error('🔌 Connection timeout');
+          wsInstance.close();
           updateConnectionState('failed');
           resolve(false);
         }
       }, CONNECTION_TIMEOUT_MS);
       
-      state.ws.onopen = () => {
+      wsInstance.onopen = () => {
+        // Ignorer si cette WS n'est plus l'instance active
+        if (state.ws !== wsInstance) return;
         clearTimeout(connectionTimeout);
         __DEV__ && console.log('🔌 WebSocket connected, sending join...');
+        __DEV__ && console.log(`🔌 DIAG WS readyState=${wsInstance.readyState}, url=${wsInstance.url?.slice(0, 60)}...`);
         state.reconnectAttempts = 0;
         
         // Envoyer le message join
@@ -404,6 +407,7 @@ export async function connectToSfu(
           timestamp: Date.now(),
         };
         sendMessage(joinMsg);
+        __DEV__ && console.log(`🔌 DIAG join sent: peerId=${peerId.slice(0,16)}, room=${roomTag.slice(0,8)}, token=${senderTokenHash.slice(0,8)}`);
         
         // Démarrer le ping
         startPingInterval();
@@ -412,19 +416,39 @@ export async function connectToSfu(
         resolve(true);
       };
       
-      state.ws.onmessage = (event) => {
+      // Compteur de messages reçus (diagnostic)
+      let wsMessageCount = 0;
+      
+      wsInstance.onmessage = (event) => {
+        wsMessageCount++;
+        if (state.ws !== wsInstance) {
+          return;
+        }
+        // Log les 10 premiers messages reçus pour diagnostic
+        if (wsMessageCount <= 10) {
+          const preview = typeof event.data === 'string' ? event.data.slice(0, 120) : `[binary ${event.data?.byteLength || '?'}B]`;
+        } else if (wsMessageCount % 200 === 0) {
+          __DEV__ && console.log(`🔌 DIAG total msgs received: ${wsMessageCount}`);
+        }
         handleSfuMessage(event.data);
       };
       
-      state.ws.onerror = (error) => {
+      wsInstance.onerror = (error) => {
+        if (state.ws !== wsInstance) return;
         clearTimeout(connectionTimeout);
-        console.error('🔌 WebSocket error');
+        __DEV__ && console.error('🔌 WebSocket error');
         if (!state.isDisconnecting && !state.disconnectInProgress) {
           state.onError?.('WebSocket connection error');
         }
       };
       
-      state.ws.onclose = (event) => {
+      wsInstance.onclose = (event) => {
+        // BUGFIX P0: Si ce n'est plus la WS active, c'est un événement fantôme
+        // provenant d'un appel précédent. On l'ignore COMPLÈTEMENT.
+        if (state.ws !== wsInstance) {
+          __DEV__ && console.log(`🔌 Ignoring stale onclose from previous WS (code: ${event.code})`);
+          return;
+        }
         clearTimeout(connectionTimeout);
         __DEV__ && console.log(`🔌 WebSocket closed: ${event.code} - ${event.reason || 'No reason'}`);
         stopPingInterval();
@@ -443,7 +467,7 @@ export async function connectToSfu(
       };
       
     } catch (error) {
-      console.error('🔌 Connect error:', error);
+      __DEV__ && console.error('🔌 Connect error:', error);
       updateConnectionState('failed');
       resolve(false);
     }
@@ -478,8 +502,19 @@ export function disconnectFromSfu(): void {
   const savedRoomTag = state.roomTag;
   
   if (state.ws) {
+    // BUGFIX P0: Neutraliser IMMÉDIATEMENT tous les handlers de l'ancienne WS.
+    // Sans ça, wsToClose.onclose (déclenché ~100ms plus tard) trouverait
+    // isDisconnecting=false (resetté par le nouveau connectToSfu) et
+    // appellerait endCall('error') sur le 2ème appel en cours.
+    const wsToClose = state.ws;
+    wsToClose.onopen = null;
+    wsToClose.onmessage = null;
+    wsToClose.onerror = null;
+    wsToClose.onclose = null;
+    state.ws = null;
+    
     // Envoyer le message leave
-    if (state.ws.readyState === WebSocket.OPEN) {
+    if (wsToClose.readyState === WebSocket.OPEN) {
       const leaveMessage: SfuMessage = {
         type: 'leave',
         peerId: savedPeerId || undefined,
@@ -488,11 +523,10 @@ export function disconnectFromSfu(): void {
         timestamp: Date.now(),
       };
       __DEV__ && console.log('🔌 Sending leave message');
-      sendMessage(leaveMessage);
+      try { wsToClose.send(JSON.stringify(leaveMessage)); } catch {}
     }
     
     // Fermer après un court délai
-    const wsToClose = state.ws;
     setTimeout(() => {
       try {
         if (wsToClose.readyState !== WebSocket.CLOSED) {
@@ -500,8 +534,6 @@ export function disconnectFromSfu(): void {
         }
       } catch (e) {}
     }, 100);
-    
-    state.ws = null;
   }
   
   // Nettoyer
@@ -517,11 +549,11 @@ export function disconnectFromSfu(): void {
   updateConnectionState('disconnected');
   state.reconnectAttempts = 0;
   
-  // Reset flags après un délai
-  setTimeout(() => {
-    state.isDisconnecting = false;
-    state.disconnectInProgress = false;
-  }, 500);
+  // v22: Reset flags immediately instead of 500ms timeout.
+  // The 500ms delay caused audio drops on quick redial — sendAudio()
+  // checked these flags and silently dropped packets.
+  state.isDisconnecting = false;
+  state.disconnectInProgress = false;
 }
 
 // ============================================
@@ -549,7 +581,7 @@ function handleSfuMessage(data: string | ArrayBuffer): void {
     
     // Valider le message
     if (!message || typeof message !== 'object' || !message.type) {
-      console.warn('🔌 Invalid message structure');
+      __DEV__ && console.warn('🔌 Invalid message structure');
       return;
     }
     
@@ -576,10 +608,11 @@ function handleSfuMessage(data: string | ArrayBuffer): void {
         
       case 'pong':
         // Réponse au ping - connexion OK
+        __DEV__ && console.log('🔌 DIAG pong received from SFU ✅');
         break;
         
       case 'error':
-        console.error('🔌 SFU error:', message.error);
+        __DEV__ && console.error('🔌 SFU error:', message.error);
         if (!state.isDisconnecting && !state.disconnectInProgress) {
           state.onError?.(message.error || 'Unknown error');
         }
@@ -592,7 +625,7 @@ function handleSfuMessage(data: string | ArrayBuffer): void {
     
   } catch (error) {
     // Erreur de parsing - ignorer (déjà filtré les non-JSON)
-    console.warn('🔌 Parse error for apparent JSON:', dataStr.slice(0, 50));
+    __DEV__ && console.warn('🔌 Parse error for apparent JSON:', dataStr.slice(0, 50));
   }
 }
 
@@ -700,7 +733,7 @@ function handleIncomingAudio(message: SfuMessage): void {
       }
     }
   } catch (error) {
-    console.error('🔊 Error processing audio:', error);
+    __DEV__ && console.error('🔊 Error processing audio:', error);
   }
 }
 
@@ -749,7 +782,7 @@ export function sendAudio(encryptedAudioData: Uint8Array): boolean {
     
     return true;
   } catch (error) {
-    console.error('Send audio error:', error);
+    __DEV__ && console.error('Send audio error:', error);
     return false;
   }
 }
@@ -840,13 +873,14 @@ function stopPingInterval(): void {
 }
 
 export function hashSenderToken(senderToken: string): string {
-  let hash = 0;
-  for (let i = 0; i < senderToken.length; i++) {
-    const char = senderToken.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
-  }
-  return Math.abs(hash).toString(16).padStart(8, '0');
+  // SECURITY FIX P0: Remplace DJB2 (32 bits, ~4Mrd de valeurs, collision triviale)
+  // par SHA-256 tronqué à 64 bits (8 bytes = 16 hex chars).
+  // Rend impossible la forgerie de collision par un pair malveillant.
+  const tokenBytes = new TextEncoder().encode(senderToken);
+  const hashBytes = sha256(tokenBytes);
+  return Array.from(hashBytes.slice(0, 8))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 // ============================================

@@ -140,7 +140,7 @@ export async function externalizeMedia(
         stripped[field] = `${MFS_PREFIX}${filePath}`;
       } catch (error) {
         // Si l'écriture échoue, garder le base64 inline (dégradation gracieuse)
-        console.warn(`[MediaFileStore] ⚠️ Failed to externalize ${field}:`, error);
+        __DEV__ && console.warn(`[MediaFileStore] ⚠️ Failed to externalize ${field}:`, error);
       }
     }
   }
@@ -209,7 +209,7 @@ export async function resolveMediaToBase64(value: string): Promise<string> {
       encoding: FileSystem.EncodingType.UTF8,
     });
   } catch (error) {
-    console.error('[MediaFileStore] ❌ Failed to read media file:', filePath, error);
+    __DEV__ && console.error('[MediaFileStore] ❌ Failed to read media file:', filePath, error);
     return ''; // Fichier manquant → données perdues
   }
 }
@@ -284,7 +284,7 @@ export async function deleteMediaFiles(sessionId: string, messageId: string): Pr
       }
     }
   } catch (error) {
-    console.warn('[MediaFileStore] Cleanup error:', error);
+    __DEV__ && console.warn('[MediaFileStore] Cleanup error:', error);
   }
 }
 
@@ -298,7 +298,7 @@ export async function deleteSessionMedia(sessionId: string): Promise<void> {
     await FileSystem.deleteAsync(dir, { idempotent: true });
     createdDirs.delete(dir);
   } catch (error) {
-    console.warn('[MediaFileStore] Session cleanup error:', error);
+    __DEV__ && console.warn('[MediaFileStore] Session cleanup error:', error);
   }
 }
 
@@ -311,6 +311,6 @@ export async function clearAllMediaFiles(): Promise<void> {
     await FileSystem.deleteAsync(rootDir, { idempotent: true });
     createdDirs.clear();
   } catch (error) {
-    console.warn('[MediaFileStore] Full cleanup error:', error);
+    __DEV__ && console.warn('[MediaFileStore] Full cleanup error:', error);
   }
 }

@@ -26,12 +26,19 @@
         "NSPhotoLibraryUsageDescription": "Ghostr needs access to your photos to send images in conversations.",
         "NSPhotoLibraryAddUsageDescription": "Ghostr needs permission to save images to your photo library.",
         "UIBackgroundModes": [
-          "audio"
-        ]
+          "audio",
+          "remote-notification"
+        ],
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "entitlements": {
+        "aps-environment": "production",
+        "com.apple.developer.usernotifications.time-sensitive": true
       }
     },
     "android": {
       "softwareKeyboardLayoutMode": "resize",
+      "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0f0f0f"
@@ -51,10 +58,26 @@
         "android.permission.ACCESS_MEDIA_LOCATION",
         "android.permission.READ_MEDIA_VIDEO",
         "android.permission.READ_MEDIA_AUDIO",
-        "android.permission.MODIFY_AUDIO_SETTINGS"
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.USE_FULL_SCREEN_INTENT",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_PHONE_CALL",
+        "android.permission.WAKE_LOCK",
+        "android.permission.DISABLE_KEYGUARD"
       ]
     },
     "plugins": [
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon_nobg.png",
+          "color": "#6C63FF",
+          "sounds": [
+            "./assets/sounds/incallmanager_ringback.mp3"
+          ]
+        }
+      ],
       [
         "expo-camera",
         {
@@ -89,7 +112,12 @@
       ],
       "expo-secure-store",
       "expo-font",
-      "@siteed/expo-audio-studio"
+      "@siteed/expo-audio-studio",
+      "@mykin-ai/expo-audio-stream",
+      "./plugins/withRingbackTone",
+      "./plugins/withIncomingCallFix",
+      "./plugins/withCallNotification",
+      "./plugins/withInsistentRingtone"
     ],
     "extra": {
       "eas": {

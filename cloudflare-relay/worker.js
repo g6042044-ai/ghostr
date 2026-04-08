@@ -1,6 +1,6 @@
 // cloudflare-relay/worker.js
 // Ghostr Anonymous Relay - Cloudflare Worker
-// Version 2.0 — Split-Trust OHTTP support
+// Version 2.1 — R-15: CORS restreint aux origines autorisées
 //
 // DEUX MODES:
 //   /relay  → OHTTP split-trust (forward blobs opaques vers le gateway)
@@ -9,9 +9,39 @@
 // Le worker voit l'IP du client mais PAS le contenu des requêtes /relay
 // (car elles sont chiffrées pour le gateway avec NaCl box)
 
+// R-15: Origines autorisées.
+// En React Native le CORS n'est pas appliqué (il n'y a pas de navigateur),
+// mais des clients web pourraient appeler ce Worker. On restreint donc
+// à des origines explicitement reconnues pour éviter la corrélation
+// temporelle OPTIONS→POST observable sur un réseau local.
+const ALLOWED_ORIGINS = [
+  'capacitor://localhost',       // iOS Capacitor / Expo
+  'http://localhost',            // Dev local
+  'http://localhost:19006',      // Expo web dev
+  'http://localhost:8081',       // Metro bundler
+];
+
+function getAllowedOrigin(requestOrigin) {
+  if (!requestOrigin) return null;
+  if (ALLOWED_ORIGINS.includes(requestOrigin)) return requestOrigin;
+  return null;
+}
+
+function corsHeaders(requestOrigin) {
+  const origin = getAllowedOrigin(requestOrigin) || ALLOWED_ORIGINS[0];
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey, x-upsert, Range',
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin',
+  };
+}
+
 export default {
   async fetch(request, env, ctx) {
     const SUPABASE_URL = env.SUPABASE_URL;
+    const requestOrigin = request.headers.get('Origin') || '';
     
     // ACTION 09: Multi-gateway support
     // Primary gateway (required)
@@ -27,46 +57,51 @@ export default {
     if (GATEWAY_3_URL) GATEWAYS[env.GATEWAY_3_ID || 'gw-tertiary'] = GATEWAY_3_URL;
     const gatewayIds = Object.keys(GATEWAYS);
 
-    // CORS preflight
+    // R-15: CORS preflight — restreint aux origines autorisées
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-          'Access-Control-Allow-Headers': request.headers.get('Access-Control-Request-Headers') || '*',
-          'Access-Control-Max-Age': '86400',
-        }
+        headers: corsHeaders(requestOrigin),
       });
     }
 
     const url = new URL(request.url);
+    const ch = corsHeaders(requestOrigin);
 
     // ================================================================
-    // ACTION 09: Gateway manifests endpoint (for multi-gateway client)
+    // ACTION 09 + P1-A6: Gateway manifests endpoint
+    // Fetches /manifest from each gateway (includes identity key + ephemeral signature)
     // ================================================================
     if (url.pathname === '/gateway-manifests' && request.method === 'GET') {
       if (gatewayIds.length === 0) {
         return new Response(JSON.stringify([]), {
           status: 200,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          headers: { 'Content-Type': 'application/json', ...ch }
         });
       }
       
-      // Fetch pubkeys AND sealed sender keys from all gateways in parallel
+      // P1-A6: Fetch le manifest complet de chaque gateway (inclut identityPubkey + signature)
       const manifests = await Promise.all(
         gatewayIds.map(async (gwId) => {
           try {
             const gwUrl = GATEWAYS[gwId];
-            // Fetch both keys in parallel
-            const [pubkeyResp, ssKeyResp] = await Promise.all([
-              fetch(gwUrl + '/pubkey', { method: 'GET', headers: { 'Accept': 'text/plain' } }),
-              fetch(gwUrl + '/sealed-sender-key', { method: 'GET', headers: { 'Accept': 'text/plain' } }),
-            ]);
-            if (pubkeyResp.ok) {
-              const pubkey = (await pubkeyResp.text()).trim();
-              const sealedSenderKey = ssKeyResp.ok ? (await ssKeyResp.text()).trim() : null;
-              return { id: gwId, pubkey, sealedSenderKey };
+            const manifestResp = await fetch(gwUrl + '/manifest', {
+              method: 'GET',
+              headers: { 'Accept': 'application/json' },
+            });
+            if (manifestResp.ok) {
+              const manifest = await manifestResp.json();
+              // Retransmettre le manifest complet au client
+              // Le client vérifie l'identité + la signature lui-même
+              return {
+                id: manifest.id || gwId,
+                pubkey: manifest.pubkey,
+                sealedSenderKey: manifest.sealedSenderPubkey || null,
+                // P1-A6: Clé d'identité et signature éphémère
+                identityPubkey: manifest.identityPubkey || null,
+                ephemeralSignature: manifest.ephemeralSignature || null,
+                ephemeralSignatureTimestamp: manifest.ephemeralSignatureTimestamp || null,
+              };
             }
           } catch (e) {
             // Gateway unreachable — skip
@@ -79,7 +114,7 @@ export default {
       
       return new Response(JSON.stringify(validManifests), {
         status: 200,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json', ...ch }
       });
     }
 
@@ -91,7 +126,7 @@ export default {
       if (gatewayIds.length === 0) {
         return new Response(JSON.stringify({ error: 'No gateways configured' }), {
           status: 500,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          headers: { 'Content-Type': 'application/json', ...ch }
         });
       }
 
@@ -101,14 +136,14 @@ export default {
       if (encryptedBody.byteLength < 72) { // 16 gwId + 32 pubkey + 24 nonce minimum
         return new Response(JSON.stringify({ error: 'Payload too small' }), {
           status: 400,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          headers: { 'Content-Type': 'application/json', ...ch }
         });
       }
 
       if (encryptedBody.byteLength > 22 * 1024 * 1024) {
         return new Response(JSON.stringify({ error: 'Payload too large (max 22MB)' }), {
           status: 413,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          headers: { 'Content-Type': 'application/json', ...ch }
         });
       }
 
@@ -141,13 +176,13 @@ export default {
           status: gatewayResponse.status,
           headers: {
             'Content-Type': 'application/octet-stream',
-            'Access-Control-Allow-Origin': '*',
+            ...ch,
           }
         });
       } else {
         return new Response(JSON.stringify({ error: 'Unknown gateway ID: ' + gwId }), {
           status: 400,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          headers: { 'Content-Type': 'application/json', ...ch }
         });
       }
       
@@ -172,79 +207,22 @@ export default {
         status: gatewayResponse.status,
         headers: {
           'Content-Type': 'application/octet-stream',
-          'Access-Control-Allow-Origin': '*',
+          ...ch,
         }
       });
     }
 
     // ================================================================
-    // MODE 2: Supabase Storage Proxy (P14 fix: RPC routes blocked)
+    // P0-A2: ALL OTHER ROUTES BLOCKED
     // ================================================================
-    // Only Storage routes (/storage/v1/*) are allowed through the legacy proxy.
-    // RPC calls MUST go through the OHTTP relay (/relay endpoint) to prevent
-    // Authorization header leakage and identity correlation.
-    
-    if (!url.pathname.startsWith('/storage/')) {
-      return new Response(JSON.stringify({ error: 'Only /storage/* routes allowed. RPCs must use OHTTP relay.' }), {
-        status: 403,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-      });
-    }
-
-    if (!SUPABASE_URL) {
-      return new Response(JSON.stringify({ error: 'SUPABASE_URL not configured' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    try {
-      const targetUrl = new URL(url.pathname + url.search, SUPABASE_URL);
-
-      // ACTION 05: Strict header whitelist — prevent device fingerprinting.
-      // Only forward headers strictly necessary for Supabase Storage API calls.
-      // NEVER forward User-Agent, Accept-Language, Referer, etc.
-      const headers = new Headers();
-      const contentType = request.headers.get('Content-Type');
-      if (contentType) headers.set('Content-Type', contentType);
-      const authorization = request.headers.get('Authorization');
-      if (authorization) headers.set('Authorization', authorization);
-      const apikey = request.headers.get('apikey');
-      if (apikey) headers.set('apikey', apikey);
-      const contentLength = request.headers.get('Content-Length');
-      if (contentLength) headers.set('Content-Length', contentLength);
-      const accept = request.headers.get('Accept');
-      if (accept) headers.set('Accept', accept);
-      // Supabase Storage needs these for uploads/downloads
-      const xUpsert = request.headers.get('x-upsert');
-      if (xUpsert) headers.set('x-upsert', xUpsert);
-      const range = request.headers.get('Range');
-      if (range) headers.set('Range', range);
-      headers.set('X-Whisper-Relay', 'cloudflare-v2');
-
-      const response = await fetch(targetUrl.toString(), {
-        method: request.method,
-        headers: headers,
-        body: request.body,
-        redirect: 'follow',
-      });
-
-      const modifiedResponse = new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-      });
-
-      modifiedResponse.headers.set('Access-Control-Allow-Origin', '*');
-      modifiedResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-      modifiedResponse.headers.set('Access-Control-Allow-Headers', '*');
-
-      return modifiedResponse;
-    } catch (error) {
-      return new Response(JSON.stringify({ error: 'Relay error', message: error.message }), {
-        status: 502,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-      });
-    }
+    // Le proxy /storage/* legacy a été SUPPRIMÉ. Toutes les opérations
+    // (messages, médias, blobs) DOIVENT passer par le relay OHTTP (/relay)
+    // pour protéger l'IP du client. Aucun accès direct à Supabase.
+    return new Response(JSON.stringify({ 
+      error: 'Only /relay and /gateway-manifests are allowed. All storage operations must use OHTTP relay.' 
+    }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json', ...ch }
+    });
   },
 };
