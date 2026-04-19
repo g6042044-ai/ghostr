@@ -13,11 +13,20 @@
 import { Platform, Vibration, DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import InCallManager from 'react-native-incall-manager';
+import { setAndroidSpeaker } from './speakerRoute';
 
 let ringtoneActive = false;
 let ringbackActive = false;
 let isPlaying = false;
 let inCallStarted = false;
+
+// v25.0: Speaker state for ringback enforcers.
+// audioService.setSpeaker() updates this so periodic/proximity enforcers
+// enforce the CURRENT speaker state instead of always forcing earpiece.
+let _ringbackSpeakerOn = false;
+export function setCallTonesSpeakerState(on: boolean): void {
+  _ringbackSpeakerOn = on;
+}
 
 // Flag set by transitionToCallAudio: true = InCallManager was freshly started
 // (callee path or first call), false = already running from ringback (caller path).
@@ -72,6 +81,7 @@ export async function startRingback(): Promise<void> {
     await new Promise(r => setTimeout(r, 500));
     if (!ringbackActive) return;
     InCallManager.setForceSpeakerphoneOn(false);
+    setAndroidSpeaker(false);
     await new Promise(r => setTimeout(r, 100));
     if (!ringbackActive) return;
 
@@ -91,6 +101,7 @@ export async function startRingback(): Promise<void> {
     await new Promise(r => setTimeout(r, 300));
     if (!ringbackActive) return;
     InCallManager.setForceSpeakerphoneOn(false);
+    setAndroidSpeaker(false);
     startRingbackProximityEnforcer();
 
   } else {
@@ -191,8 +202,10 @@ async function startEPASRingback(): Promise<void> {
     // Samsung's first-ever USAGE_VOICE_COMMUNICATION routing table update
     // takes ~200-300ms. Enforce at 300ms to catch the delayed update.
     InCallManager.setForceSpeakerphoneOn(false);
+    setAndroidSpeaker(false);
     await new Promise(r => setTimeout(r, 300));
     InCallManager.setForceSpeakerphoneOn(false);
+    setAndroidSpeaker(false);
 
     // Generate 200ms tone chunk (440Hz = ITU-T E.180 European ringback)
     if (!epasRingbackToneChunk) {
@@ -248,6 +261,7 @@ function stopEPASRingback(): void {
     try { epasRingbackModule.stopAudio(); } catch {}
     epasRingbackConfigured = false;
   }
+  _ringbackSpeakerOn = false;
   stopRingbackProximityEnforcer();
 }
 
@@ -278,28 +292,30 @@ function startRingbackProximityEnforcer(): void {
   if (Platform.OS !== 'android') return;
   stopRingbackProximityEnforcer();
 
-  // Periodic enforcement: re-assert earpiece every 500ms while ringback is active.
-  // This catches Samsung's unpredictable AudioPolicyManager re-evaluations on
-  // first-call USAGE_VOICE_COMMUNICATION routing table initialization.
+  // v25.0: Periodic enforcement maintains system-level routing.
+  // AudioTrack-level routing is handled by setSpeaker() via setSoundConfig() which
+  // recreates the AudioTrack with USAGE_MEDIA (speaker) or USAGE_VOICE_COMMUNICATION (earpiece).
+  // Enforcers only need to maintain setCommunicationDevice + legacy routing.
   ringbackPeriodicEnforcer = setInterval(() => {
     if (ringbackActive && inCallStarted) {
-      InCallManager.setForceSpeakerphoneOn(false);
+      setAndroidSpeaker(_ringbackSpeakerOn);
+      InCallManager.setForceSpeakerphoneOn(_ringbackSpeakerOn ? true : false);
     } else {
       if (ringbackPeriodicEnforcer) { clearInterval(ringbackPeriodicEnforcer); ringbackPeriodicEnforcer = null; }
     }
   }, 500);
 
-  // Event-driven enforcement: responds immediately to proximity changes
   ringbackProximitySub = DeviceEventEmitter.addListener('Proximity', (data: { isNear: boolean }) => {
     if (ringbackActive && inCallStarted) {
-      // Immediate + delayed enforcement on each proximity event
-      InCallManager.setForceSpeakerphoneOn(false);
+      setAndroidSpeaker(_ringbackSpeakerOn);
+      InCallManager.setForceSpeakerphoneOn(_ringbackSpeakerOn ? true : false);
       setTimeout(() => {
         if (ringbackActive && inCallStarted) {
-          InCallManager.setForceSpeakerphoneOn(false);
+          setAndroidSpeaker(_ringbackSpeakerOn);
+          InCallManager.setForceSpeakerphoneOn(_ringbackSpeakerOn ? true : false);
         }
       }, 300);
-      __DEV__ && console.log(`🔔 Ringback proximity ${data?.isNear ? 'near' : 'far'} → earpiece enforced`);
+      __DEV__ && console.log(`🔔 Ringback proximity ${data?.isNear ? 'near' : 'far'} → ${_ringbackSpeakerOn ? 'speaker' : 'earpiece'} enforced`);
     }
   });
   __DEV__ && console.log('🔔 Ringback proximity enforcer started (periodic + event-driven)');
@@ -372,6 +388,7 @@ export async function transitionToCallAudio(): Promise<void> {
   ringtoneActive = false;
   ringbackActive = false;
   isPlaying = false;
+  _ringbackSpeakerOn = false;
 
   // Step 2: Platform-specific InCallManager lifecycle
   if (Platform.OS === 'android') {
@@ -388,6 +405,7 @@ export async function transitionToCallAudio(): Promise<void> {
     InCallManager.start({ media: 'audio' });
     InCallManager.setKeepScreenOn(true);
     InCallManager.setForceSpeakerphoneOn(false);
+    setAndroidSpeaker(false);
     inCallStarted = true;
 
     const startSettleMs = 500;
@@ -642,6 +660,7 @@ export function restartInCallManager(): void {
   InCallManager.start({ media: 'audio' });
   InCallManager.setKeepScreenOn(true);
   InCallManager.setForceSpeakerphoneOn(false);
+  setAndroidSpeaker(false);
   inCallStarted = true;
   __DEV__ && console.log('🔔 InCallManager restarted (fresh mode) ✅');
 }

@@ -117,7 +117,8 @@
       "./plugins/withRingbackTone",
       "./plugins/withIncomingCallFix",
       "./plugins/withCallNotification",
-      "./plugins/withInsistentRingtone"
+      "./plugins/withInsistentRingtone",
+      "./plugins/withSpeakerRoute"
     ],
     "extra": {
       "eas": {

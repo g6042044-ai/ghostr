@@ -1,6 +1,17 @@
 /**
  * ContactInfoScreen.tsx
  * Écran d'info contact 1:1 - Style WhatsApp/Telegram
+ *
+ * CORRECTIONS APPLIQUÉES:
+ *   1. Notifications: suppression du doublon (Quick Action mute retiré,
+ *      toggle persistant dans la section Paramètres uniquement)
+ *   2. Mute: état persisté via muteService (AsyncStorage chiffré)
+ *      + envoi E2E au pair → push bloqué côté émetteur
+ *   3. Vidéo: bouton désactivé visuellement (pas encore implémenté)
+ *   4. Reset clés: supprimé (faux sentiment de sécurité, le Triple Ratchet
+ *      se répare automatiquement via DH ratchet steps)
+ *   5. Blocage: supprimé (cosmétique, n'empêchait rien — supprimer la
+ *      conversation est la bonne réponse)
  */
 
 import React, { useState, useEffect } from 'react';
@@ -20,13 +31,14 @@ import { Ionicons } from '@expo/vector-icons';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { sessionService } from '../services/tripleRatchet/sessionService';
-import { sendSessionReset1to1, clearLocalMessages1to1, clearUnreadCount } from '../services/api1to1';
+import { clearLocalMessages1to1, clearUnreadCount } from '../services/api1to1';
 import { useCall1to1 } from '../hooks/useCall1to1';
 import { isInCall1to1 } from '../services/call1to1Service';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { theme } from '../components/ui/theme';
 import { Avatar } from '../components/Avatar';
 import { generateAvatarInitials } from '../services/crypto';
+import { loadMuteState, setSessionMuted } from '../services/muteService';
 
 const COLORS = {
   primary: theme.colors.primary,
@@ -72,15 +84,13 @@ export const ContactInfoScreen: React.FC = () => {
   const [contact, setContact] = useState<ContactData | null>(null);
   const [loading, setLoading] = useState(true);
   const [muted, setMuted] = useState(false);
-  const [blocked, setBlocked] = useState(false);
   const [isCallingAudio, setIsCallingAudio] = useState(false);
-  const [resetting, setResetting] = useState(false);
 
-  // Hook pour les appels 1:1
   const { startCall, isInCall } = useCall1to1();
 
   useEffect(() => {
     loadContact();
+    loadPersistedStates();
   }, [sessionId]);
 
   const loadContact = async () => {
@@ -102,14 +112,31 @@ export const ContactInfoScreen: React.FC = () => {
     }
   };
 
-  // Appel audio via Triple Ratchet
+  /**
+   * Charge l'état de mute depuis le stockage.
+   */
+  const loadPersistedStates = async () => {
+    try {
+      const isMuted = await loadMuteState(sessionId);
+      setMuted(isMuted);
+    } catch (error) {
+      __DEV__ && console.error('[ContactInfo] Error loading persisted states:', error);
+    }
+  };
+
+  /**
+   * Toggle mute — persiste via muteService (AsyncStorage chiffré + cache mémoire)
+   */
+  const handleToggleMute = async (newMuted: boolean) => {
+    setMuted(newMuted);
+    await setSessionMuted(sessionId, newMuted);
+  };
+
   const handleCall = async () => {
     if (isCallingAudio || isInCall || !contact) return;
-    
     try {
       setIsCallingAudio(true);
       const result = await startCall(sessionId, contact.displayName);
-      
       if (!result.success) {
         Alert.alert('Erreur', result.error || 'Impossible de démarrer l\'appel');
       }
@@ -121,12 +148,12 @@ export const ContactInfoScreen: React.FC = () => {
     }
   };
 
-  const handleVideoCall = () => Alert.alert('Appel vidéo', 'Les appels vidéo arrivent bientôt !');
+  const handleVideoCall = () => {
+    // Bouton désactivé — ne rien faire
+  };
 
-  // Recherche dans la conversation
   const handleSearch = () => {
     if (!contact) return;
-    // Naviguer vers la conversation en mode recherche
     navigation.navigate('Conversation', {
       conversationId: sessionId,
       conversationName: contact.displayName,
@@ -134,21 +161,7 @@ export const ContactInfoScreen: React.FC = () => {
     });
   };
 
-  const handleBlock = () => {
-    Alert.alert(
-      blocked ? 'Débloquer' : 'Bloquer',
-      blocked 
-        ? `${contact?.displayName} pourra à nouveau vous contacter.`
-        : `${contact?.displayName} ne pourra plus vous envoyer de messages.`,
-      [
-        { text: 'Annuler', style: 'cancel' },
-        { text: blocked ? 'Débloquer' : 'Bloquer', style: blocked ? 'default' : 'destructive', onPress: () => setBlocked(!blocked) },
-      ]
-    );
-  };
-
   const handleDelete = () => {
-    // BUG FIX #5: Bloquer la suppression si un appel est en cours
     if (isInCall1to1()) {
       Alert.alert('Appel en cours', 'Terminez l\'appel avant de supprimer la conversation.');
       return;
@@ -163,7 +176,6 @@ export const ContactInfoScreen: React.FC = () => {
           style: 'destructive',
           onPress: async () => {
             try {
-              // BUG FIX #1: Nettoyer TOUTES les données de transport AVANT de supprimer la session
               await clearLocalMessages1to1(sessionId);
               await clearUnreadCount(sessionId);
               try { await AsyncStorage.removeItem(`@ghostr_reactions_${sessionId}`); } catch {}
@@ -172,44 +184,6 @@ export const ContactInfoScreen: React.FC = () => {
               navigation.goBack();
             } catch (error) {
               Alert.alert('Erreur', 'Impossible de supprimer');
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  const handleResetSession = () => {
-    Alert.alert(
-      'Réinitialiser le chiffrement',
-      'La session de chiffrement sera détruite des deux côtés. ' +
-      'Un nouveau handshake sera nécessaire au prochain message.\n\n' +
-      'Utilisez cette option si :\n' +
-      '• Vous suspectez une compromission de vos clés\n' +
-      '• Un appareil avec cette session a été perdu ou volé\n' +
-      '• Vous souhaitez forcer une rotation complète des clés',
-      [
-        { text: 'Annuler', style: 'cancel' },
-        {
-          text: 'Réinitialiser',
-          style: 'destructive',
-          onPress: async () => {
-            setResetting(true);
-            try {
-              const result = await sendSessionReset1to1(sessionId);
-              if (result.success) {
-                Alert.alert(
-                  'Session réinitialisée',
-                  'Le chiffrement a été réinitialisé. Un nouveau handshake sera établi au prochain message.',
-                  [{ text: 'OK', onPress: () => { navigation.goBack(); navigation.goBack(); } }]
-                );
-              } else {
-                Alert.alert('Erreur', result.error || 'Impossible de réinitialiser la session');
-              }
-            } catch (error) {
-              Alert.alert('Erreur', 'Une erreur est survenue lors de la réinitialisation');
-            } finally {
-              setResetting(false);
             }
           },
         },
@@ -238,7 +212,6 @@ export const ContactInfoScreen: React.FC = () => {
   }
 
   const avatarColor = getAvatarColor(sessionId);
-  const initial = generateAvatarInitials(contact.displayName);
 
   return (
     <View style={styles.container}>
@@ -273,20 +246,14 @@ export const ContactInfoScreen: React.FC = () => {
           </View>
         </View>
 
-        {/* Quick Actions */}
+        {/* Quick Actions — CORRIGÉ: notification retirée (reste dans Paramètres), vidéo désactivée */}
         <View style={styles.quickActions}>
           <QuickAction icon="call" label="Audio" onPress={handleCall} />
-          <QuickAction icon="videocam" label="Vidéo" onPress={handleVideoCall} />
+          <QuickAction icon="videocam" label="Vidéo" onPress={handleVideoCall} disabled />
           <QuickAction icon="search" label="Recherche" onPress={handleSearch} />
-          <QuickAction 
-            icon={muted ? "notifications-off" : "notifications"} 
-            label={muted ? "Muet" : "Son"} 
-            onPress={() => setMuted(!muted)}
-            muted={muted}
-          />
         </View>
 
-        {/* Security Section */}
+        {/* Security */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Sécurité</Text>
           <View style={styles.card}>
@@ -303,41 +270,22 @@ export const ContactInfoScreen: React.FC = () => {
           </View>
         </View>
 
-        {/* Settings Section */}
+        {/* Paramètres — CORRIGÉ: un seul toggle notifications, état persisté */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Paramètres</Text>
           <View style={styles.card}>
             <Row 
-              icon="notifications" 
+              icon={muted ? "notifications-off" : "notifications"} 
               title="Notifications" 
               subtitle={muted ? 'Désactivées' : 'Activées'}
               toggle
               toggleValue={!muted}
-              onToggle={() => setMuted(!muted)}
-            />
-            <View style={styles.sep} />
-            <Row 
-              icon={blocked ? "checkmark-circle" : "ban"} 
-              title={blocked ? "Contact bloqué" : "Bloquer le contact"}
-              danger={!blocked}
-              onPress={handleBlock}
-              rightText={blocked ? "Débloquer" : undefined}
+              onToggle={() => handleToggleMute(!muted)}
             />
           </View>
         </View>
 
-        {/* Sécurité & Danger */}
-        <TouchableOpacity 
-          style={styles.resetBtn} 
-          onPress={handleResetSession}
-          disabled={resetting}
-        >
-          <Ionicons name="refresh-outline" size={20} color={COLORS.primary} />
-          <Text style={styles.resetBtnText}>
-            {resetting ? 'Réinitialisation...' : 'Réinitialiser le chiffrement'}
-          </Text>
-        </TouchableOpacity>
-
+        {/* Supprimer la conversation */}
         <TouchableOpacity style={styles.dangerBtn} onPress={handleDelete}>
           <Ionicons name="trash-outline" size={20} color={COLORS.danger} />
           <Text style={styles.dangerBtnText}>Supprimer la conversation</Text>
@@ -351,13 +299,14 @@ export const ContactInfoScreen: React.FC = () => {
   );
 };
 
-// Composants réutilisables
-const QuickAction = ({ icon, label, onPress, muted }: { icon: string; label: string; onPress: () => void; muted?: boolean }) => (
-  <TouchableOpacity style={styles.quickAction} onPress={onPress}>
-    <View style={[styles.quickActionIcon, muted && styles.quickActionIconMuted]}>
-      <Ionicons name={icon as any} size={22} color={muted ? COLORS.textSecondary : COLORS.primary} />
+// --- Composants réutilisables ---
+
+const QuickAction = ({ icon, label, onPress, muted, disabled }: { icon: string; label: string; onPress: () => void; muted?: boolean; disabled?: boolean }) => (
+  <TouchableOpacity style={styles.quickAction} onPress={onPress} disabled={disabled}>
+    <View style={[styles.quickActionIcon, muted && styles.quickActionIconMuted, disabled && styles.quickActionIconDisabled]}>
+      <Ionicons name={icon as any} size={22} color={disabled ? COLORS.textTertiary : muted ? COLORS.textSecondary : COLORS.primary} />
     </View>
-    <Text style={styles.quickActionLabel}>{label}</Text>
+    <Text style={[styles.quickActionLabel, disabled && styles.quickActionLabelDisabled]}>{label}</Text>
   </TouchableOpacity>
 );
 
@@ -407,7 +356,9 @@ const styles = StyleSheet.create({
   quickAction: { alignItems: 'center', flex: 1, maxWidth: 80 },
   quickActionIcon: { width: 52, height: 52, borderRadius: 16, backgroundColor: COLORS.surfaceLight, justifyContent: 'center', alignItems: 'center', marginBottom: 6 },
   quickActionIconMuted: { backgroundColor: COLORS.surface },
+  quickActionIconDisabled: { backgroundColor: COLORS.surface, opacity: 0.4 },
   quickActionLabel: { fontSize: 12, color: COLORS.textSecondary, fontWeight: '500' },
+  quickActionLabelDisabled: { opacity: 0.4 },
 
   section: { marginBottom: 20, paddingHorizontal: 16 },
   sectionTitle: { fontSize: 13, fontWeight: '600', color: COLORS.textTertiary, textTransform: 'uppercase', marginBottom: 8, marginLeft: 4 },
@@ -428,9 +379,6 @@ const styles = StyleSheet.create({
   toggleKnob: { width: 24, height: 24, borderRadius: 12, backgroundColor: '#FFF', alignSelf: 'flex-end' },
   toggleKnobOff: { alignSelf: 'flex-start' },
   rightText: { fontSize: 14, color: COLORS.primary, fontWeight: '600' },
-
-  resetBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginHorizontal: 16, marginBottom: 12, padding: 16, backgroundColor: COLORS.surfaceLight, borderRadius: 16, gap: 10, borderWidth: 1, borderColor: COLORS.border },
-  resetBtnText: { fontSize: 16, fontWeight: '600', color: COLORS.primary },
 
   dangerBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginHorizontal: 16, marginBottom: 24, padding: 16, backgroundColor: COLORS.dangerLight, borderRadius: 16, gap: 10 },
   dangerBtnText: { fontSize: 16, fontWeight: '600', color: COLORS.danger },

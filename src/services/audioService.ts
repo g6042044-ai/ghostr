@@ -30,7 +30,8 @@ import { Platform, DeviceEventEmitter } from 'react-native';
 import * as Device from 'expo-device';
 import InCallManager from 'react-native-incall-manager';
 import { getRandomBytes } from './crypto';
-import { setSpeakerSyncCallback, isRingtoneActive, stopInCallManager } from './callTones';
+import { setSpeakerSyncCallback, isRingtoneActive, stopInCallManager, setCallTonesSpeakerState } from './callTones';
+import { setAndroidSpeaker, clearAndroidRoute } from './speakerRoute';
 
 // ============================================
 // TYPES
@@ -107,7 +108,7 @@ const stats: AudioStats = {
 interface GainProfile { earpiece: number; speaker: number; }
 
 const ANDROID_GAINS: Record<string, GainProfile> = {};
-const ANDROID_DEFAULT: GainProfile = { earpiece: 1.0, speaker: 1.0 };
+const ANDROID_DEFAULT: GainProfile = { earpiece: 1.0, speaker: 3.0 };
 const IOS_GAIN: GainProfile = { earpiece: 1.0, speaker: 1.0 };
 
 function getPlaybackGain(): number {
@@ -241,9 +242,12 @@ export async function reconfigurePlaybackEngine(): Promise<void> {
   }
 
   // Platform-specific playback mode:
-  // Android 'conversation' → with native patch: USAGE_VOICE_COMMUNICATION + CONTENT_TYPE_SPEECH
-  // iOS 'voiceProcessing' → VP I/O engine with AEC (playSound requires this)
-  const playbackMode = Platform.OS === 'android' ? 'conversation' : 'voiceProcessing';
+  // Android: 'conversation' → USAGE_VOICE_COMMUNICATION (earpiece)
+  //          'default' → USAGE_MEDIA (speaker) — Samsung ignores setPreferredDevice for voice comm
+  // iOS: 'voiceProcessing' → VP I/O engine with AEC (playSound requires this)
+  const playbackMode = Platform.OS === 'android'
+    ? (speakerOn ? 'default' : 'conversation')
+    : 'voiceProcessing';
 
   __DEV__ && console.log(`🔊 [${Platform.OS}] Configuring audio engine (${playbackMode})...`);
 
@@ -303,6 +307,7 @@ export async function reconfigurePlaybackEngine(): Promise<void> {
 
   // Re-enforce InCallManager routing after warm-up.
   InCallManager.setForceSpeakerphoneOn(speakerOn ? true : false);
+  setAndroidSpeaker(speakerOn);
 
   // Step 3: Configure with call-mode settings
   try {
@@ -693,6 +698,17 @@ export async function startCallAudioPipeline(
   const routeSettleMs = Platform.OS === 'android' ? 150 : 100;
   await new Promise(r => setTimeout(r, routeSettleMs));
   InCallManager.setForceSpeakerphoneOn(speakerOn ? true : false);
+  setAndroidSpeaker(speakerOn);
+
+  // iOS: If speaker was toggled during ringback, the pipeline started mic in
+  // earpiece VP I/O mode. InCallManager.setForceSpeakerphoneOn(true) alone won't
+  // switch the VP I/O route — we must restart the mic with the correct route.
+  // Delay 300ms to let VP I/O priming complete before tearing down the mic.
+  if (Platform.OS === 'ios' && speakerOn && recording) {
+    await new Promise(r => setTimeout(r, 300));
+    __DEV__ && console.log('🔊 [ios] Speaker was ON before pipeline — restarting mic for speaker');
+    await restartMicWithRoute(true);
+  }
 
   __DEV__ && console.log(`🎤 [${Platform.OS}] startCallAudioPipeline() DONE, speaker=${speakerOn} ✅`);
   return true;
@@ -716,9 +732,37 @@ export async function setSpeaker(on: boolean): Promise<void> {
     return;
   }
   speakerOn = on;
+  setCallTonesSpeakerState(on); // Sync to ringback enforcers
   if (isWeb()) return;
   if (Platform.OS === 'ios' && recording) {
     await restartMicWithRoute(on);
+  } else if (Platform.OS === 'android') {
+    // ═══════════════════════════════════════════════════════════════
+    // ANDROID SPEAKER FIX (Samsung / Android 12+)
+    //
+    // On Samsung, audioTrack.setPreferredDevice(SPEAKER) is IGNORED
+    // for USAGE_VOICE_COMMUNICATION AudioTracks — Samsung's audio
+    // policy enforces earpiece for voice communication regardless.
+    //
+    // FIX: Recreate the AudioTrack with a different USAGE:
+    //   Speaker ON  → 'default' mode → USAGE_MEDIA → routes to speaker
+    //   Speaker OFF → 'conversation' mode → USAGE_VOICE_COMMUNICATION → earpiece
+    //
+    // This is the same pattern as iOS (restartMicWithRoute), adapted
+    // for Android: recreate the audio engine with the correct attributes.
+    // ═══════════════════════════════════════════════════════════════
+    if (EPAS && typeof EPAS.setSoundConfig === 'function') {
+      const playbackMode = on ? 'default' : 'conversation';
+      try {
+        await EPAS.setSoundConfig({ sampleRate: 16000, playbackMode });
+        __DEV__ && console.log(`🔊 [Android] AudioTrack recreated: mode=${playbackMode}`);
+      } catch (e) {
+        __DEV__ && console.error('🔊 [Android] setSoundConfig for speaker toggle failed:', e);
+      }
+    }
+    // Also set system-level routing (native module + legacy)
+    setAndroidSpeaker(on);
+    InCallManager.setForceSpeakerphoneOn(on ? true : false);
   } else {
     InCallManager.setForceSpeakerphoneOn(on ? true : false);
   }
@@ -732,6 +776,7 @@ export function setTestMode(_: boolean): void {}
 export function forceAudioRoute(): void {
   if (isWeb() || isRingtoneActive()) return;
   InCallManager.setForceSpeakerphoneOn(speakerOn ? true : false);
+  setAndroidSpeaker(speakerOn);
 }
 export const forceEarpieceNow = forceAudioRoute;
 
@@ -757,11 +802,13 @@ export function startProximityRouteEnforcer(): void {
       setTimeout(() => {
         if (recording || playing) {
           InCallManager.setForceSpeakerphoneOn(speakerOn ? true : false);
+          setAndroidSpeaker(speakerOn);
         }
       }, 250);
       setTimeout(() => {
         if (recording || playing) {
           InCallManager.setForceSpeakerphoneOn(speakerOn ? true : false);
+          setAndroidSpeaker(speakerOn);
         }
       }, 700);
       __DEV__ && console.log(`📱 Proximity ${data?.isNear ? 'near' : 'far'} → route enforcement scheduled: speaker=${speakerOn}`);
@@ -847,6 +894,7 @@ export async function restartCallAudioPipeline(
 
   hasEPAS = false;
   InCallManager.setForceSpeakerphoneOn(speakerOn ? true : false);
+  setAndroidSpeaker(speakerOn);
   await new Promise(r => setTimeout(r, 150));
 
   return startCallAudioPipeline(onAudioCaptured);
@@ -871,6 +919,8 @@ export async function cleanupAudio(): Promise<void> {
 
   // Reset InCallManager route override
   if (!isWeb()) { try { InCallManager.setForceSpeakerphoneOn(null); } catch {} }
+  // Android 12+: clear setCommunicationDevice
+  clearAndroidRoute();
 
   // Drain delay between mic stop and engine teardown.
   // iOS: VP I/O is a single unit with both input and output. stopMicrophone()
@@ -958,6 +1008,7 @@ export async function cleanupAudio(): Promise<void> {
   nativePreWarmed = false;
   muted = false;
   speakerOn = false;
+  setCallTonesSpeakerState(false); // Reset ringback enforcer speaker state
   playCount = 0;
   stats.packetsSent = 0; stats.packetsReceived = 0; stats.packetsLost = 0;
   stats.averageLatencyMs = 0; stats.outputLevel = 0;

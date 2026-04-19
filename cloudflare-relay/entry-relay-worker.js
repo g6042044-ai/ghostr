@@ -236,7 +236,7 @@ export default {
     const DEFAULT_EXIT = env.DEFAULT_EXIT_RELAY || 'https://whisper-exit-relay.fly.dev';
 
     const securityHeaders = {
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': 'capacitor://localhost',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Upgrade, Connection, Sec-WebSocket-Key, Sec-WebSocket-Version, Sec-WebSocket-Protocol, Sec-WebSocket-Extensions',
       'X-Content-Type-Options': 'nosniff',
@@ -394,59 +394,17 @@ export default {
       }
     }
 
-    // Route directe au SFU (fallback)
+    // PRODUCTION FIX (Mod-06): /direct/room/ SUPPRIMÉ
+    // Cette route contournait le double-hop et exposait l'IP du client au SFU.
     const directMatch = url.pathname.match(/^\/direct\/room\/([a-f0-9]{32})$/);
-    
     if (directMatch) {
-      const roomTag = directMatch[1];
-      const sfuUrl = env.SFU_URL || 'https://whisper-sfu.ghostcrypt.workers.dev';
-      
-      // Rate limiting sur la route directe aussi
-      const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-      if (!(await checkRateLimitDO(clientIP, env))) {
-        return new Response(JSON.stringify({ error: 'Rate limit exceeded', code: 'RATE_LIMITED' }), {
-          status: 429,
-          headers: { 'Content-Type': 'application/json', ...securityHeaders, 'Retry-After': '60' },
-        });
-      }
-      
-      const upgradeHeader = request.headers.get('Upgrade');
-      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
-        return new Response(JSON.stringify({ error: 'WebSocket upgrade required' }), {
-          status: 426, headers: { 'Content-Type': 'application/json', ...securityHeaders },
-        });
-      }
-
-      const peerId = url.searchParams.get('peerId');
-      const authToken = url.searchParams.get('authToken');
-
-      if (!peerId) {
-        return new Response(JSON.stringify({ error: 'Missing peerId' }), {
-          status: 400, headers: { 'Content-Type': 'application/json', ...securityHeaders },
-        });
-      }
-
-      let targetUrl = `${toHttpsUrl(sfuUrl)}/room/${roomTag}?peerId=${encodeURIComponent(peerId)}`;
-      if (authToken) {
-        targetUrl += `&authToken=${encodeURIComponent(authToken)}`;
-      }
-
-      try {
-        const proxyRequest = new Request(targetUrl, {
-          method: 'GET',
-          headers: {
-            'Upgrade': 'websocket',
-            'Connection': 'Upgrade',
-            'Sec-WebSocket-Key': request.headers.get('Sec-WebSocket-Key') || crypto.randomUUID(),
-            'Sec-WebSocket-Version': request.headers.get('Sec-WebSocket-Version') || '13',
-          },
-        });
-        return await fetch(proxyRequest);
-      } catch (error) {
-        return new Response(JSON.stringify({ error: 'SFU unreachable' }), {
-          status: 502, headers: { 'Content-Type': 'application/json', ...securityHeaders },
-        });
-      }
+      return new Response(JSON.stringify({
+        error: 'Direct SFU access disabled. Use /relay/:region/room/:tag for anonymized routing.',
+        code: 'DIRECT_ACCESS_DISABLED',
+      }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json', ...securityHeaders },
+      });
     }
 
     return new Response(JSON.stringify({ error: 'Not found', code: 'NOT_FOUND' }), {

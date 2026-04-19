@@ -148,8 +148,9 @@ const CONVERSATIONS_KEY = 'whisper_conversations_v3';
 const CONVERSATIONS_KEY_ENCRYPTED = 'whisper_conversations_encrypted_v6';
 const SENDER_TOKEN_KEY = 'whisper_sender_token';
 const USER_SECRET_KEY = 'whisper_user_secret_v1';
-const GLOBAL_DISPLAY_NAME_KEY = 'whisper_display_name_v1';
-const GLOBAL_AVATAR_KEY = 'whisper_avatar_v1';
+// Clés opaques pour le profil — ne révèlent pas le type de données stockées
+const OPAQUE_DISPLAY_NAME_KEY = 'g_pd_v1';
+const OPAQUE_AVATAR_KEY = 'g_pa_v1';
 const MESSAGES_PREFIX = 'whisper_messages_';
 const DELETED_IDS_PREFIX = 'whisper_deleted_';
 const LAST_SEEN_PREFIX = 'whisper_lastseen_';
@@ -230,13 +231,37 @@ export async function setEncryptionKeys(
   convKey: Uint8Array | null
 ): Promise<void> {
   if (localKey) {
-    // ACTION 5: Initialize opaque key seed from localKey
-    // We use SHA-256(localKey || "opaque-seed") to get a stable seed
+    // ══════════════════════════════════════════════════════════════════
+    // FIX: MIGRATION DES CLÉS OPAQUES ASYNCSTORAGE
+    // ══════════════════════════════════════════════════════════════════
+    // Quand on passe de hardware encryption → PIN encryption (ou inversement),
+    // le seed opaque change → les noms de clés AsyncStorage changent.
+    // reencryptAllEntries() re-chiffre les VALEURS en place mais ne renomme
+    // pas les CLÉS. Il faut donc renommer les clés AVANT de changer le seed.
+    //
+    // On collecte les anciens noms opaques (avec l'ancien seed), on calcule
+    // les nouveaux noms (avec le nouveau seed), et on renomme dans AsyncStorage.
+    // ══════════════════════════════════════════════════════════════════
+
+    // 1. Calculer le NOUVEAU seed (sans l'activer encore)
     const { sha256 } = await import('@noble/hashes/sha256');
     const seedInput = new Uint8Array(localKey.length + 11);
     seedInput.set(localKey, 0);
     seedInput.set(new TextEncoder().encode('opaque-seed'), localKey.length);
-    setOpaqueKeySeed(sha256(seedInput));
+    const newSeed = sha256(seedInput);
+
+    // 2. Migrer les clés opaques SI le seed va changer
+    //    (= premier setup PIN, ou transition hardware → PIN)
+    //    On le fait AVANT de changer le seed pour pouvoir calculer
+    //    les anciens noms avec l'ancien seed.
+    try {
+      await migrateOpaqueKeys(newSeed);
+    } catch (e) {
+      __DEV__ && console.error('[storage] ⚠️ Opaque key migration error (non-fatal):', e);
+    }
+
+    // 3. Activer le nouveau seed
+    setOpaqueKeySeed(newSeed);
     
     // Rotation de la clé locale (HKDF + re-chiffrement des sessions)
     await setEncryptionKeyAndRotate(localKey);
@@ -266,6 +291,99 @@ export async function setEncryptionKeys(
   }
 }
 
+/**
+ * Migre les noms de clés opaques AsyncStorage quand le seed change.
+ *
+ * Scénario: L'utilisateur a des données stockées avec seed_HW (hardware)
+ * et active un PIN → seed_PIN. Les noms de clés changent.
+ * Cette fonction renomme les entrées AsyncStorage de l'ancien nom vers le nouveau.
+ *
+ * IMPORTANT: Doit être appelée AVANT de changer le seed opaque.
+ *
+ * @param newSeed - Le nouveau seed qui sera activé après la migration
+ */
+async function migrateOpaqueKeys(newSeed: Uint8Array): Promise<void> {
+  // Récupérer les conversation IDs depuis la liste chiffrée (SecureStore)
+  // qui n'est PAS affectée par les clés opaques
+  let conversations: StoredConversation[];
+  try {
+    conversations = await getConversations();
+  } catch {
+    return; // Pas de conversations → rien à migrer
+  }
+
+  if (conversations.length === 0) return;
+
+  // Les préfixes de clés AsyncStorage liés aux conversations
+  const PREFIXES = [
+    MESSAGES_PREFIX,       // whisper_messages_
+    DELETED_IDS_PREFIX,    // whisper_deleted_
+    LAST_SEEN_PREFIX,      // whisper_lastseen_
+    PARTICIPANTS_PREFIX,   // whisper_participants_
+  ];
+
+  // Fonction helper pour calculer un opaque key avec un seed spécifique
+  const computeOpaque = (readableKey: string, seed: Uint8Array): string => {
+    const { sha256: sha256Sync } = require('@noble/hashes/sha256');
+    const keyBytes = new TextEncoder().encode(readableKey);
+    const combined = new Uint8Array(seed.length + keyBytes.length);
+    combined.set(seed, 0);
+    combined.set(keyBytes, seed.length);
+    const hash = sha256Sync(combined);
+    const hex = Array.from(hash.slice(0, 16))
+      .map((b: number) => b.toString(16).padStart(2, '0'))
+      .join('');
+    return 'g_' + hex;
+  };
+
+  // Collecter les renommages à effectuer
+  const renames: [string, string][] = []; // [oldKey, newKey]
+
+  for (const conv of conversations) {
+    for (const prefix of PREFIXES) {
+      const readableName = prefix + conv.id;
+
+      // Calculer l'ancien nom (avec le seed actuel, encore actif)
+      const oldName = opaqueStorageKey(readableName);
+
+      // Calculer le nouveau nom (avec le nouveau seed)
+      const newName = computeOpaque(readableName, newSeed);
+
+      // Ne renommer que si les noms diffèrent
+      if (oldName !== newName) {
+        renames.push([oldName, newName]);
+      }
+    }
+  }
+
+  if (renames.length === 0) {
+    __DEV__ && console.log('[storage] ✅ Opaque keys already aligned, no migration needed');
+    return;
+  }
+
+  __DEV__ && console.log(`[storage] 🔄 Migrating ${renames.length} opaque AsyncStorage keys...`);
+
+  // Effectuer les renommages (read old → write new → delete old)
+  let migrated = 0;
+  let skipped = 0;
+  for (const [oldKey, newKey] of renames) {
+    try {
+      const value = await AsyncStorage.getItem(oldKey);
+      if (value !== null) {
+        await AsyncStorage.setItem(newKey, value);
+        await AsyncStorage.removeItem(oldKey);
+        migrated++;
+      } else {
+        skipped++; // Clé n'existait pas (normal si conversation vide)
+      }
+    } catch (e) {
+      __DEV__ && console.error(`[storage] ⚠️ Failed to rename ${oldKey.slice(0, 10)}... → ${newKey.slice(0, 10)}...`, e);
+    }
+  }
+
+  __DEV__ && console.log(`[storage] ✅ Opaque key migration: ${migrated} migrated, ${skipped} skipped`);
+}
+
 export function getEncryptionKey(): Uint8Array | null {
   const { getEncryptionKey: getKey } = require('./localCrypto');
   return getKey();
@@ -277,7 +395,26 @@ export function clearEncryptionKey(): void {
     conversationsEncryptionKey.fill(0);
   }
   conversationsEncryptionKey = null;
-  // Legacy ratchet cache cleared (ratchetStorage supprimé, plus de cache à vider)
+
+  // Vider le cache des tokens de conversation en mémoire.
+  // Sans ça, les tokens restaient en RAM après verrouillage → un memory dump
+  // pouvait révéler les mappings conversation-token.
+  clearConversationTokenCache();
+
+  // Verrouiller la mémoire de SessionService : zéroise toutes les clés privées
+  // (identité Ed25519 + X25519, signed pre-keys, OTPKs, PQ signed keys, anciennes
+  //  clés archivées, états de ratchet actifs et leurs header/chain keys).
+  // require() synchrone + try/catch pour éviter les cycles d'import et gérer
+  // le cas où le module ne serait pas encore chargé (premier démarrage).
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { sessionService } = require('./tripleRatchet');
+    if (sessionService && typeof sessionService.lockMemory === 'function') {
+      sessionService.lockMemory();
+    }
+  } catch (e) {
+    __DEV__ && console.error('[storage] sessionService.lockMemory failed:', e);
+  }
 }
 
 export { isEncryptionEnabled };
@@ -352,7 +489,18 @@ export async function transitionToHardwareEncryption(): Promise<boolean> {
     const seedInput = new Uint8Array(hwConvKey.length + 11);
     seedInput.set(hwConvKey, 0);
     seedInput.set(new TextEncoder().encode('opaque-seed'), hwConvKey.length);
-    setOpaqueKeySeed(sha256(seedInput));
+    const newSeed = sha256(seedInput);
+
+    // FIX: Migrate opaque AsyncStorage key names BEFORE changing the seed.
+    // Without this, data stored under PIN-derived opaque names becomes
+    // invisible after the seed switches to the hardware-derived one.
+    try {
+      await migrateOpaqueKeys(newSeed);
+    } catch (e) {
+      __DEV__ && console.error('[storage] ⚠️ Opaque key migration error (PIN→HW):', e);
+    }
+
+    setOpaqueKeySeed(newSeed);
 
     __DEV__ && console.log('[storage] ✅ Full transition PIN → hardware encryption complete');
     return true;
@@ -563,41 +711,41 @@ export async function getOrCreateUserSecret(): Promise<Uint8Array> {
 // ============================================
 
 /**
- * Vérifie si le pseudo global est défini
- * Utilise AsyncStorage pour la fiabilité (le pseudo n'est pas une donnée sensible)
- * v2.0: Vérifie aussi le stockage sessionService en fallback
+ * Vérifie si le pseudo global est défini.
+ * 
+ * IMPORTANT : cette fonction est appelée dans le fast path de App.tsx
+ * AVANT l'initialisation de la crypto. Elle ne doit PAS tenter de
+ * déchiffrer — elle vérifie uniquement l'existence de la clé.
+ * setGlobalDisplayName() valide que le nom est non-vide avant stockage,
+ * donc si la clé existe et a du contenu, un profil est configuré.
  */
 export async function hasGlobalDisplayName(): Promise<boolean> {
   try {
-    // 1. Vérification principale dans le stockage global
-    const name = await AsyncStorage.getItem(GLOBAL_DISPLAY_NAME_KEY);
-    const hasName = !!name && name.trim().length > 0;
-    __DEV__ && console.log(`👤 hasGlobalDisplayName: ${hasName} (value: "${name?.slice(0, 20) || 'null'}")`);
+    // Vérifier l'existence sans déchiffrer (pas de crypto à ce stade)
+    const raw = await AsyncStorage.getItem(OPAQUE_DISPLAY_NAME_KEY);
+    if (raw && raw.length > 0) return true;
     
-    if (hasName) {
-      return true;
-    }
-    
-    // 2. Fallback: Vérifier dans le stockage sessionService
-    // Cela gère les cas de désynchronisation entre les deux systèmes
+    // Fallback : sessionService peut avoir le profil si désynchronisation.
+    // On vérifie seulement l'existence + parsing JSON (pas de decrypt ici,
+    // la synchro vers OPAQUE_DISPLAY_NAME_KEY se fera au prochain
+    // getGlobalDisplayName() quand la crypto sera initialisée).
     const sessionProfile = await AsyncStorage.getItem('ghostr_pq_my_profile');
     if (sessionProfile) {
       try {
+        // Tenter le parse direct (données non chiffrées ou profil en clair)
         const profile = JSON.parse(sessionProfile);
         if (profile.displayName && 
             profile.displayName.trim().length > 0 && 
             profile.displayName !== 'Anonymous') {
-          __DEV__ && console.log(`👤 hasGlobalDisplayName: Found in session storage, syncing...`);
-          // Synchroniser vers le stockage global
-          await AsyncStorage.setItem(GLOBAL_DISPLAY_NAME_KEY, profile.displayName);
-          if (profile.avatarBase64) {
-            await AsyncStorage.setItem(GLOBAL_AVATAR_KEY, profile.avatarBase64);
-          }
-          __DEV__ && console.log(`👤 hasGlobalDisplayName: Synced from session storage`);
           return true;
         }
-      } catch (parseError) {
-        __DEV__ && console.warn('👤 hasGlobalDisplayName: Failed to parse session profile');
+      } catch {
+        // JSON parse failed — probablement chiffré, on ne peut pas lire ici.
+        // Ce n'est pas grave : après unlock/crypto init, getGlobalDisplayName()
+        // sera appelé et pourra déchiffrer + synchroniser.
+        // On retourne true car la présence de données (même chiffrées) indique
+        // qu'un profil existe.
+        return sessionProfile.length > 0;
       }
     }
     
@@ -609,13 +757,13 @@ export async function hasGlobalDisplayName(): Promise<boolean> {
 }
 
 /**
- * Récupère le pseudo global de l'utilisateur
+ * Récupère le pseudo global
  */
 export async function getGlobalDisplayName(): Promise<string | null> {
   try {
-    const name = await AsyncStorage.getItem(GLOBAL_DISPLAY_NAME_KEY);
-    __DEV__ && console.log(`👤 getGlobalDisplayName: "${name?.slice(0, 20) || 'null'}"`);
-    return name || null;
+    const raw = await AsyncStorage.getItem(OPAQUE_DISPLAY_NAME_KEY);
+    if (!raw) return null;
+    return decryptIfNeeded(raw) || null;
   } catch (error) {
     __DEV__ && console.error('❌ getGlobalDisplayName error:', error);
     return null;
@@ -623,17 +771,14 @@ export async function getGlobalDisplayName(): Promise<string | null> {
 }
 
 /**
- * Définit le pseudo global de l'utilisateur
+ * Définit le pseudo global
  */
 export async function setGlobalDisplayName(name: string): Promise<void> {
   if (!name || name.trim().length === 0) {
     throw new Error('Le pseudo ne peut pas être vide');
   }
-  const trimmedName = name.trim();
-  
   try {
-    await AsyncStorage.setItem(GLOBAL_DISPLAY_NAME_KEY, trimmedName);
-    __DEV__ && console.log('👤 Global display name saved:', trimmedName);
+    await AsyncStorage.setItem(OPAQUE_DISPLAY_NAME_KEY, encryptIfEnabled(name.trim()));
   } catch (error) {
     __DEV__ && console.error('❌ setGlobalDisplayName error:', error);
     throw error;
@@ -645,13 +790,14 @@ export async function setGlobalDisplayName(name: string): Promise<void> {
 // ============================================
 
 /**
- * Récupère l'avatar global de l'utilisateur
+ * Récupère l'avatar global
  * @returns Avatar en base64 (data:image/...) ou null
  */
 export async function getGlobalAvatar(): Promise<string | null> {
   try {
-    const avatar = await AsyncStorage.getItem(GLOBAL_AVATAR_KEY);
-    return avatar || null;
+    const raw = await AsyncStorage.getItem(OPAQUE_AVATAR_KEY);
+    if (!raw) return null;
+    return decryptIfNeeded(raw) || null;
   } catch (error) {
     __DEV__ && console.error('Failed to get avatar:', error);
     return null;
@@ -659,17 +805,15 @@ export async function getGlobalAvatar(): Promise<string | null> {
 }
 
 /**
- * Définit l'avatar global de l'utilisateur
+ * Définit l'avatar global
  * @param avatarBase64 - Image en base64 (data:image/...) ou null pour supprimer
  */
 export async function setGlobalAvatar(avatarBase64: string | null): Promise<void> {
   try {
     if (avatarBase64) {
-      await AsyncStorage.setItem(GLOBAL_AVATAR_KEY, avatarBase64);
-      __DEV__ && console.log('🖼️ Global avatar set');
+      await AsyncStorage.setItem(OPAQUE_AVATAR_KEY, encryptIfEnabled(avatarBase64));
     } else {
-      await AsyncStorage.removeItem(GLOBAL_AVATAR_KEY);
-      __DEV__ && console.log('🖼️ Global avatar removed');
+      await AsyncStorage.removeItem(OPAQUE_AVATAR_KEY);
     }
   } catch (error) {
     __DEV__ && console.error('Failed to set avatar:', error);
@@ -1421,8 +1565,8 @@ export async function clearAllData(): Promise<void> {
   // ======================================
   try {
     const PROFILE_KEYS_TO_PRESERVE = [
-      GLOBAL_DISPLAY_NAME_KEY,  // 'whisper_display_name_v1'
-      GLOBAL_AVATAR_KEY,        // 'whisper_avatar_v1'
+      OPAQUE_DISPLAY_NAME_KEY,  // 'g_pd_v1'
+      OPAQUE_AVATAR_KEY,        // 'g_pa_v1'
       'ghostr_pq_my_profile',   // Profil sessionService
     ];
     

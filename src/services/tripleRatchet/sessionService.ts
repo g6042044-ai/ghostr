@@ -2451,7 +2451,100 @@ export class SessionService {
   // ==========================================
   // RESET & CLEANUP
   // ==========================================
-  
+
+  /**
+   * ═══════════════════════════════════════════════════════════════════════════
+   * VERROUILLAGE EN MÉMOIRE — Zéroisation complète sans toucher au stockage
+   * ═══════════════════════════════════════════════════════════════════════════
+   *
+   * Appelée par le handler de verrouillage (App.tsx → onConfirmedBackground
+   * ou retour shouldLock). Elle :
+   *   - Zéroise toutes les clés privées (identité long terme, pre-keys classiques
+   *     et post-quantiques, anciennes clés archivées).
+   *   - Zéroise tous les états de ratchet actifs (rootKey, chainKeys, headerKeys,
+   *     clés sautées et état SPQR — via cleanupTripleRatchetState).
+   *   - Vide toutes les Maps (sessions, ratchetStates, cryptoLocks, reservedOtpkIds).
+   *   - Marque `initialized = false` pour forcer un rechargement complet depuis
+   *     le stockage chiffré au prochain déverrouillage.
+   *
+   * Le stockage persistant (SecureStore/AsyncStorage) n'est PAS touché — les
+   * données y restent chiffrées avec la clé dérivée du mot de passe utilisateur
+   * (qui vient d'être effacée de la RAM). Sans le mot de passe, elles sont
+   * inaccessibles.
+   *
+   * Différence avec clearAllData() : clearAllData supprime aussi le stockage
+   * (reset complet, perte définitive des données). lockMemory() n'affecte
+   * que la RAM.
+   * ═══════════════════════════════════════════════════════════════════════════
+   */
+  lockMemory(): void {
+    try {
+      // ── Zéroiser tous les états de ratchet actifs ───────────────────────
+      for (const state of this.ratchetStates.values()) {
+        try { cleanupTripleRatchetState(state); } catch {}
+      }
+      this.ratchetStates.clear();
+
+      // ── Zéroiser l'identity key pair (Ed25519 + X25519 dérivée) ─────────
+      if (this.identityKeyPair) {
+        try { zeroize(this.identityKeyPair.privateKey.bytes); } catch {}
+        try { zeroize(this.identityKeyPair.dhPrivateKey.bytes); } catch {}
+      }
+      this.identityKeyPair = null;
+
+      // ── Zéroiser la signed pre-key courante ─────────────────────────────
+      if (this.signedPreKey) {
+        try { zeroize(this.signedPreKey.keyPair.privateKey.bytes); } catch {}
+      }
+      this.signedPreKey = null;
+
+      // ── Zéroiser toutes les one-time pre-keys ───────────────────────────
+      for (const otpk of this.oneTimePreKeys.values()) {
+        try { zeroize(otpk.keyPair.privateKey.bytes); } catch {}
+      }
+      this.oneTimePreKeys.clear();
+
+      // ── Zéroiser la clé PQ signed courante (ML-KEM) ─────────────────────
+      if (this.pqSignedKey) {
+        try { zeroize(this.pqSignedKey.keyPair.secretKey.bytes); } catch {}
+      }
+      this.pqSignedKey = null;
+
+      // ── Zéroiser les anciennes signed pre-keys archivées ────────────────
+      for (const entry of this.oldSignedPreKeys.values()) {
+        try { zeroize(entry.key.keyPair.privateKey.bytes); } catch {}
+      }
+      this.oldSignedPreKeys.clear();
+
+      // ── Zéroiser les anciennes PQ signed keys archivées ─────────────────
+      for (const entry of this.oldPQSignedKeys.values()) {
+        try { zeroize(entry.key.keyPair.secretKey.bytes); } catch {}
+      }
+      this.oldPQSignedKeys.clear();
+
+      // ── Vider les sessions (pas de clés secrètes dedans, mais des méta-
+      //    données : fingerprints, noms, avatars qu'on ne veut pas en RAM) ─
+      this.sessions.clear();
+
+      // ── Vider les verrous et réservations ───────────────────────────────
+      this.cryptoLocks.clear();
+      this.reservedOtpkIds.clear();
+
+      // ── Forcer un rechargement depuis le stockage chiffré au déverrouillage
+      this.initialized = false;
+
+      // NOTE: on ne touche PAS `myProfile` (nom + avatar sont du non-secret
+      // déjà affichable sur le LockScreen et dans l'App Switcher masqué).
+      // NOTE: on ne vide PAS `profileChangeListeners` ni les autres listeners :
+      // ils sont attachés par des composants React toujours montés, et vider
+      // les sets les casserait pour la durée de la session.
+
+      __DEV__ && console.log('[SessionService] 🔒 Memory locked (keys zeroized)');
+    } catch (error) {
+      __DEV__ && console.error('[SessionService] lockMemory error:', error);
+    }
+  }
+
   /**
    * Supprime toutes les données (pour reset complet)
    */

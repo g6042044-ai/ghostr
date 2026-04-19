@@ -111,6 +111,13 @@ export function SettingsScreen({ onSecurityChange }: Props) {
       const { sendPushTokenToAllPeers } = require('../services/api1to1');
       sendPushTokenToAllPeers().catch(() => {});
     }
+    // v28.0: Informer TOUS les pairs de la préférence globale de mute.
+    // Si désactivé → les pairs utilisent un blob aléatoire → aucun push envoyé.
+    // Si réactivé → les pairs ré-envoient de vrais blobs push.
+    try {
+      const { sendMutePreferenceToAllPeers } = require('../services/api1to1');
+      sendMutePreferenceToAllPeers(!enabled).catch(() => {});
+    } catch {}
   };
 
   const handleClearData = async () => {

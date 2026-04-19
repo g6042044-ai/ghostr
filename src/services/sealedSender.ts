@@ -341,9 +341,14 @@ function _applyPadding(json: string, currentBytes: number, targetBytes: number):
       return JSON.stringify(obj);
     }
     return result;
-  } catch {
-    // Fallback: string manipulation (should not happen with valid JSON)
-    return json.slice(0, -1) + ',"_p":"' + padding + '"}';
+  } catch (e) {
+    // Si le JSON est invalide à ce stade, c'est un BUG en amont —
+    // ne pas masquer avec du string manipulation qui pourrait produire
+    // du JSON invalide et créer un side-channel de taille.
+    __DEV__ && console.error('[SealedSender] CRITICAL: Invalid JSON in _applyPadding — this should never happen:', e);
+    // Retourner sans padding : le message sera légèrement plus petit que le tier
+    // mais au moins le JSON sera valide et déchiffrable.
+    return json;
   }
 }
 

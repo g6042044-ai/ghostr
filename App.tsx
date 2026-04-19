@@ -3,7 +3,7 @@
 // Conversations 1-à-1 uniquement
 // Triple Ratchet + Appels vocaux + Vérification sécurité
 import 'react-native-get-random-values';
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { StatusBar, View, StyleSheet, Text, AppState, AppStateStatus, Platform, Alert } from 'react-native';
 import { useKeepAwake } from 'expo-keep-awake';
 import { NavigationContainer, DefaultTheme } from '@react-navigation/native';
@@ -16,6 +16,10 @@ import 'react-native-gesture-handler';
 // Push Notifications
 import * as Notifications from 'expo-notifications';
 import * as TaskManager from 'expo-task-manager';
+// Screen capture protection: bloque screenshots Android (FLAG_SECURE),
+// scrcpy, enregistrement d'écran, casting. Sur iOS, la capture ne peut être
+// que détectée (pas bloquée) — l'overlay privacy reste la protection primaire.
+import * as ScreenCapture from 'expo-screen-capture';
 import {
   initPushNotifications,
   showLocalNotification,
@@ -111,18 +115,24 @@ const LAST_BACKGROUND_TIME_KEY = '@whisper_last_background_time';
 const SECURITY_CHECK_SHOWN_KEY = '@whisper_security_check_shown';
 const ONBOARDING_COMPLETED_KEY = '@ghostr_onboarding_completed';
 
-// Routes qui utilisent presentation: 'modal' ou 'fullScreenModal'.
-// Sur Android, ces présentations ouvrent une nouvelle Activity native,
-// ce qui fait passer l'Activity principale en état "background" pendant
-// toute la durée où le modal est affiché.
-const MODAL_ROUTES = new Set(['Security', 'Create1to1', 'Join1to1', 'ConnectionSuccess']);
-
-// Durée max (ms) d'un artefact de transition Android.
-// Quand une navigation card/slide provoque un faux background sur
-// certaines ROMs, le passage background survient < 500ms après le
-// onStateChange. Un vrai Home press n'est PAS précédé d'un
-// onStateChange récent, donc ce seuil ne crée jamais de faux négatif.
-const NAV_ARTIFACT_THRESHOLD_MS = 500;
+// ═══════════════════════════════════════════════════════════════════════════
+// DÉTECTION VRAI vs FAUX BACKGROUND
+// ═══════════════════════════════════════════════════════════════════════════
+// Android ouvre les écrans `presentation: 'modal'` / `'fullScreenModal'` dans
+// une nouvelle Activity : l'Activity principale passe en `onPause` → AppState
+// devient temporairement 'background', puis 'active' quand la nouvelle Activity
+// est au premier plan. Les transitions de navigation peuvent aussi générer de
+// brefs `background`.
+//
+// Règle fiable : si l'app est TOUJOURS en 'background' après ce délai, alors
+// l'utilisateur a bel et bien quitté l'app (Home, App Switcher, autre app).
+// Si elle revient en 'active' avant, c'était une transition interne.
+//
+// 1200ms est assez long pour couvrir les transitions les plus lentes
+// (Android bas de gamme, grosses animations), et assez court pour que
+// l'utilisateur ne remarque aucun délai de verrouillage perceptible.
+// ═══════════════════════════════════════════════════════════════════════════
+const BACKGROUND_CONFIRMATION_MS = 1200;
 
 export type RootStackParamList = {
   ConversationList: undefined;
@@ -334,32 +344,28 @@ export default function App() {
   const [needsProfileSetup, setNeedsProfileSetup] = useState(false);
   const [securityCheckResult, setSecurityCheckResult] = useState<SecurityCheckResult | null>(null);
   const [splashStatus, setSplashStatus] = useState<string | undefined>(undefined);
-  
+
+  // Privacy overlay: masque le contenu pendant 'inactive'/'background' afin
+  // qu'aucune donnée ne fuite dans l'App Switcher / Recents.
+  const [showPrivacyOverlay, setShowPrivacyOverlay] = useState(false);
+
   const previousAppState = useRef<AppStateStatus>(AppState.currentState);
   const inactiveStartTime = useRef<number | null>(null);
   const wentToBackground = useRef(false);
   const initStartedRef = useRef(false);
 
-  // ── Lock suppression state (aucun timer — que des timestamps et booleans) ──
-  //
-  // isOnModalRoute: true quand la route active est un écran modal (Android
-  //   nouvelle Activity → faux background pendant toute la durée du modal)
-  //
-  // lastNavChangeTime: timestamp du dernier onStateChange. Si un background
-  //   survient < 500ms après, c'est un artefact de transition Android, pas
-  //   un vrai départ de l'app. Un vrai Home press n'est JAMAIS précédé
-  //   d'un onStateChange récent.
-  const isOnModalRoute = useRef(false);
-  const lastNavChangeTime = useRef<number>(0);
+  // Refs miroirs pour accéder aux valeurs à jour dans le timer de confirmation
+  // sans recréer l'useEffect à chaque changement (ce qui ferait rater des
+  // transitions d'AppState).
+  const lockEnabledRef = useRef(lockEnabled);
+  const lockTimeoutRef = useRef(lockTimeout);
+  const isLockedRef = useRef(isLocked);
+  useEffect(() => { lockEnabledRef.current = lockEnabled; }, [lockEnabled]);
+  useEffect(() => { lockTimeoutRef.current = lockTimeout; }, [lockTimeout]);
+  useEffect(() => { isLockedRef.current = isLocked; }, [isLocked]);
 
-  const handleNavigationStateChange = useCallback((state: any) => {
-    let route = state;
-    while (route?.routes) {
-      route = route.routes[route.index];
-    }
-    lastNavChangeTime.current = Date.now();
-    isOnModalRoute.current = !!(route?.name && MODAL_ROUTES.has(route.name));
-  }, []);
+  // Timer de confirmation de vrai background (voir BACKGROUND_CONFIRMATION_MS)
+  const bgConfirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (initStartedRef.current) return;
@@ -368,72 +374,166 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Fonction appelée quand le timer confirme que le background est RÉEL
+    // (l'utilisateur a vraiment quitté l'app : Home, App Switcher, autre app).
+    const onConfirmedBackground = async () => {
+      bgConfirmTimer.current = null;
+
+      // Double-check : l'état doit toujours être 'background' au moment du fire
+      // (si l'app est revenue en 'active' entre-temps, on n'aurait pas dû arriver ici
+      //  car clearTimeout a été appelé — mais safety first).
+      if (AppState.currentState !== 'background') {
+        return;
+      }
+
+      wentToBackground.current = true;
+
+      const departureTime = inactiveStartTime.current || Date.now();
+      try {
+        await AsyncStorage.setItem(LAST_BACKGROUND_TIME_KEY, departureTime.toString());
+      } catch {}
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // VERROUILLAGE IMMÉDIAT (timeout === 0)
+      // ═══════════════════════════════════════════════════════════════════════
+      // On efface les clés MAINTENANT (pendant le background), pas au retour.
+      // Raison : tant que les clés sont en RAM pendant le background, elles
+      // restent accessibles via un memory dump (root / debugger / cold boot).
+      // Effacer au moment du départ ferme cette fenêtre d'attaque et respecte
+      // littéralement le paramètre « Immédiatement ».
+      //
+      // Note : ce setState ne re-rend pas l'UI tant que l'app est en background
+      // (le thread JS tourne ~5-10s puis est suspendu par l'OS), mais quand
+      // l'utilisateur reviendra, il verra directement le LockScreen.
+      if (lockEnabledRef.current && lockTimeoutRef.current === 0 && !isLockedRef.current) {
+        try { clearEncryptionKey(); } catch {}
+        try { clearSealedSenderState(); } catch {}
+        setIsLocked(true);
+        try { await AsyncStorage.removeItem(LAST_BACKGROUND_TIME_KEY); } catch {}
+      }
+    };
+
     const handleAppStateChange = async (nextAppState: AppStateStatus) => {
       const prevState = previousAppState.current;
-      
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // INACTIVE (iOS uniquement)
+      // ═══════════════════════════════════════════════════════════════════════
+      // État transitoire : Control Center, Notification Center, FaceID prompt,
+      // preview de l'App Switcher. Afficher immédiatement le privacy overlay
+      // pour que rien de sensible ne fuite.
       if (nextAppState === 'inactive' && prevState === 'active') {
         inactiveStartTime.current = Date.now();
+        setShowPrivacyOverlay(true);
       }
-      
-      if (nextAppState === 'background') {
-        // ═══════════════════════════════════════════════════════════════
-        // FILTRE À LA SOURCE — déterminer si c'est un VRAI background
-        // (l'utilisateur a quitté l'app) ou un FAUX (artefact interne).
-        //
-        // Faux backgrounds connus :
-        //   1. Écran modal actif (Activity Android séparée)
-        //   2. Artefact de transition card/slide (< 500ms après nav)
-        //   3. Picker / caméra ouvert (lockGuard)
-        //   4. Appel en cours (capteur de proximité)
-        //
-        // On ne marque wentToBackground=true QUE pour les vrais.
-        // Vérifier au retour (active) est sujet aux race conditions
-        // car l'ordre des callbacks varie selon les ROMs Android.
-        // ═══════════════════════════════════════════════════════════════
-        const msSinceNav = Date.now() - lastNavChangeTime.current;
 
-        const isFake = isOnModalRoute.current                 // 1
-                    || (msSinceNav < NAV_ARTIFACT_THRESHOLD_MS) // 2
-                    || isLockSuppressed()                       // 3
-                    || isInCall1to1();                          // 4
-        
-        if (!isFake) {
-          wentToBackground.current = true;
-          const departureTime = inactiveStartTime.current || Date.now();
-          await AsyncStorage.setItem(LAST_BACKGROUND_TIME_KEY, departureTime.toString());
+      // ═══════════════════════════════════════════════════════════════════════
+      // BACKGROUND
+      // ═══════════════════════════════════════════════════════════════════════
+      if (nextAppState === 'background') {
+        setShowPrivacyOverlay(true);
+
+        // Cas #1 — FAUX background EXPLICITE déclaré par l'app.
+        // Ce sont les seuls cas où on sait avec CERTITUDE que le passage en
+        // background est dû à une action interne de l'app qui ouvre une
+        // Activity système :
+        //   - `isLockSuppressed()` : image picker / caméra / document picker
+        //     (src/services/lockGuard.ts, appelé par ConversationScreen,
+        //      EditProfileScreen, SetupProfileScreen autour des ImagePicker.launch*)
+        //   - `isInCall1to1()` : appel vocal en cours (capteur de proximité
+        //      + InCallManager basculent brièvement l'état).
+        //
+        // Dans ces cas, on ne fait rien : pas de verrouillage, pas de timer.
+        if (isLockSuppressed() || isInCall1to1()) {
+          pausePrivacyServices();
+          // (On ne stoppe pas le polling pendant un appel — il est géré par
+          //  le service d'appel lui-même.)
+          if (!isInCall1to1()) {
+            stopGlobalPolling1to1();
+            inviteWatcher.stop();
+          }
+          previousAppState.current = nextAppState;
+          return;
         }
-        
+
+        // Cas #2 — background AMBIGU.
+        // On ne sait PAS encore si c'est :
+        //   (a) un vrai départ (Home, App Switcher, autre app) → il faut verrouiller
+        //   (b) l'ouverture d'un écran modal Android → il ne faut PAS verrouiller
+        //   (c) un artefact de transition de navigation Android → idem
+        //
+        // Pour trancher, on arme un timer. Si l'app revient en 'active' avant
+        // l'expiration, c'était un cas (b) ou (c) — on annule. Si le timer
+        // expire en étant toujours en 'background', c'est un (a) confirmé.
+        //
+        // Cette approche est robuste car elle ne fait AUCUNE hypothèse sur la
+        // route courante ou les timings de navigation : on observe uniquement
+        // le comportement réel d'AppState.
+        if (bgConfirmTimer.current) {
+          clearTimeout(bgConfirmTimer.current);
+        }
+        bgConfirmTimer.current = setTimeout(onConfirmedBackground, BACKGROUND_CONFIRMATION_MS);
+
         pausePrivacyServices();
         if (!isInCall1to1()) {
           stopGlobalPolling1to1();
           inviteWatcher.stop();
         }
       }
-      
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // ACTIVE — retour au premier plan
+      // ═══════════════════════════════════════════════════════════════════════
       if (nextAppState === 'active') {
+        // Si le timer de confirmation tourne encore, on l'annule : le background
+        // n'était pas "réel" (ouverture d'un modal Android, transition, etc.).
+        if (bgConfirmTimer.current) {
+          clearTimeout(bgConfirmTimer.current);
+          bgConfirmTimer.current = null;
+        }
+
         inactiveStartTime.current = null;
-        
+
+        // Vérifier si un vrai background a été enregistré (wentToBackground
+        // est passé à true par onConfirmedBackground, OU l'app a été tuée
+        // et relancée pendant qu'on était en background — mais dans ce cas
+        // on ne passe pas par ici, on passe par initializeApp).
         if (wentToBackground.current && lockEnabled) {
           wentToBackground.current = false;
-          
+
+          // timeout === 0 a déjà été traité dans onConfirmedBackground ; isLocked
+          // est déjà true. On laisse l'overlay privacy actif : le LockScreen
+          // prendra la main au prochain rendu (il est opaque, masque tout).
+          if (isLockedRef.current) {
+            setShowPrivacyOverlay(false);
+            previousAppState.current = nextAppState;
+            return;
+          }
+
           const shouldLock = await checkIfShouldLock(lockTimeout);
           if (shouldLock) {
-            clearEncryptionKey();
-            clearSealedSenderState();
+            try { clearEncryptionKey(); } catch {}
+            try { clearSealedSenderState(); } catch {}
             setIsLocked(true);
-            await AsyncStorage.removeItem(LAST_BACKGROUND_TIME_KEY);
+            // L'overlay reste affiché jusqu'au rendu du LockScreen (opaque) :
+            // ça évite tout flash de la conversation déchiffrée entre les
+            // deux frames.
+            setShowPrivacyOverlay(false);
+            try { await AsyncStorage.removeItem(LAST_BACKGROUND_TIME_KEY); } catch {}
             previousAppState.current = nextAppState;
             return;
           }
         }
+
         wentToBackground.current = false;
-        await AsyncStorage.removeItem(LAST_BACKGROUND_TIME_KEY);
-        
+        try { await AsyncStorage.removeItem(LAST_BACKGROUND_TIME_KEY); } catch {}
+        setShowPrivacyOverlay(false);
+
         if (!isLocked) {
           resumePrivacyServices();
           startGlobalPolling1to1();
           inviteWatcher.start().catch(console.error);
-          
+
           // PERF A3: Poll immédiat au retour de background.
           // Avec A1, le sealed sender est probablement encore valide → ce poll
           // part instantanément au lieu d'attendre le premier cycle de constantTraffic.
@@ -443,12 +543,18 @@ export default function App() {
           pollAllSessions().catch(() => {});
         }
       }
-      
+
       previousAppState.current = nextAppState;
     };
 
     const subscription = AppState.addEventListener('change', handleAppStateChange);
-    return () => subscription.remove();
+    return () => {
+      subscription.remove();
+      if (bgConfirmTimer.current) {
+        clearTimeout(bgConfirmTimer.current);
+        bgConfirmTimer.current = null;
+      }
+    };
   }, [lockEnabled, lockTimeout, isLocked]);
 
   const checkIfShouldLock = async (timeoutMinutes: number): Promise<boolean> => {
@@ -523,6 +629,15 @@ export default function App() {
   const initializeApp = async () => {
     try {
       console.log('[App] initializeApp: starting...');
+
+      // Activer la protection contre les captures d'écran dès le démarrage.
+      // Android : ajoute FLAG_SECURE → écran noir dans les screenshots et les
+      //   logiciels de mirroring (scrcpy, Vysor, enregistrement d'écran).
+      // iOS : installe un listener pour détecter les screenshots ; la capture
+      //   elle-même ne peut pas être empêchée (limitation de l'OS).
+      // Le tag 'ghostr-global' permet de le désactiver temporairement autour
+      //   d'un ImagePicker (où Android bloquerait aussi la preview de caméra).
+      ScreenCapture.preventScreenCaptureAsync('ghostr-global').catch(() => {});
       
       // ═══════════════════════════════════════════════
       // PHASE 1 — RAPIDE (~100ms) : Checks AsyncStorage
@@ -979,9 +1094,12 @@ export default function App() {
     <SafeAreaProvider>
       <GestureHandlerRootView style={styles.container}>
         <StatusBar barStyle="light-content" backgroundColor={theme.colors.background} />
-        <NavigationContainer theme={NavigationTheme} onStateChange={handleNavigationStateChange}>
+        <NavigationContainer theme={NavigationTheme}>
           <AppContent onSecurityChange={refreshLockState} />
         </NavigationContainer>
+        {showPrivacyOverlay && (
+          <View pointerEvents="none" style={styles.privacyOverlay} />
+        )}
         <InAppNotificationHost />
       </GestureHandlerRootView>
     </SafeAreaProvider>
@@ -996,6 +1114,20 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: theme.colors.background,
+  },
+  // Overlay plein écran affiché quand l'app est 'inactive' ou 'background'.
+  // Empêche la fuite d'informations sensibles dans :
+  //   - l'App Switcher iOS (snapshot pris à 'inactive')
+  //   - le Recents Android (snapshot pris au moment du pause)
+  //   - les previews de FaceID / contrôle center
+  // Note : pour une protection complète contre les screenshots utilisateur,
+  // ajouter aussi `expo-screen-capture` → preventScreenCaptureAsync().
+  privacyOverlay: {
+    position: 'absolute',
+    top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: theme.colors.background,
+    zIndex: 9999,
+    elevation: 9999,
   },
   errorContainer: {
     flex: 1,

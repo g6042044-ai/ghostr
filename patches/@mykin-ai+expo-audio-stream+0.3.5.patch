@@ -11,7 +11,8 @@ diff --git a/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo
  import android.os.Bundle
  import android.util.Base64
  import android.util.Log
-@@ -48,6 +51,6 @@
+@@ -47,7 +50,7 @@
+     var isPromiseSettled: Boolean = false
  ) // contains the decoded base64 chunk
  
 -class AudioPlaybackManager(private val eventSender: EventSender? = null) {
@@ -35,11 +36,7 @@ diff --git a/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo
  
          // Set content type based on playback mode
          val contentType = when (config.playbackMode) {
-@@ -106,10 +116,26 @@
-         audioTrack =
-             AudioTrack.Builder()
-                 .setAudioAttributes(audioAttributesBuilder.build())
-                 .setAudioFormat(audioFormat)
+@@ -110,6 +120,59 @@
                  .setBufferSizeInBytes(minBufferSize * 2)
                  .setTransferMode(AudioTrack.MODE_STREAM)
                  .build()
@@ -59,13 +56,62 @@ diff --git a/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo
 +                }
 +            }
 +        }
++    }
++
++    /**
++     * Actively route the AudioTrack to speaker or earpiece.
++     *
++     * CRITICAL: setPreferredDevice() is the HIGHEST PRIORITY routing in Android.
++     * It overrides ALL system-level routing including setCommunicationDevice().
++     * Setting null means "let system decide" — but in MODE_IN_COMMUNICATION
++     * the system ALWAYS picks earpiece. So we must actively SET the speaker
++     * device, not just clear the override.
++     */
++    fun setPreferredOutputDevice(useSpeaker: Boolean) {
++        if (!::audioTrack.isInitialized) return
++        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
++            try {
++                val am = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
++                val devices = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
++                if (useSpeaker) {
++                    val speaker = devices?.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
++                    if (speaker != null) {
++                        val result = audioTrack.setPreferredDevice(speaker)
++                        Log.d("AudioPlaybackManager", "audioTrack.setPreferredDevice(SPEAKER): $result")
++                    } else {
++                        audioTrack.setPreferredDevice(null)
++                        Log.w("AudioPlaybackManager", "SPEAKER not found, cleared preferred device")
++                    }
++                } else {
++                    val earpiece = devices?.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
++                    earpiece?.let {
++                        audioTrack.setPreferredDevice(it)
++                        Log.d("AudioPlaybackManager", "audioTrack.setPreferredDevice(EARPIECE)")
++                    }
++                }
++            } catch (e: Exception) {
++                Log.w("AudioPlaybackManager", "setPreferredOutputDevice failed: ${e.message}")
++            }
++        }
      }
  
      private fun initializeChannels() {
 diff --git a/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/ExpoPlayAudioStreamModule.kt b/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/ExpoPlayAudioStreamModule.kt
 --- a/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/ExpoPlayAudioStreamModule.kt
 +++ b/node_modules/@mykin-ai/expo-audio-stream/android/src/main/java/expo/modules/audiostream/ExpoPlayAudioStreamModule.kt
-@@ -280,6 +280,6 @@
+@@ -233,6 +233,10 @@
+             audioRecorderManager.toggleSilence()
+         }
+ 
++        Function("setPreferredOutputDevice") { useSpeaker: Boolean ->
++            audioPlaybackManager.setPreferredOutputDevice(useSpeaker)
++        }
++
+         AsyncFunction("setSoundConfig") { config: Map<String, Any?>, promise: Promise ->
+             val useDefault = config["useDefault"] as? Boolean ?: false
+             
+@@ -279,7 +283,7 @@
+     }
  
      private fun initializePlaybackManager() {
 -        audioPlaybackManager = AudioPlaybackManager(this)
@@ -88,15 +134,15 @@ diff --git a/node_modules/@mykin-ai/expo-audio-stream/ios/AudioSessionManager.sw
 diff --git a/node_modules/@mykin-ai/expo-audio-stream/ios/ExpoPlayAudioStreamModule.swift b/node_modules/@mykin-ai/expo-audio-stream/ios/ExpoPlayAudioStreamModule.swift
 --- a/node_modules/@mykin-ai/expo-audio-stream/ios/ExpoPlayAudioStreamModule.swift
 +++ b/node_modules/@mykin-ai/expo-audio-stream/ios/ExpoPlayAudioStreamModule.swift
-@@ -394,7 +394,10 @@
+@@ -392,9 +392,12 @@
+         if self.isAudioSessionInitialized { return }
+ 
          let audioSession = AVAudioSession.sharedInstance()
--        try audioSession.setCategory(
--            .playAndRecord, mode: .voiceChat,
--            options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
 +        // Always call setCategory even if already in playAndRecord/voiceChat.
 +        // On call 2+, I/O routes are stale from ringback AVAudioPlayer.
-+        try audioSession.setCategory(
-+            .playAndRecord, mode: .voiceChat,
+         try audioSession.setCategory(
+             .playAndRecord, mode: .voiceChat,
+-            options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
 +            options: [.allowBluetooth, .allowBluetoothA2DP])
 +        try audioSession.setActive(true)
          if let settings = recordingSettings {

@@ -22,11 +22,24 @@ import { sha256 } from '@noble/hashes/sha256';
 // ============================================
 
 /**
- * PoW difficulty: 16 bits = ~65K iterations = <1 second on mobile (pure JS SHA-256).
- * Combined with CF Worker IP rate limiting + cert quota (100 msgs/cert), this is
- * sufficient anti-spam. 22 bits was ~4M iterations = 80s on Hermes (unusable).
+ * PoW difficulty: 18 bits = ~260K iterations = ~1-1.5 second on mobile (pure JS SHA-256).
+ * Combined with CF Worker IP rate limiting (30/min) + cert quota (100 msgs/cert),
+ * this provides strong anti-spam.
+ *
+ * Trade-offs:
+ *   16 bits = ~65K iter = <500ms mobile, but ~0.0003ms on GPU (trivial)
+ *   18 bits = ~260K iter = ~1-1.5s mobile (acceptable: 1x per hour), ~0.001ms on GPU (4× harder)
+ *   20 bits = ~1M iter = ~3-5s mobile (noticeable), ~0.005ms on GPU
+ *   22 bits = ~4M iter = ~80s on Hermes (unusable)
+ *
+ * Audit fix: increased from 16 → 18 bits. The PoW is computed ONCE per certificate
+ * (valid 1 hour), so ~1.5s once/hour is imperceptible to the user.
+ * The async yielding (setTimeout every 50K iterations) prevents UI freezing.
+ *
+ * GATEWAY COMPAT: The gateway must accept difficulty >= 16 during migration
+ * (old clients still send 16-bit PoW). See ohttp-gateway/server.js.
  */
-export const POW_DIFFICULTY_BITS = 16;
+export const POW_DIFFICULTY_BITS = 18;
 
 /** Fenêtre de validité du timestamp (±5 minutes) */
 export const POW_TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;

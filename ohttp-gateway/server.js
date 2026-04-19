@@ -84,34 +84,66 @@ const CERTIFICATE_VALIDITY_MS = 60 * 60 * 1000; // P5 fix: 1h (was 24h)
 // This prevents a single certificate from enabling unlimited tag-rotation DoS.
 
 const MAX_MESSAGES_PER_CERT = 100; // P1-A1: Réduit de 200 à 100
-const certUsage = new Map(); // nonce_b64 → { count, expiry }
+
+// PRODUCTION FIX: certUsage persisté sur disque pour survivre aux redémarrages.
+// Sans ça, un restart du gateway reset tous les quotas de certificats.
+const CERT_PERSIST_PATH = process.env.CERT_PERSIST_PATH || '/tmp/ghostr_cert_state.json';
+const PERSIST_INTERVAL_MS = 30_000;
+let certUsage = new Map();
+let certUsageDirty = false;
 let lastCertCleanup = Date.now();
+
+function loadCertUsage() {
+  try {
+    if (fs.existsSync(CERT_PERSIST_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(CERT_PERSIST_PATH, 'utf8'));
+      const now = Date.now();
+      for (const [nonce, info] of Object.entries(raw)) {
+        if (info.expiry > now) certUsage.set(nonce, info);
+      }
+      console.log(`🔐 certUsage restored: ${certUsage.size} active certificates`);
+    }
+  } catch (e) {
+    console.warn('⚠️ Could not load certUsage:', e.message, '— starting fresh');
+  }
+}
+
+function saveCertUsage() {
+  if (!certUsageDirty) return;
+  try {
+    const obj = {};
+    const now = Date.now();
+    for (const [nonce, info] of certUsage) {
+      if (info.expiry > now) obj[nonce] = info;
+    }
+    fs.writeFileSync(CERT_PERSIST_PATH, JSON.stringify(obj));
+    certUsageDirty = false;
+  } catch (e) {
+    console.warn('⚠️ Could not persist certUsage:', e.message);
+  }
+}
 
 function cleanupCertUsage() {
   const now = Date.now();
-  if (now - lastCertCleanup > 5 * 60 * 1000) { // cleanup every 5 min
+  if (now - lastCertCleanup > 5 * 60 * 1000) {
     for (const [nonce, info] of certUsage) {
-      if (now > info.expiry) certUsage.delete(nonce);
+      if (now > info.expiry) { certUsage.delete(nonce); certUsageDirty = true; }
     }
     lastCertCleanup = now;
   }
 }
 
-/**
- * Check if a certificate nonce has exceeded its message quota.
- * Returns true if allowed, false if rate limited.
- */
 function checkCertRateLimit(nonceB64, expiry) {
   cleanupCertUsage();
   const existing = certUsage.get(nonceB64);
   if (existing) {
-    if (existing.count >= MAX_MESSAGES_PER_CERT) {
-      return false;
-    }
+    if (existing.count >= MAX_MESSAGES_PER_CERT) return false;
     existing.count++;
+    certUsageDirty = true;
     return true;
   }
   certUsage.set(nonceB64, { count: 1, expiry });
+  certUsageDirty = true;
   return true;
 }
 
@@ -126,37 +158,76 @@ function checkCertRateLimit(nonceB64, expiry) {
 // Si le serveur détecte un pic de demandes (>50 certs/min), la difficulté monte
 // temporairement à 24 bits (~15s mobile) pour décourager les attaques par spam.
 
-const POW_BASE_DIFFICULTY = 16;  // 16 bits = ~65K iterations = <1s mobile (pure JS SHA-256)
+const POW_BASE_DIFFICULTY = 18;  // 18 bits = ~260K iterations = ~1-1.5s mobile
+                                 // Audit fix: increased from 16 bits for stronger anti-spam.
+
 const POW_SURGE_DIFFICULTY = 20; // 20 bits = ~1M iterations = ~3s mobile (surge mode)
 const POW_SURGE_THRESHOLD = 50; // Requêtes par minute déclenchant le mode surge
 const POW_TIMESTAMP_WINDOW_MS = 5 * 60 * 1000; // ±5 minutes
 
-// Adaptive difficulty: track cert request rate (sliding window 60s)
-const certRequestTimestamps = [];
+// PRODUCTION FIX (M-03): Sliding window counter au lieu de array.shift() O(n).
+// Compteur atomique avec timestamp de fenêtre — O(1) constant.
+let certRateCount = 0;
+let certRateWindowStart = Date.now();
+
 function getCurrentDifficulty() {
   const now = Date.now();
-  const oneMinuteAgo = now - 60_000;
-  // Purge old entries
-  while (certRequestTimestamps.length > 0 && certRequestTimestamps[0] < oneMinuteAgo) {
-    certRequestTimestamps.shift();
+  // Si la fenêtre de 60s a expiré, reset
+  if (now - certRateWindowStart > 60_000) {
+    certRateCount = 1;
+    certRateWindowStart = now;
+  } else {
+    certRateCount++;
   }
-  certRequestTimestamps.push(now);
-  if (certRequestTimestamps.length > POW_SURGE_THRESHOLD) {
-    console.log(`⚠️ PoW SURGE: ${certRequestTimestamps.length} certs/min > ${POW_SURGE_THRESHOLD}, difficulty raised to ${POW_SURGE_DIFFICULTY}`);
+  if (certRateCount > POW_SURGE_THRESHOLD) {
+    console.log(`⚠️ PoW SURGE: ${certRateCount} certs/min > ${POW_SURGE_THRESHOLD}, difficulty raised to ${POW_SURGE_DIFFICULTY}`);
     return POW_SURGE_DIFFICULTY;
   }
   return POW_BASE_DIFFICULTY;
 }
 
 // ACTION 12 (Audit Fix): Replay protection with per-entry timestamps instead of bulk clear.
-// Each challenge is stored with its insertion time and cleaned up individually.
+// PRODUCTION FIX: Persisté sur disque pour survivre aux redémarrages.
+const CHALLENGE_PERSIST_PATH = process.env.CHALLENGE_PERSIST_PATH || '/tmp/ghostr_challenges.json';
 const recentChallenges = new Map(); // challengeId -> timestamp
+let challengesDirty = false;
+
+function loadRecentChallenges() {
+  try {
+    if (fs.existsSync(CHALLENGE_PERSIST_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(CHALLENGE_PERSIST_PATH, 'utf8'));
+      const cutoff = Date.now() - (POW_TIMESTAMP_WINDOW_MS + 60_000);
+      for (const [key, ts] of Object.entries(raw)) {
+        if (ts > cutoff) recentChallenges.set(key, ts);
+      }
+      console.log(`🔐 recentChallenges restored: ${recentChallenges.size} entries`);
+    }
+  } catch (e) {
+    console.warn('⚠️ Could not load recentChallenges:', e.message);
+  }
+}
+
+function saveRecentChallenges() {
+  if (!challengesDirty) return;
+  try {
+    const obj = {};
+    const cutoff = Date.now() - (POW_TIMESTAMP_WINDOW_MS + 60_000);
+    for (const [key, ts] of recentChallenges) {
+      if (ts > cutoff) obj[key] = ts;
+    }
+    fs.writeFileSync(CHALLENGE_PERSIST_PATH, JSON.stringify(obj));
+    challengesDirty = false;
+  } catch (e) {
+    console.warn('⚠️ Could not persist recentChallenges:', e.message);
+  }
+}
 
 function cleanupRecentChallenges() {
   const expiry = Date.now() - (POW_TIMESTAMP_WINDOW_MS + 60_000); // Keep 1min margin
   for (const [key, ts] of recentChallenges) {
     if (ts < expiry) {
       recentChallenges.delete(key);
+      challengesDirty = true;
     } else {
       break; // Map preserves insertion order; once we hit a valid entry, stop
     }
@@ -176,7 +247,7 @@ function verifyProofOfWork(pow) {
   // Get current required difficulty (may be elevated during surge)
   const requiredDifficulty = getCurrentDifficulty();
 
-  // Check difficulty meets current requirement
+  // Check difficulty meets requirement
   if (pow.difficulty < requiredDifficulty) {
     return { valid: false, reason: `difficulty_too_low: client=${pow.difficulty}, required=${requiredDifficulty}` };
   }
@@ -218,6 +289,7 @@ function verifyProofOfWork(pow) {
 
   // Mark challenge as used with timestamp
   recentChallenges.set(challengeId, now);
+  challengesDirty = true;
 
   return { valid: true, reason: 'ok' };
 }
@@ -1257,6 +1329,21 @@ loadKeys();
 loadSealedSenderKeys();
 startKeyRotation(); // ACTION 10: Schedule automatic key rotation
 
+// PRODUCTION FIX: Load persisted state and schedule periodic saves
+loadCertUsage();
+loadRecentChallenges();
+setInterval(() => { saveCertUsage(); saveRecentChallenges(); }, PERSIST_INTERVAL_MS);
+process.on('SIGTERM', () => {
+  console.log('💾 Saving state before shutdown...');
+  saveCertUsage(); saveRecentChallenges();
+  process.exit(0);
+});
+process.on('SIGINT', () => {
+  console.log('💾 Saving state before shutdown...');
+  saveCertUsage(); saveRecentChallenges();
+  process.exit(0);
+});
+
 // P0: Initialize Key Transparency Merkle Tree
 let ktTree = null;
 function initKeyTransparency() {
@@ -1311,6 +1398,37 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error('SUPABASE_URL and SUPABASE_ANON_KEY must be set.');
   process.exit(1);
 }
+
+// PRODUCTION FIX: Validate critical config before starting
+(function validateProductionConfig() {
+  const isProd = process.env.NODE_ENV === 'production';
+  const warnings = [];
+  if (!GATEWAY_IDENTITY_SECRET_KEY || !GATEWAY_IDENTITY_PUBLIC_KEY) {
+    warnings.push('GATEWAY_IDENTITY_*_KEY not set — client key pinning will not work');
+  }
+  if (!KT_HMAC_KEY) {
+    warnings.push('KT_HMAC_KEY not set — KT tree resets on restart');
+  }
+  if (KT_PERSIST_PATH === '/tmp/kt_data' && isProd) {
+    warnings.push('KT_PERSIST_PATH is /tmp — data lost on redeploy. Use a persistent volume.');
+  }
+  if (CERT_PERSIST_PATH.startsWith('/tmp') && isProd) {
+    warnings.push('CERT_PERSIST_PATH is /tmp — cert quotas lost on redeploy.');
+  }
+  if (warnings.length > 0) {
+    console.warn('\n⚠️  Production warnings:');
+    warnings.forEach(w => console.warn(`   • ${w}`));
+    console.warn('');
+  }
+  // Verify Supabase connectivity (non-blocking)
+  fetch(`${SUPABASE_URL}/rest/v1/`, {
+    method: 'HEAD',
+    headers: { 'apikey': SUPABASE_ANON_KEY },
+  }).then(r => {
+    if (r.ok) console.log('✅ Supabase connectivity verified');
+    else console.error(`❌ Supabase responded ${r.status} — check SUPABASE_URL/SUPABASE_ANON_KEY`);
+  }).catch(e => console.error(`❌ Supabase unreachable: ${e.message}`));
+})();
 
 server.listen(PORT, () => {
   console.log(`🔒 GHOSTR OHTTP Gateway listening on port ${PORT}`);

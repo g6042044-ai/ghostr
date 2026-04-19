@@ -28,6 +28,7 @@ import { pendingInviteStore, PendingInvite } from '../services/pendingInvites';
 import { inviteWatcher } from '../services/inviteWatcher';
 import { showInAppNotification } from '../components/InAppNotification';
 import { subscribeToAllMessages1to1, getAllUnreadCounts, pollAllSessions, getLocalMessages1to1, clearLocalMessages1to1, clearUnreadCount } from '../services/api1to1';
+import { isSessionMutedSync } from '../services/muteService';
 import { getDeviceId } from '../services/storage';
 import { isInCall1to1 } from '../services/call1to1Service';
 import {
@@ -247,14 +248,12 @@ export function ConversationListScreen() {
             msgType = 'call';
             if (parsed.status === 'ended' && parsed.duration > 0) {
               content = `📞 Appel vocal (${formatCallDuration(parsed.duration)})`;
-            } else if (parsed.status === 'missed') {
-              content = '📞 Appel manqué';
-            } else if (parsed.status === 'declined') {
-              content = '📞 Appel refusé';
-            } else if (parsed.status === 'cancelled') {
-              content = '📞 Appel annulé';
+            } else if (msg.isMine) {
+              // J'ai initié l'appel → c'est MOI qui ai appelé
+              content = '📞 Appel sans réponse';
             } else {
-              content = '📞 Appel vocal';
+              // J'ai reçu l'appel → quelqu'un m'a appelé
+              content = '📞 Appel manqué';
             }
           }
         } catch {
@@ -262,15 +261,15 @@ export function ConversationListScreen() {
           if (trimmed.includes('call')) {
             const statusMatch = trimmed.match(/status\s*[":]\s*["']?(\w+)["']?/i);
             const status = statusMatch ? statusMatch[1].toLowerCase() : '';
-            if (status === 'missed') { msgType = 'call'; content = '📞 Appel manqué'; }
-            else if (status === 'declined') { msgType = 'call'; content = '📞 Appel refusé'; }
-            else if (status === 'cancelled') { msgType = 'call'; content = '📞 Appel annulé'; }
-            else if (status === 'ended') {
+            if (status === 'ended') {
               msgType = 'call';
               const durMatch = trimmed.match(/duration\s*[":]\s*(\d+)/i);
               content = durMatch && parseInt(durMatch[1]) > 0
                 ? `📞 Appel vocal (${formatCallDuration(parseInt(durMatch[1]))})`
                 : '📞 Appel vocal';
+            } else if (status === 'missed' || status === 'declined' || status === 'cancelled') {
+              msgType = 'call';
+              content = msg.isMine ? '📞 Appel sans réponse' : '📞 Appel manqué';
             }
           }
         }
@@ -437,6 +436,9 @@ export function ConversationListScreen() {
       // Notification in-app pour les messages entrants visibles uniquement
       if (message.isMine) return;
       if (message.messageType && SILENT_TYPES.has(message.messageType)) return;
+      
+      // CORRECTION: Ne pas afficher la notification si la conversation est mutée
+      if (isSessionMutedSync(sessionId)) return;
       
       const contactName = message.displayName || 'Contact';
       

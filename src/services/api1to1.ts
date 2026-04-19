@@ -56,6 +56,8 @@ import {
 import { sha256 } from '@noble/hashes/sha256';
 import * as Crypto from 'expo-crypto';
 import { externalizeMedia, migrateMessagesToFileStore, clearAllMediaFiles, deleteSessionMedia, resolveMediaToBase64, isMediaRef } from './mediaFileStore';
+// Mute service — filtre les notifications par conversation
+import { isSessionMutedSync, clearMuteState } from './muteService';
 // P7 FIX: Import blob upload for media retry
 import { encryptAndUploadBlob, base64ToUint8Array } from './encryptedBlobService';
 // PHASE 1: Epoch tags (rotation 5min) — legacy
@@ -142,15 +144,15 @@ export type MessageType =
   | 'call'         // v7.0: Message "Appel terminé"
   | 'handshake_ack'    // Accusé de réception du handshake
   | 'media_chunk'      // v25.0: Legacy — réception uniquement (backward compat)
-  | 'session_reset'    // P1-A3: Force une réinitialisation PQXDH de la session
-  | 'push_token_update'; // v2.0: Partage du push token via E2E
+  | 'push_token_update' // v2.0: Partage du push token via E2E
+  | 'mute_preference';  // v28.0: Sync de la préférence mute via E2E → bloque le push côté émetteur
 
 // v20.0: Types de messages de protocole à ne jamais afficher dans l'UI
 const PROTOCOL_MESSAGE_TYPES: MessageType[] = [
   'handshake_ack',
   'media_chunk',
-  'session_reset',
   'push_token_update', // Invisible dans l'UI
+  'mute_preference',   // v28.0: Invisible dans l'UI
 ];
 
 // ============================================
@@ -719,6 +721,130 @@ function _clearProcessedIdsCache(sessionId: string): void {
 }
 
 // ============================================
+// v28.0: PEER MUTE PREFERENCE — Sender-side push suppression
+// ============================================
+//
+// ARCHITECTURE:
+//   Quand un utilisateur mute une conversation, il envoie un message E2E
+//   de type 'mute_preference' à son correspondant. Le correspondant stocke
+//   cette préférence et utilise generateRandomPushBlob() au lieu d'un vrai
+//   blob push lors des envois suivants.
+//
+// SÉCURITÉ:
+//   - La préférence est transmise via le pipeline Triple Ratchet (chiffrée E2E)
+//   - Le serveur ne voit qu'un message chiffré standard (indistinguable)
+//   - Le Push Proxy reçoit un blob aléatoire → ne peut pas déchiffrer → aucun push
+//   - Aucune fuite de métadonnées vers FCM/APNs pour les conversations mutées
+//   - Le traffic analysis ne peut pas distinguer un blob aléatoire d'un decoy
+//
+// SUPÉRIEUR À SIGNAL/WHATSAPP:
+//   Signal/WhatsApp: le push arrive toujours, le client le supprime localement
+//   Ghostr: le push n'est JAMAIS envoyé → Google/Apple ne savent même pas
+//   qu'un message a été reçu sur cette conversation
+
+const PEER_MUTE_PREFIX = '@ghostr_peer_mute_';
+
+/** Cache mémoire des préférences de mute reçues des pairs */
+const _peerMuteCache = new Map<string, boolean>();
+
+/**
+ * Vérifie si un pair nous a demandé de ne pas lui envoyer de push.
+ * Synchrone (cache mémoire) — appelé à chaque envoi de message.
+ */
+export function isPeerMuteRequested(sessionId: string): boolean {
+  return _peerMuteCache.get(sessionId) ?? false;
+}
+
+/**
+ * Stocke la préférence de mute reçue d'un pair.
+ */
+async function storePeerMutePreference(sessionId: string, muted: boolean): Promise<void> {
+  _peerMuteCache.set(sessionId, muted);
+  try {
+    const key = PEER_MUTE_PREFIX + sessionId;
+    const encrypted = encryptIfEnabled(muted ? 'true' : 'false');
+    await AsyncStorage.setItem(key, encrypted);
+    __DEV__ && console.log(`[api1to1] 🔇 Peer mute preference stored: ${sessionId.slice(0, 12)}... → ${muted}`);
+  } catch (error) {
+    __DEV__ && console.error('[api1to1] Error storing peer mute preference:', error);
+  }
+}
+
+/**
+ * Charge les préférences de mute des pairs depuis AsyncStorage (au démarrage).
+ */
+async function loadPeerMutePreferences(): Promise<void> {
+  try {
+    const allKeys = await AsyncStorage.getAllKeys();
+    const muteKeys = allKeys.filter(k => k.startsWith(PEER_MUTE_PREFIX));
+    for (const key of muteKeys) {
+      const raw = await secureGet(key);
+      if (raw) {
+        const sessionId = key.replace(PEER_MUTE_PREFIX, '');
+        _peerMuteCache.set(sessionId, raw === 'true');
+      }
+    }
+    __DEV__ && console.log(`[api1to1] 🔇 Loaded ${_peerMuteCache.size} peer mute preferences`);
+  } catch (error) {
+    __DEV__ && console.error('[api1to1] Error loading peer mute preferences:', error);
+  }
+}
+
+/**
+ * Envoie la préférence de mute à un pair via message E2E.
+ * Appelé quand l'utilisateur toggle le mute dans ContactInfoScreen.
+ */
+export async function sendMutePreference(
+  sessionId: string,
+  muted: boolean
+): Promise<{ success: boolean; error?: string }> {
+  const session = sessionService.getSession(sessionId);
+  if (!session) {
+    return { success: false, error: 'Session not found' };
+  }
+
+  const myFingerprint = session.myIdentityKeyFingerprint;
+  const myProfile = sessionService.getMyProfile();
+
+  const innerPayload: InnerPayload = {
+    type: 'mute_preference',
+    content: JSON.stringify({ muted }),
+    senderFingerprint: myFingerprint,
+    displayName: myProfile.displayName,
+    timestamp: Date.now(),
+    messageId: generateMessageId(),
+  };
+
+  // Deferred: pas urgent, et empêche la corrélation temporelle avec le toggle UI
+  const result = await sendInnerPayload(sessionId, innerPayload, 'deferred');
+
+  if (result.success) {
+    __DEV__ && console.log(`[api1to1] 🔇 Mute preference sent to ${sessionId.slice(0, 12)}...: muted=${muted}`);
+  }
+
+  return result;
+}
+
+/**
+ * Envoie la préférence de mute à TOUS les pairs.
+ * Appelé quand l'utilisateur désactive les notifications globalement.
+ */
+export async function sendMutePreferenceToAllPeers(muted: boolean): Promise<void> {
+  await sessionService.initialize();
+  const sessions = sessionService.getAllSessions();
+
+  __DEV__ && console.log(`[api1to1] 🔇 Sending mute preference (${muted}) to ${sessions.length} peers`);
+
+  for (const session of sessions) {
+    try {
+      await sendMutePreference(session.id, muted);
+    } catch (err) {
+      __DEV__ && console.warn(`[api1to1] Mute preference send failed for ${session.id.slice(0, 8)}:`, err);
+    }
+  }
+}
+
+// ============================================
 // GESTION DES STATUTS DE MESSAGES
 // ============================================
 
@@ -905,7 +1031,10 @@ async function prepareChunkRpcFunction(
     // Retourner la fonction RPC SANS l'exécuter
     return async () => {
       // Push blob: chiffré pour le Push Proxy, ou aléatoire si pas de token pair
-      const pushBlob = await createPushBlobForPeer(sessionId, false);
+      // v28.0: blob aléatoire si le pair a muté → aucun push
+      const pushBlob = isPeerMuteRequested(sessionId)
+        ? generateRandomPushBlob()
+        : await createPushBlobForPeer(sessionId, false);
       const result = await secureRpc('send_sealed_message', {
         p_tag: envelope.tag,
         p_sealed_content: envelope.sealedContent,
@@ -1016,7 +1145,12 @@ async function sendSingleChunk(
       //
       // Le blob est chiffré côté client, le Gateway ne voit qu'un blob opaque de taille fixe.
       const noPush = isCallSignalNoPush(innerPayload);
-      const shouldPush = !noPush
+      // v28.0: Si le pair nous a demandé de ne pas envoyer de push (mute_preference),
+      // utiliser un blob aléatoire → le Push Proxy ne peut pas déchiffrer → aucun push.
+      // SÉCURITÉ: Le serveur voit un blob de taille identique → pas de side channel.
+      // Le pair recevra le message via polling normal, sans notification OS.
+      const peerMuted = isPeerMuteRequested(sessionId);
+      const shouldPush = !noPush && !peerMuted
         && (PUSH_WORTHY.has(innerPayload.type as MessageType) || isCallOffer(innerPayload));
       const callCancel = isCallTermination(innerPayload);
       const missedCall = isMissedCallMessage(innerPayload);
@@ -1801,76 +1935,6 @@ export async function sendDeliveredReceipt1to1(
 }
 
 // ============================================
-// ENVOI - SESSION RESET (P1-A3)
-// ============================================
-
-/**
- * P1-A3: Envoie un signal de réinitialisation de session au correspondant.
- *
- * Quand le correspondant reçoit ce message :
- *   1. Son état de session Triple Ratchet est détruit
- *   2. Un nouveau handshake PQXDH sera nécessaire au prochain message
- *   3. Un message système est affiché dans la conversation
- *
- * Cas d'utilisation :
- *   - Appareil volé ou compromis → couper l'accès à la session
- *   - Suspicion de compromission des clés
- *   - Réinitialisation manuelle par l'utilisateur
- *
- * SÉCURITÉ : Le message session_reset transite via le pipeline Triple Ratchet
- * existant. Il est chiffré et authentifié comme n'importe quel message.
- * Seul un participant légitime de la session peut envoyer un reset.
- *
- * Après l'envoi, la session locale est AUSSI détruite pour garantir
- * que les deux côtés repartent d'une feuille blanche.
- *
- * @param sessionId - ID de la session à réinitialiser
- * @returns { success, error }
- */
-export async function sendSessionReset1to1(
-  sessionId: string
-): Promise<{ success: boolean; error?: string }> {
-  const session = sessionService.getSession(sessionId);
-  if (!session) {
-    return { success: false, error: 'Session not found' };
-  }
-
-  const myFingerprint = session.myIdentityKeyFingerprint;
-  const myProfile = sessionService.getMyProfile();
-
-  const innerPayload: InnerPayload = {
-    type: 'session_reset',
-    content: '',
-    senderFingerprint: myFingerprint,
-    displayName: myProfile.displayName,
-    timestamp: Date.now(),
-    messageId: generateMessageId(),
-  };
-
-  // Envoi urgent : le reset doit partir immédiatement, pas en mode deferred
-  const result = await sendInnerPayload(sessionId, innerPayload, 'urgent');
-
-  if (result.success) {
-    __DEV__ && console.log(`[api1to1] 🔄 Session reset sent for ${sessionId.slice(0, 12)}...`);
-
-    // Détruire la session locale aussi
-    try {
-      // BUG FIX #3/#9: Cleanup AVANT deleteSession (expire les invites d'abord,
-      // empêche l'InviteWatcher de re-finaliser l'ancien accept)
-      await clearLocalMessages1to1(sessionId);
-      await sessionService.deleteSession(sessionId);
-      __DEV__ && console.log(`[api1to1] 🔄 Local session & transport data destroyed after reset`);
-    } catch (e) {
-      __DEV__ && console.error(`[api1to1] ⚠️ Failed to destroy local session after reset:`, e);
-    }
-  } else {
-    __DEV__ && console.error(`[api1to1] ❌ Session reset failed:`, result.error);
-  }
-
-  return result;
-}
-
-// ============================================
 // PERSISTANCE DES RÉACTIONS (v21.0)
 // ============================================
 
@@ -2266,7 +2330,7 @@ async function doFetchMessages1to1(
             messages.push(assembledMessage);
             await saveLocalMessage1to1(sessionId, assembledMessage);
             
-            if (!pollState.callbacks.has(sessionId)) {
+            if (!pollState.callbacks.has(sessionId) && !isSessionMutedSync(sessionId)) {
               await incrementUnreadCount(sessionId);
             }
             deliveredIds.push(assembledMessage.id);
@@ -2329,31 +2393,6 @@ async function doFetchMessages1to1(
             callStartedAt: message.callStartedAt, // Timestamp de début pour synchroniser les chronos
             timestamp: message.timestamp,
           }, message.displayName, message.senderAvatarBase64);  // v7.0: Inclure l'avatar
-        } else if (message.messageType === 'session_reset') {
-          // P1-A3: Le pair demande une réinitialisation complète de la session
-          __DEV__ && console.log(`[api1to1] 🔄 Received SESSION_RESET for session ${sessionId.slice(0, 12)}...`);
-          try {
-            // BUG FIX #2/#9: Nettoyer les données de transport AVANT deleteSession.
-            // Ordre critique : clearLocalMessages1to1 expire les invites associées,
-            // ce qui empêche l'InviteWatcher de re-finaliser l'ancien accept PQXDH
-            // dans la fenêtre entre deleteSession et le cleanup.
-            await clearLocalMessages1to1(sessionId);
-            const { SessionService } = await import('./tripleRatchet/sessionService');
-            const sessionService = SessionService.getInstance();
-            await sessionService.deleteSession(sessionId);
-            __DEV__ && console.log(`[api1to1] 🔄 Session & transport data destroyed — new PQXDH required`);
-            // Message système visible (sauvé APRÈS le clear pour repartir proprement)
-            const resetMsg = {
-              ...message,
-              messageType: 'text' as MessageType,
-              content: '\u26a0\ufe0f Session de chiffrement r\u00e9initialis\u00e9e par le correspondant. Un nouveau handshake sera initi\u00e9.',
-              isMine: false,
-            };
-            messages.push(resetMsg);
-            await saveLocalMessage1to1(sessionId, resetMsg);
-          } catch (resetErr) {
-            __DEV__ && console.error(`[api1to1] \u274c Session reset failed:`, resetErr);
-          }
         } else if (message.messageType === 'push_token_update') {
           // v2.0: Pair partage son push token via E2E — stocker localement
           try {
@@ -2364,6 +2403,18 @@ async function doFetchMessages1to1(
             }
           } catch (pushErr) {
             __DEV__ && console.warn('[api1to1] Push token update parse error:', pushErr);
+          }
+        } else if (message.messageType === 'mute_preference') {
+          // v28.0: Le pair nous informe de sa préférence de mute
+          // Si muted=true → on utilisera generateRandomPushBlob() pour ce pair
+          // → le Push Proxy ne pourra pas déchiffrer → aucun push envoyé
+          try {
+            const muteData = JSON.parse(message.content);
+            if (typeof muteData.muted === 'boolean') {
+              await storePeerMutePreference(sessionId, muteData.muted);
+            }
+          } catch (muteErr) {
+            __DEV__ && console.warn('[api1to1] Mute preference parse error:', muteErr);
           }
         } else {
           // Message normal
@@ -2380,7 +2431,8 @@ async function doFetchMessages1to1(
           }
           
           // v6.1: Incrémenter le compteur non-lus SEULEMENT si la conversation n'est pas ouverte
-          if (!pollState.callbacks.has(sessionId)) {
+          // CORRECTION: Ne pas incrémenter si la conversation est mutée
+          if (!pollState.callbacks.has(sessionId) && !isSessionMutedSync(sessionId)) {
             await incrementUnreadCount(sessionId);
           }
           deliveredIds.push(message.id);
@@ -3077,28 +3129,6 @@ export async function pollAllSessions(): Promise<void> {
                   timestamp: message.timestamp,
                 }, message.displayName, message.senderAvatarBase64);
                 
-              } else if (message.messageType === 'session_reset') {
-                // P1-A3: Session reset reçu via pollAll — même logique que fetchMessages1to1
-                __DEV__ && console.log(`[api1to1] 🔄 Received SESSION_RESET via pollAll for ${sessionId.slice(0, 12)}...`);
-                try {
-                  // BUG FIX #2/#9: Cleanup AVANT deleteSession (expire les invites d'abord)
-                  await clearLocalMessages1to1(sessionId);
-                  const { SessionService } = await import('./tripleRatchet/sessionService');
-                  const ss = SessionService.getInstance();
-                  await ss.deleteSession(sessionId);
-                  __DEV__ && console.log(`[api1to1] 🔄 Session & transport data destroyed via pollAll — new PQXDH required`);
-                  // Message système visible (sauvé APRÈS le clear)
-                  const resetMsg = {
-                    ...message,
-                    messageType: 'text' as MessageType,
-                    content: '\u26a0\ufe0f Session de chiffrement r\u00e9initialis\u00e9e par le correspondant. Un nouveau handshake sera initi\u00e9.',
-                    isMine: false,
-                  };
-                  await saveLocalMessage1to1(sessionId, resetMsg);
-                } catch (resetErr) {
-                  __DEV__ && console.error(`[api1to1] \u274c Session reset failed in pollAll:`, resetErr);
-                }
-
               } else if (message.messageType === 'push_token_update') {
                 // v2.0: Pair partage son push token via E2E
                 try {
@@ -3109,6 +3139,17 @@ export async function pollAllSessions(): Promise<void> {
                   }
                 } catch (pushErr) {
                   __DEV__ && console.warn('[api1to1] Push token update parse error in pollAll:', pushErr);
+                }
+
+              } else if (message.messageType === 'mute_preference') {
+                // v28.0: Le pair nous informe de sa préférence de mute
+                try {
+                  const muteData = JSON.parse(message.content);
+                  if (typeof muteData.muted === 'boolean') {
+                    await storePeerMutePreference(sessionId, muteData.muted);
+                  }
+                } catch (muteErr) {
+                  __DEV__ && console.warn('[api1to1] Mute preference parse error in pollAll:', muteErr);
                 }
 
               } else {
@@ -3122,7 +3163,10 @@ export async function pollAllSessions(): Promise<void> {
                   }).catch(() => {});
                 }
                 
-                await incrementUnreadCount(sessionId);
+                // CORRECTION: Ne pas incrémenter si la conversation est mutée
+                if (!isSessionMutedSync(sessionId)) {
+                  await incrementUnreadCount(sessionId);
+                }
                 deliveredIds.push(message.id);
               }
               
@@ -3170,7 +3214,7 @@ async function processServerMessages(
   const messages: Message1to1[] = [];
   
   // BUG FIX #4: Guard race condition — si la session a été supprimée pendant le polling
-  // (par l'utilisateur ou par un session_reset), on ne tente pas de déchiffrer.
+  // (par l'utilisateur), on ne tente pas de déchiffrer.
   const currentSession = sessionService.getSession(sessionId);
   if (!currentSession) {
     __DEV__ && console.warn(`[api1to1] ⚠️ processServerMessages: Session ${sessionId.slice(0, 12)}... disappeared during poll, skipping`);
@@ -3212,6 +3256,7 @@ async function processServerMessages(
       continue;
     }
     
+    // v28.0: Réponse de re-handshake PQXDH (sealed envelope, pas Triple Ratchet)
     if (sealedPayload.type !== 'triple_ratchet_v1' && 
         sealedPayload.type !== 'triple_ratchet_v2' && 
         sealedPayload.type !== 'triple_ratchet_v3') {
@@ -3997,6 +4042,12 @@ export async function clearLocalMessages1to1(sessionId: string): Promise<void> {
     // Nettoyer les fichiers médias locaux (images, vocaux, fichiers téléchargés)
     await deleteSessionMedia(sessionId);
     
+    // CORRECTION: Nettoyer l'état de mute persisté pour cette session
+    await clearMuteState(sessionId);
+    // v28.0: Nettoyer la préférence de mute du pair
+    _peerMuteCache.delete(sessionId);
+    try { await AsyncStorage.removeItem(PEER_MUTE_PREFIX + sessionId); } catch {}
+    
     // BUG FIX #9: Expirer les invitations associées à cette session.
     // CRITIQUE: Sans cela, l'InviteWatcher détecte l'invite comme "orpheline"
     // et re-finalise l'ancien accept PQXDH → session zombie avec ratchet périmé,
@@ -4113,6 +4164,11 @@ export async function clearAll1to1Data(): Promise<void> {
     clearAllAssemblyBuffers();
     clearAvatarHashCache();
     clearAllMediaFiles();
+    
+    // CORRECTION: Nettoyer le cache mémoire des mutes
+    const { clearAllMuteCache } = await import('./muteService');
+    clearAllMuteCache();
+    _peerMuteCache.clear();
     
     // BUG FIX #7: Vider les sets mémoire globaux qui survivent entre sessions
     // Sans cela, les IDs de messages de l'ancienne session filtrent les nouveaux messages
@@ -4510,6 +4566,9 @@ export function startGlobalPolling1to1(): void {
   
   // Premier poll immédiat
   performGlobalPoll();
+  
+  // v28.0: Charger les préférences de mute des pairs (pour le push blob routing)
+  loadPeerMutePreferences().catch(() => {});
   
   // Push notifications: envoyer notre token aux pairs via E2E
   sendPushTokenToAllPeers().catch(() => {});

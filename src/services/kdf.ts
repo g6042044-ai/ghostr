@@ -392,7 +392,19 @@ export async function deriveKey(
     
     __DEV__ && console.log('🔐 Clé dérivée avec Argon2id (sécurité maximale)');
   } else {
-    // ⚠️ Fallback : PBKDF2 JS
+    // ⚠️ PBKDF2 UNIQUEMENT autorisé en développement (Expo Go)
+    // En production, Argon2id est OBLIGATOIRE — un build sans react-native-argon2
+    // fonctionnel est un build défectueux qui ne doit pas permettre le verrouillage.
+    if (!__DEV__ && !isExpoGo) {
+      throw new Error(
+        'SECURITY_FATAL: Argon2id is not available in this production build. ' +
+        'react-native-argon2 must be installed and functional for app lock. ' +
+        'This is a build configuration error — please rebuild with: ' +
+        'npx expo install react-native-argon2 && npx expo prebuild && eas build'
+      );
+    }
+
+    // Fallback développement uniquement : PBKDF2 JS
     key = await deriveWithPBKDF2(
       password,
       salt,
@@ -414,12 +426,10 @@ export async function deriveKey(
       iterations: PBKDF2_ITERATIONS_JS,
       estimatedTimeMs: 1500,
       native: false,
-      warning: isExpoGo 
-        ? 'Mode développement (Expo Go) - sécurité réduite'
-        : 'Installez react-native-argon2 pour une sécurité optimale',
+      warning: 'Mode développement (Expo Go) - PBKDF2 fallback actif',
     };
     
-    __DEV__ && console.log('⚠️ Clé dérivée avec PBKDF2 (fallback)');
+    __DEV__ && console.log('⚠️ Clé dérivée avec PBKDF2 (fallback dev uniquement)');
   }
   
   return { key, params: JSON.stringify(params), algorithmInfo };
