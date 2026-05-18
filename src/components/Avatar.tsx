@@ -11,17 +11,10 @@
 // - Badge de warning pour changement d'identité
 
 import React, { useState, useEffect } from 'react';
-import { 
-  View, 
-  Text, 
-  StyleSheet, 
-  ViewStyle, 
-  Image,
-  Animated,
-  ActivityIndicator,
-} from 'react-native';
-import { generateColorFromToken, generateAvatarInitials, AVATAR_COLORS } from '../services/crypto';
+import { View, Text, StyleSheet, ViewStyle, Image, Animated, ActivityIndicator } from 'react-native';
+import { generateColorFromToken, generateAvatarInitials } from '../services/crypto';
 import { Ionicons } from '@expo/vector-icons';
+import { useThemedStyles, type ColorPalette } from './ui';
 
 // ============================================
 // TYPES
@@ -96,6 +89,7 @@ export function Avatar({
   borderWidth,
   borderColor,
 }: AvatarProps) {
+  const styles = useThemedStyles(makeStyles);
   const dimensions = SIZES[size];
   const [imageLoading, setImageLoading] = useState(false);
   const [imageError, setImageError] = useState(false);
@@ -271,6 +265,7 @@ interface TypingDotsProps {
 }
 
 const TypingDots: React.FC<TypingDotsProps> = ({ size }) => {
+  const styles = useThemedStyles(makeStyles);
   const dot1 = React.useRef(new Animated.Value(0)).current;
   const dot2 = React.useRef(new Animated.Value(0)).current;
   const dot3 = React.useRef(new Animated.Value(0)).current;
@@ -355,6 +350,7 @@ export function EditableAvatar({
   showEditBadge = true,
   ...props
 }: EditableAvatarProps) {
+  const styles = useThemedStyles(makeStyles);
   const dimensions = SIZES[props.size || 'xlarge'];
   
   return (
@@ -382,72 +378,76 @@ export function EditableAvatar({
 // STYLES
 // ============================================
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   container: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    overflow: 'hidden',
+    alignItems: 'center' as const,
+    justifyContent: 'center' as const,
+    overflow: 'hidden' as const,
   },
-  
+
   // Image
   imageContainer: {
-    position: 'relative',
-    width: '100%',
-    height: '100%',
+    position: 'relative' as const,
+    width: '100%' as const,
+    height: '100%' as const,
   },
   image: {
-    width: '100%',
-    height: '100%',
+    width: '100%' as const,
+    height: '100%' as const,
   },
   loadingOverlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(0,0,0,0.3)',
-    alignItems: 'center',
-    justifyContent: 'center',
+    alignItems: 'center' as const,
+    justifyContent: 'center' as const,
   },
-  
+
   // Text
   text: {
-    fontWeight: '600',
+    fontWeight: '600' as const,
     letterSpacing: 0.5,
   },
-  
-  // Online badge
+
+  // Online badge — the borderColor is the cutout against the page, so it
+  // must match the surface the avatar sits on. Was hardcoded to `#111B21`
+  // (dark bg) in v1; now uses `colors.background` so the cutout reads
+  // correctly on both themes.
   onlineBadge: {
-    position: 'absolute',
+    position: 'absolute' as const,
     bottom: 0,
     right: 0,
-    backgroundColor: '#00A884',
-    borderColor: '#111B21',
+    backgroundColor: colors.online,
+    borderColor: colors.background,
   },
-  
+
   // Typing badge
   typingBadge: {
-    position: 'absolute',
+    position: 'absolute' as const,
     bottom: -2,
     right: -2,
-    backgroundColor: '#1F2C34',
-    borderColor: '#111B21',
-    alignItems: 'center',
-    justifyContent: 'center',
+    backgroundColor: colors.surfaceLight,
+    borderColor: colors.background,
+    alignItems: 'center' as const,
+    justifyContent: 'center' as const,
   },
   typingDotsContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
+    flexDirection: 'row' as const,
+    alignItems: 'center' as const,
     gap: 1,
   },
   typingDot: {
-    backgroundColor: '#00A884',
+    backgroundColor: colors.typing,
   },
-  
-  // Warning badge
+
+  // Warning badge — state colour (warning yellow). Stays yellow on both
+  // themes since it's a semantic alert colour, not a surface colour.
   warningBadge: {
-    position: 'absolute',
+    position: 'absolute' as const,
     top: -2,
     right: -2,
-    backgroundColor: '#FFB300',
-    alignItems: 'center',
-    justifyContent: 'center',
+    backgroundColor: colors.warning,
+    alignItems: 'center' as const,
+    justifyContent: 'center' as const,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.3,
@@ -456,27 +456,27 @@ const styles = StyleSheet.create({
   },
   warningIcon: {
     color: '#000',
-    fontWeight: '700',
+    fontWeight: '700' as const,
   },
-  
-  
+
+
   // Editable Avatar
   editableContainer: {
-    position: 'relative',
+    position: 'relative' as const,
   },
   editBadge: {
-    position: 'absolute',
+    position: 'absolute' as const,
     bottom: 0,
     right: 0,
-    backgroundColor: '#00A884',
-    alignItems: 'center',
-    justifyContent: 'center',
+    backgroundColor: colors.primary,
+    alignItems: 'center' as const,
+    justifyContent: 'center' as const,
     borderWidth: 2,
-    borderColor: '#111B21',
+    borderColor: colors.background,
   },
   editIcon: {
     fontSize: 12,
   },
-});
+}) as const;
 
 export default Avatar;

@@ -39,9 +39,6 @@ export function wasLastTransitionFreshStart(): boolean { return lastTransitionWa
 
 export function isRingtoneActive(): boolean { return ringtoneActive; }
 
-let speakerSyncCallback: (() => void) | null = null;
-export function setSpeakerSyncCallback(cb: (() => void) | null): void { speakerSyncCallback = cb; }
-
 const SILENT_MODE_KEY = 'ghostr_silent_mode';
 let silentMode = false;
 export function isSilentMode(): boolean { return silentMode; }

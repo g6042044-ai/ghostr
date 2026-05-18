@@ -1,39 +1,145 @@
-# Générés par prebuild sur le serveur EAS — pas besoin de les uploader
+# ════════════════════════════════════════════════════════════════════════════
+# GHOSTR — .easignore
+# ════════════════════════════════════════════════════════════════════════════
+# Contrôle ce qui est uploadé au serveur EAS pour les builds cloud.
+# Tout ce qui n'est pas nécessaire au build doit être exclu pour :
+#   - réduire la taille de l'upload et la durée de build
+#   - éviter les fuites de secrets vers l'infra EAS
+# ════════════════════════════════════════════════════════════════════════════
+
+# ─── Credentials & secrets — NEVER uploaded ───────────────────────────────
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+
+*.p8
+*.p12
+*.keystore
+*.jks
+*.pem
+*.cer
+*.crt
+GoogleService-Info.plist
+secrets/
+credentials/
+
+# Clé privée Ed25519 du kill-switch (publique embarquée dans le code,
+# privée reste offline et JAMAIS uploadée nulle part).
+scripts/notice-private*.key
+scripts/notice-keys.json
+notice-*.priv
+
+# ─── Données utilisateur exportées ──────────────────────────────────────────
+# Backups produits par le flux de migration. Aucune raison de les uploader.
+*.ghostrbk
+
+# ─── Backends déployés séparément ───────────────────────────────────────────
+# Pas nécessaires au build mobile.
+ohttp-gateway/
+cloudflare-relay/
+exit-relay/
+push-proxy/
+supabase/
+
+# ─── Générés par prebuild sur le serveur EAS ────────────────────────────────
 ios/
 android/
 
-# Git
+# ─── Git & metadata ─────────────────────────────────────────────────────────
 .git/
+.gitignore
+.gitattributes
 
-# Expo
+# ─── Expo / Metro / RN caches ───────────────────────────────────────────────
 .expo/
+.expo-shared/
+.metro-health-check*
+metro-cache/
+node_modules/.cache/
 
-# Logs
+# ─── Builds antérieurs locaux ───────────────────────────────────────────────
+dist/
+build/
+web-build/
+*.apk
+*.aab
+*.ipa
+*.jsbundle
+*.hbc
+
+# ─── TypeScript / tests / linting ───────────────────────────────────────────
+*.tsbuildinfo
+__tests__/
+__mocks__/
+*.test.ts
+*.test.tsx
+*.test.js
+*.spec.ts
+*.spec.tsx
+*.spec.js
+coverage/
+.nyc_output/
+jest.config*
+e2e/
+
+# Linting / formatting configs (non requis au build)
+.eslintrc*
+.eslint.*
+.prettierrc*
+.prettier.*
+.editorconfig
+eslint.config.*
+
+# ─── Documentation ──────────────────────────────────────────────────────────
+README.md
+*.md
+docs/
+CHANGELOG*
+LICENSE*
+
+# ─── Logs ───────────────────────────────────────────────────────────────────
 *.log
+logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
 
-# Temporaires
+# ─── Archives ───────────────────────────────────────────────────────────────
+*.zip
 *.tgz
 *.tar.gz
+*.rar
+*.7z
 
-# IDE
+# ─── Sandbox / migration folders (locaux uniquement) ────────────────────────
+ghostr_full_test/
+ghostr_work/
+work/
+
+# ─── OS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── IDE / editors ──────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+*.sublime-project
+*.sublime-workspace
 
-# macOS
-.DS_Store
-Thumbs.db
+# AI tooling locales
+.cursor/
+.claude/
+.aider*
 
-# Cloudflare workers (déployés séparément)
-ohttp-gateway/
-cloudflare-relay/
-exit-relay/
-
-# Tests
-__tests__/
-coverage/
+# ─── Misc ───────────────────────────────────────────────────────────────────
+*.bak
+*.orig
+*.tmp
+tmp/
+temp/

@@ -17,78 +17,14 @@
 //
 // RÉFÉRENCE: Signal PQXDH + Triple Ratchet (Eurocrypt 2025)
 
-import {
-  SymmetricKey,
-  ChainKey,
-  RootKey,
-  MessageKey,
-  HeaderKey,
-  X25519KeyPair,
-  X25519PublicKey,
-  CRYPTO_CONSTANTS,
-} from './types';
+import { ChainKey, RootKey, MessageKey, HeaderKey, X25519KeyPair, X25519PublicKey } from './types';
 
-import {
-  generateX25519KeyPair,
-  x25519,
-  protocolHkdf,
-  zeroize,
-  zeroizeAll,
-  createSymmetricKey,
-  createChainKey,
-  createRootKey,
-  createHeaderKey,
-  secureClone,
-  getSecureRandomBytes,
-  bytesToHex,
-} from './primitives';
+import { generateX25519KeyPair, x25519, protocolHkdf, zeroize, createChainKey, createRootKey, createHeaderKey, secureClone } from './primitives';
 
-import {
-  KyberKeyPair,
-  KyberPublicKey,
-  KyberSecretKey,
-  KyberCiphertext,
-  KyberSharedSecret,
-  KyberChunk,
-  kyberKeyGen,
-  kyberEncapsulate,
-  kyberDecapsulate,
-  chunkPublicKey,
-  chunkCiphertext,
-  reconstructFromChunks,
-  serializeKyberPublicKey,
-  deserializeKyberPublicKey,
-  serializeKyberCiphertext,
-  deserializeKyberCiphertext,
-  serializeKyberChunk,
-  deserializeKyberChunk,
-  zeroizeKyberSecretKey,
-  zeroizeKyberSharedSecret,
-  KYBER_CONSTANTS,
-} from './pqPrimitives';
+import { KyberKeyPair, KyberPublicKey, KyberCiphertext, KyberChunk, kyberKeyGen, kyberEncapsulate, kyberDecapsulate, chunkPublicKey, chunkCiphertext, reconstructFromChunks, serializeKyberPublicKey, deserializeKyberPublicKey, serializeKyberCiphertext, deserializeKyberCiphertext, serializeKyberChunk, deserializeKyberChunk, zeroizeKyberSecretKey, zeroizeKyberSharedSecret, KYBER_CONSTANTS } from './pqPrimitives';
 
 // ML-KEM Braid imports
-import {
-  BraidState,
-  BraidPayload,
-  BraidConfig,
-  SerializedBraidState,
-  createInitialBraidState,
-  initiateBraid,
-  processReceivedBraidPayload,
-  generateBraidPayload,
-  shouldInitiateBraid,
-  canFinalizeBraid,
-  finalizeBraid,
-  cleanupBraidState,
-  serializeBraidState,
-  deserializeBraidState,
-  mixBraidSecrets,
-  isBraidExchangeExpired,
-  resetExpiredBraidExchange,
-  DEFAULT_BRAID_CONFIG,
-  BRAID_CONSTANTS,
-} from './mlkemBraid';
+import { BraidState, BraidPayload, BraidConfig, SerializedBraidState, createInitialBraidState, initiateBraid, processReceivedBraidPayload, generateBraidPayload, shouldInitiateBraid, cleanupBraidState, serializeBraidState, deserializeBraidState, mixBraidSecrets, isBraidExchangeExpired, resetExpiredBraidExchange, DEFAULT_BRAID_CONFIG, BRAID_CONSTANTS } from './mlkemBraid';
 
 // ============================================
 // CONSTANTES SPQR
@@ -923,7 +859,7 @@ export function createSPQRMessageMeta(
     // Si pendingPQRotation est true mais qu'on n'a pas pu sérialiser la clé,
     // la rotation PQ échouera silencieusement. On préfère crasher explicitement.
     if (!meta.kyberPublicKey) {
-      throw new Error('SPQR legacy: pendingPQRotation=true mais kyberPublicKey sérialisation a échoué');
+      throw new Error('SPQR legacy: pendingPQRotation=true but kyberPublicKey serialization failed');
     }
   } else if (state.pendingPQRotation && !state.myKyberKeyPair) {
     // ASSERTION DÉFENSIVE: pendingPQRotation=true sans keyPair est un état incohérent

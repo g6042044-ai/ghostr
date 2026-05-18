@@ -45,6 +45,7 @@ DROP FUNCTION IF EXISTS public.get_messages_by_tags(TEXT[], TIMESTAMPTZ, INTEGER
 DROP FUNCTION IF EXISTS public.send_call_signal(TEXT, TEXT) CASCADE;
 DROP FUNCTION IF EXISTS public.get_call_signals_by_tags(TEXT[], TIMESTAMPTZ, INTEGER) CASCADE;
 DROP FUNCTION IF EXISTS public.download_blob(TEXT) CASCADE;
+DROP FUNCTION IF EXISTS public.get_app_notice() CASCADE;
 
 -- Fonctions internes
 DROP FUNCTION IF EXISTS public.check_rate_limit(TEXT, TEXT, INTEGER) CASCADE;
@@ -56,6 +57,7 @@ DROP FUNCTION IF EXISTS public.send_message(TEXT, TEXT, TEXT) CASCADE;
 DROP FUNCTION IF EXISTS public.send_call_signal(TEXT, TEXT, TEXT) CASCADE;
 
 -- Tables
+DROP TABLE IF EXISTS public.app_notice CASCADE;
 DROP TABLE IF EXISTS public.blob_cleanup_log CASCADE;
 DROP TABLE IF EXISTS public.rate_limits CASCADE;
 DROP TABLE IF EXISTS public.call_signals CASCADE;
@@ -177,6 +179,40 @@ CREATE TABLE public.blob_cleanup_log (
 );
 
 COMMENT ON TABLE public.blob_cleanup_log IS 'Log du nettoyage automatique des blobs expirés';
+
+
+-- ── App notice (kill-switch / deprecation banner) ──
+--
+-- Table singleton (id=1 forcé par CHECK) contenant un blob de texte SIGNÉ
+-- Ed25519 dont la clé publique est embarquée dans le client. Le serveur
+-- est non-confiance pour ce contenu — toute modification non signée par
+-- la clé hors-ligne du développeur est REJETÉE par le client.
+--
+-- État nominal: signed_payload IS NULL → aucun avis n'est affiché.
+-- Activation:   UPDATE app_notice SET signed_payload = '<base64.signature>'
+--               WHERE id = 1;
+-- Désactivation: UPDATE app_notice SET signed_payload = NULL WHERE id = 1;
+--
+-- Format du payload: voir src/services/appNotice.ts (header du fichier).
+CREATE TABLE public.app_notice (
+    id              SMALLINT    PRIMARY KEY DEFAULT 1,
+    signed_payload  TEXT,
+    updated_at      TIMESTAMPTZ DEFAULT now() NOT NULL,
+
+    CONSTRAINT app_notice_singleton CHECK (id = 1),
+    CONSTRAINT app_notice_size      CHECK (
+        signed_payload IS NULL
+        OR length(signed_payload) BETWEEN 64 AND 8192
+    )
+);
+
+INSERT INTO public.app_notice (id, signed_payload) VALUES (1, NULL)
+ON CONFLICT (id) DO NOTHING;
+
+COMMENT ON TABLE public.app_notice IS
+    'Singleton — avis de dépréciation signé Ed25519. NULL = pas d''avis.';
+COMMENT ON COLUMN public.app_notice.signed_payload IS
+    'Format: base64(canonical_json).base64(ed25519_sig). Clé pub côté client.';
 
 
 -- ============================================================================
@@ -531,6 +567,24 @@ COMMENT ON FUNCTION public.cleanup_expired_blobs()
     IS 'Supprime les blobs chiffrés > 48h du bucket ghostr-blobs. Cron: 0 */6 * * *';
 
 
+-- ── get_app_notice ──
+-- RPC publique appelée au boot par chaque client. Retourne le payload signé
+-- de l'avis courant, ou NULL s'il n'y a pas d'avis. Coût: SELECT sur une
+-- ligne unique avec PK. Pas de rate limiting nécessaire (lecture cheap).
+CREATE OR REPLACE FUNCTION public.get_app_notice()
+RETURNS TABLE (signed_payload TEXT)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+STABLE
+AS $$
+    SELECT signed_payload FROM public.app_notice WHERE id = 1 LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION public.get_app_notice() IS
+    'Retourne le payload Ed25519-signé de l''avis courant (ou NULL). Vérif client.';
+
+
 -- ============================================================================
 -- 8. STORAGE — BUCKETS
 -- ============================================================================
@@ -593,6 +647,7 @@ ALTER TABLE public.messages     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.call_signals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.rate_limits  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.blob_cleanup_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.app_notice   ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY messages_deny_direct
     ON public.messages
@@ -614,6 +669,12 @@ CREATE POLICY blob_cleanup_log_deny_direct
     TO anon, authenticated
     USING (false) WITH CHECK (false);
 
+-- app_notice: aucun accès direct, lecture uniquement via la RPC SECURITY DEFINER.
+CREATE POLICY app_notice_deny_direct
+    ON public.app_notice
+    TO anon, authenticated
+    USING (false) WITH CHECK (false);
+
 
 -- ============================================================================
 -- 11. PERMISSIONS — LEAST PRIVILEGE
@@ -626,11 +687,13 @@ REVOKE ALL ON public.messages          FROM anon, authenticated;
 REVOKE ALL ON public.call_signals      FROM anon, authenticated;
 REVOKE ALL ON public.rate_limits       FROM anon, authenticated;
 REVOKE ALL ON public.blob_cleanup_log  FROM anon, authenticated;
+REVOKE ALL ON public.app_notice        FROM anon, authenticated;
 
 GRANT ALL ON public.messages          TO service_role;
 GRANT ALL ON public.call_signals      TO service_role;
 GRANT ALL ON public.rate_limits       TO service_role;
 GRANT ALL ON public.blob_cleanup_log  TO service_role;
+GRANT ALL ON public.app_notice        TO service_role;
 
 -- Séquence
 GRANT USAGE, SELECT ON SEQUENCE public.blob_cleanup_log_id_seq TO service_role;
@@ -640,6 +703,7 @@ GRANT EXECUTE ON FUNCTION public.send_sealed_message(TEXT, TEXT, INTEGER)       
 GRANT EXECUTE ON FUNCTION public.get_messages_by_tags(TEXT[], TIMESTAMPTZ, INTEGER)     TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.send_call_signal(TEXT, TEXT)                           TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_call_signals_by_tags(TEXT[], TIMESTAMPTZ, INTEGER) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_app_notice()                                       TO anon, authenticated;
 
 -- RPCs internes: service_role uniquement
 -- check_rate_limit est appelé depuis les SECURITY DEFINER RPCs (qui tournent
@@ -721,7 +785,7 @@ BEGIN
     SELECT count(*) INTO v_tables
     FROM information_schema.tables
     WHERE table_schema = 'public'
-      AND table_name IN ('messages', 'call_signals', 'rate_limits', 'blob_cleanup_log');
+      AND table_name IN ('messages', 'call_signals', 'rate_limits', 'blob_cleanup_log', 'app_notice');
 
     SELECT count(*) INTO v_functions
     FROM information_schema.routines
@@ -729,7 +793,8 @@ BEGIN
       AND routine_name IN (
         'send_sealed_message', 'get_messages_by_tags',
         'send_call_signal', 'get_call_signals_by_tags',
-        'check_rate_limit', 'cleanup_old_data', 'cleanup_expired_blobs'
+        'check_rate_limit', 'cleanup_old_data', 'cleanup_expired_blobs',
+        'get_app_notice'
       );
 
     SELECT count(*) INTO v_buckets
@@ -751,14 +816,14 @@ BEGIN
     RAISE NOTICE '════════════════════════════════════════════════';
     RAISE NOTICE '  GHOSTR SCHEMA v26.0 — DEPLOYMENT COMPLETE';
     RAISE NOTICE '════════════════════════════════════════════════';
-    RAISE NOTICE '  Tables:             % / 4 expected', v_tables;
-    RAISE NOTICE '  Functions (RPCs):   % / 7 expected', v_functions;
+    RAISE NOTICE '  Tables:             % / 5 expected', v_tables;
+    RAISE NOTICE '  Functions (RPCs):   % / 8 expected', v_functions;
     RAISE NOTICE '  Storage buckets:    % / 2 expected', v_buckets;
     RAISE NOTICE '  Storage policies:   % / 6 expected', v_policies;
     RAISE NOTICE '  Public indexes:     % / 4 expected', v_indexes;
     RAISE NOTICE '════════════════════════════════════════════════';
 
-    IF v_tables    = 4 AND v_functions = 7 AND v_buckets = 2 AND v_policies >= 6 THEN
+    IF v_tables    = 5 AND v_functions = 8 AND v_buckets = 2 AND v_policies >= 6 THEN
         RAISE NOTICE '  ✅ ALL CHECKS PASSED';
     ELSE
         RAISE WARNING '  ⚠️  SOME CHECKS FAILED — review above counts';

@@ -2,24 +2,16 @@
 // Écran de célébration quand un contact accepte une invitation
 // Full-screen animé avec avatar, badges sécurité, CTA
 
-import React, { useEffect, useRef } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  Animated,
-  Easing,
-  Image,
-  BackHandler,
-} from 'react-native';
+import { useEffect, useRef } from 'react';
+import { View, Text, TouchableOpacity, Animated, Easing, Image, BackHandler } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useTranslation } from 'react-i18next';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RouteProp } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 
-import { theme } from '../components/ui';
+import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 import { suppressNotification } from '../components/InAppNotification';
 import { generateAvatarInitials } from '../services/crypto';
 import { sendPushTokenToPeer } from '../services/api1to1';
@@ -56,6 +48,9 @@ export function ConnectionSuccessScreen() {
   const navigation = useNavigation<NavigationProp>();
   const route = useRoute<ScreenRouteProp>();
   const insets = useSafeAreaInsets();
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
   const { sessionId, contactName, inviteLabel, inviteTag, contactAvatarBase64 } = route.params;
 
   // Supprimer le toast "Connexion établie" — cet écran affiche déjà l'info
@@ -207,7 +202,7 @@ export function ConnectionSuccessScreen() {
         <Animated.View style={[styles.checkBadge, {
           transform: [{ scale: checkScale }],
         }]}>
-          <Ionicons name="checkmark" size={14} color={theme.colors.background} />
+          <Ionicons name="checkmark" size={14} color={colors.background} />
         </Animated.View>
       </View>
 
@@ -216,7 +211,7 @@ export function ConnectionSuccessScreen() {
         opacity: titleOpacity,
         transform: [{ translateY: titleTranslateY }],
       }]}>
-        Connexion établie
+        {t('connectionSuccess.title')}
       </Animated.Text>
 
       {/* ═══ Subtitle ═══ */}
@@ -226,7 +221,7 @@ export function ConnectionSuccessScreen() {
         alignItems: 'center' as const,
       }}>
         <Text style={styles.contactName}>{contactName}</Text>
-        <Text style={styles.subtitle}>Connecté via {inviteLabel}</Text>
+        <Text style={styles.subtitle}>{t('connectionSuccess.connectedVia', { label: inviteLabel })}</Text>
       </Animated.View>
 
       {/* ═══ Security Badges ═══ */}
@@ -238,21 +233,21 @@ export function ConnectionSuccessScreen() {
           <View style={styles.badgeIcon}>
             <Ionicons name="shield-checkmark" size={14} color="#34D399" />
           </View>
-          <Text style={styles.badgeText}>Chiffrement de bout en bout</Text>
+          <Text style={styles.badgeText}>{t('connectionSuccess.badgeE2E')}</Text>
         </View>
         <View style={styles.badgeSep} />
         <View style={styles.badge}>
           <View style={styles.badgeIcon}>
             <Ionicons name="key" size={14} color="#34D399" />
           </View>
-          <Text style={styles.badgeText}>Post-quantique (ML-KEM-768)</Text>
+          <Text style={styles.badgeText}>{t('connectionSuccess.badgePQ')}</Text>
         </View>
         <View style={styles.badgeSep} />
         <View style={styles.badge}>
           <View style={styles.badgeIcon}>
             <Ionicons name="eye-off" size={14} color="#34D399" />
           </View>
-          <Text style={styles.badgeText}>Aucune trace d'identité</Text>
+          <Text style={styles.badgeText}>{t('connectionSuccess.badgeNoTrace')}</Text>
         </View>
       </Animated.View>
 
@@ -271,10 +266,17 @@ export function ConnectionSuccessScreen() {
             <Ionicons
               name="chatbubble"
               size={18}
-              color={theme.colors.background}
+              color={colors.background}
               style={{ marginRight: 8 }}
             />
-            <Text style={styles.primaryButtonText}>Commencer à discuter</Text>
+            <Text
+              style={styles.primaryButtonText}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.82}
+            >
+              {t('connectionSuccess.startChatting')}
+            </Text>
           </TouchableOpacity>
         </Animated.View>
 
@@ -284,7 +286,14 @@ export function ConnectionSuccessScreen() {
             onPress={handleLater}
             activeOpacity={0.6}
           >
-            <Text style={styles.laterText}>Plus tard</Text>
+            <Text
+              style={styles.laterText}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.85}
+            >
+              {t('app.later')}
+            </Text>
           </TouchableOpacity>
         </Animated.View>
       </View>
@@ -292,10 +301,10 @@ export function ConnectionSuccessScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   container: {
     flex: 1,
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 32,
@@ -336,7 +345,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 3,
-    borderColor: theme.colors.background,
+    borderColor: colors.background,
     shadowColor: '#34D399',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.5,
@@ -346,7 +355,7 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 26,
     fontWeight: '800',
-    color: theme.colors.text,
+    color: colors.text,
     letterSpacing: -0.5,
     marginBottom: 12,
     textAlign: 'center',
@@ -360,14 +369,14 @@ const styles = StyleSheet.create({
   },
   subtitle: {
     fontSize: 15,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     textAlign: 'center',
     lineHeight: 22,
     marginBottom: 8,
   },
   tagline: {
     fontSize: 13,
-    color: theme.colors.primary,
+    color: colors.primary,
     fontWeight: '500',
     textAlign: 'center',
     marginBottom: 28,
@@ -375,7 +384,7 @@ const styles = StyleSheet.create({
   },
   badges: {
     width: '100%',
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 16,
     padding: 16,
     borderWidth: 1,
@@ -398,7 +407,7 @@ const styles = StyleSheet.create({
   },
   badgeText: {
     fontSize: 14,
-    color: theme.colors.text,
+    color: colors.text,
     fontWeight: '500',
     flex: 1,
   },
@@ -430,7 +439,7 @@ const styles = StyleSheet.create({
   primaryButtonText: {
     fontSize: 17,
     fontWeight: '700',
-    color: theme.colors.background,
+    color: colors.background,
     letterSpacing: -0.2,
   },
   laterButton: {
@@ -440,8 +449,8 @@ const styles = StyleSheet.create({
   laterText: {
     fontSize: 15,
     fontWeight: '600',
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
   },
-});
+}) as const;
 
 export default ConnectionSuccessScreen;

@@ -79,8 +79,6 @@ const DECOY_INTERLEAVE_PROBABILITY_MAX = 0.40;
 
 type SendDecoyFn = () => Promise<void>;
 type SendDecoyMediumTierFn = () => Promise<void>;
-// v25.1: Decoy ciblé sur une session réelle (même tag que les chunks)
-type SendSessionDecoyFn = (sessionId: string) => Promise<void>;
 type PollFn = () => Promise<void>;
 type SendMessageFn = () => Promise<void>;
 
@@ -98,8 +96,6 @@ interface QueuedMessage {
 
 let sendDecoyFn: SendDecoyFn | null = null;
 let sendDecoyMediumTierFn: SendDecoyMediumTierFn | null = null;
-// v25.1: Decoy envoyé au MÊME tag que les chunks (indistinguable côté serveur)
-let sendSessionDecoyFn: SendSessionDecoyFn | null = null;
 let pollFn: PollFn | null = null;
 
 let slotTimerId: ReturnType<typeof setTimeout> | null = null;
@@ -411,13 +407,11 @@ export function startConstantTraffic(
   decoyFn: SendDecoyFn,
   pollCallback: PollFn,
   mediumTierDecoyFn?: SendDecoyMediumTierFn,
-  sessionDecoyFn?: SendSessionDecoyFn  // v25.1: Decoy ciblé sur session
 ): void {
   if (isRunning) return;
-  
+
   sendDecoyFn = decoyFn;
   sendDecoyMediumTierFn = mediumTierDecoyFn || null;
-  sendSessionDecoyFn = sessionDecoyFn || null;
   pollFn = pollCallback;
   isRunning = true;
   currentGeneration++;

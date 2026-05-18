@@ -13,46 +13,60 @@
 //   - Animations fluides via React Native Animated
 //   - Cohérent avec le thème sombre de Ghostr
 
-import React, { useEffect, useRef, useMemo } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  Animated,
-  Easing,
-  Platform,
-} from 'react-native';
+import React, { useEffect, useRef } from 'react';
+import { View, Text, StyleSheet, Animated, Easing, Platform } from 'react-native';
+import { useTranslation } from 'react-i18next';
+import { useThemedStyles, type ColorPalette } from './ui';
 
 // ============================================
 // THÈME — Aligné avec ConversationScreen Colors
 // ============================================
 
-const ProgressColors = {
-  // Fond semi-transparent de l'overlay
-  overlayBg: 'rgba(10, 15, 20, 0.65)',
-  
-  // Anneau de progression
-  ringTrack: 'rgba(139, 164, 184, 0.2)',   // Piste inactive
-  ringFill: '#00D9A6',                       // Progression (accent primary)
-  ringFillReceive: '#00B4D8',                // Progression réception (accent secondary)
-  
-  // Barre linéaire
-  barTrack: 'rgba(139, 164, 184, 0.15)',
-  barFill: '#00D9A6',
-  barFillReceive: '#00B4D8',
-  
-  // Texte
-  percentText: '#FFFFFF',
-  phaseText: 'rgba(240, 244, 248, 0.7)',
-  
-  // Placeholder
-  placeholderBg: 'rgba(26, 37, 47, 0.85)',
-  placeholderBorder: 'rgba(0, 217, 166, 0.15)',
-  placeholderIcon: 'rgba(0, 217, 166, 0.4)',
-  
-  // Shimmer
-  shimmer: 'rgba(0, 217, 166, 0.08)',
-};
+// v2.0 — Was a static dark-only constant; now a factory that mirrors the
+// same shape from the active palette. Each ProgressColors-consuming
+// StyleSheet block has been converted to a `makeStyles` factory below.
+//
+// Conventions:
+//   - `overlayBg` stays dark semi-transparent. It sits ON TOP of photo
+//     pixels (not the app surface), so dark-tinted overlay is intentional
+//     on both themes for legibility.
+//   - `placeholderBg` is the bubble shown while a file is being received
+//     and IS on the app surface — it uses `messageTheirs` so it matches
+//     the incoming bubble of the current theme.
+function makeProgressColors(c: ColorPalette) {
+  return {
+    // Overlay over media content — dark on both themes by design.
+    overlayBg: 'rgba(10, 15, 20, 0.65)',
+
+    // Anneau de progression
+    ringTrack: c.textSecondary + '33', // ~20% alpha
+    ringFill: c.primary,
+    ringFillReceive: c.info,
+
+    // Barre linéaire
+    barTrack: c.textSecondary + '26', // ~15% alpha
+    barFill: c.primary,
+    barFillReceive: c.info,
+
+    // Texte
+    percentText: '#FFFFFF',  // over dark overlay — stays white
+    phaseText: 'rgba(240, 244, 248, 0.7)',  // over dark overlay
+
+    // Placeholder — palette-driven. The "received-file" bubble shape.
+    placeholderBg: c.messageTheirs,
+    placeholderBorder: c.primary + '26', // ~15% alpha
+    placeholderIcon: c.primary + '66', // ~40% alpha
+
+    // Shimmer
+    shimmer: c.primary + '14', // ~8% alpha
+  };
+}
+
+// Boot-time palette for any callers that still need a static reference.
+// Imported lazily through `_theme` so we don't add a dependency arrow
+// from this file to ThemeContext at module load.
+import { theme as _theme } from './ui/theme';
+const ProgressColors = makeProgressColors(_theme.colors as ColorPalette);
 
 // ============================================
 // ANNEAU DE PROGRESSION SVG (React Native compatible)
@@ -257,6 +271,7 @@ export const MediaProgressOverlay: React.FC<MediaProgressOverlayProps> = ({
   ringSize = 64,
   phaseLabel,
 }) => {
+  const { t } = useTranslation();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   
   useEffect(() => {
@@ -284,11 +299,11 @@ export const MediaProgressOverlay: React.FC<MediaProgressOverlayProps> = ({
   
   const label = phaseLabel || (() => {
     switch (phase) {
-      case 'preparing': return 'Préparation...';
-      case 'transferring': return direction === 'send' ? 'Envoi sécurisé' : 'Réception';
-      case 'assembling': return 'Assemblage...';
-      case 'complete': return 'Terminé';
-      case 'error': return 'Erreur';
+      case 'preparing': return t('mediaProgress.preparing');
+      case 'transferring': return direction === 'send' ? t('mediaProgress.secureSending') : t('mediaProgress.receiving');
+      case 'assembling': return t('mediaProgress.assembling');
+      case 'complete': return t('mediaProgress.complete');
+      case 'error': return t('mediaProgress.errorLabel');
       default: return '';
     }
   })();
@@ -353,6 +368,7 @@ export const FileProgressBar: React.FC<FileProgressBarProps> = ({
   direction = 'send',
   height = 3,
 }) => {
+  const barStyles = useThemedStyles(makeBarStyles);
   const widthAnim = useRef(new Animated.Value(0)).current;
   
   useEffect(() => {
@@ -387,10 +403,10 @@ export const FileProgressBar: React.FC<FileProgressBarProps> = ({
   );
 };
 
-const barStyles = StyleSheet.create({
+const makeBarStyles = (c: ColorPalette) => StyleSheet.create({
   track: {
     width: '100%',
-    backgroundColor: ProgressColors.barTrack,
+    backgroundColor: makeProgressColors(c).barTrack,
     borderRadius: 2,
     overflow: 'hidden',
   },
@@ -455,6 +471,8 @@ export const IncomingMediaPlaceholder: React.FC<IncomingMediaPlaceholderProps> =
   width = 200,
   height = 150,
 }) => {
+  const placeholderStyles = useThemedStyles(makePlaceholderStyles);
+  const { t } = useTranslation();
   const shimmerAnim = useRef(new Animated.Value(0)).current;
   
   useEffect(() => {
@@ -525,10 +543,10 @@ export const IncomingMediaPlaceholder: React.FC<IncomingMediaPlaceholderProps> =
         <Text style={placeholderStyles.fileIcon}>{iconName}</Text>
         <View style={placeholderStyles.fileInfo}>
           <Text style={placeholderStyles.fileLabel}>
-            {mediaType === 'voice' ? 'Vocal en cours...' : 'Fichier en cours...'}
+            {mediaType === 'voice' ? t('mediaProgress.voiceInProgress') : t('mediaProgress.fileInProgress')}
           </Text>
           <Text style={placeholderStyles.chunkText}>
-            {receivedChunks}/{totalChunks} fragments
+            {receivedChunks}/{totalChunks} {t('mediaProgress.fragmentsLabel')}
           </Text>
         </View>
       </View>
@@ -537,26 +555,28 @@ export const IncomingMediaPlaceholder: React.FC<IncomingMediaPlaceholderProps> =
   );
 };
 
-const placeholderStyles = StyleSheet.create({
+const makePlaceholderStyles = (c: ColorPalette) => {
+  const P = makeProgressColors(c);
+  return StyleSheet.create({
   imageContainer: {
     borderRadius: 14,
     overflow: 'hidden',
-    backgroundColor: ProgressColors.placeholderBg,
+    backgroundColor: P.placeholderBg,
     borderWidth: 1,
-    borderColor: ProgressColors.placeholderBorder,
+    borderColor: P.placeholderBorder,
     justifyContent: 'center',
     alignItems: 'center',
   },
   imageBg: {
-    backgroundColor: ProgressColors.placeholderBg,
+    backgroundColor: P.placeholderBg,
   },
   shimmer: {
     position: 'absolute',
     top: 0,
-    backgroundColor: ProgressColors.shimmer,
+    backgroundColor: P.shimmer,
     ...Platform.select({
       ios: {
-        shadowColor: ProgressColors.shimmer,
+        shadowColor: P.shimmer,
         shadowOffset: { width: 0, height: 0 },
         shadowOpacity: 1,
         shadowRadius: 40,
@@ -571,7 +591,9 @@ const placeholderStyles = StyleSheet.create({
     gap: 6,
   },
   chunkText: {
-    color: ProgressColors.phaseText,
+    // Inside the placeholder bubble (palette-driven), so text uses the
+    // palette's secondary colour rather than over-overlay white.
+    color: c.textSecondary,
     fontSize: 10,
     fontWeight: '500',
     fontVariant: ['tabular-nums'],
@@ -595,11 +617,12 @@ const placeholderStyles = StyleSheet.create({
     gap: 2,
   },
   fileLabel: {
-    color: '#F0F4F8',
+    color: c.text,
     fontSize: 13,
     fontWeight: '500',
   },
-});
+  });
+};
 
 // ============================================
 // SENDING STATUS AVEC PROGRESSION
@@ -620,13 +643,15 @@ export const SendingProgressLabel: React.FC<SendingProgressLabelProps> = ({
   phase,
   totalChunks,
 }) => {
+  const sendingStyles = useThemedStyles(makeSendingStyles);
+  const { t } = useTranslation();
   if (phase === 'complete') return null;
   
   const label = phase === 'preparing'
-    ? 'Chiffrement...'
+    ? t('mediaProgress.encrypting')
     : phase === 'error'
-    ? 'Erreur d\'envoi'
-    : `Envoi sécurisé ${Math.round(progress * 100)}%`;
+    ? t('mediaProgress.sendError')
+    : t('mediaProgress.secureSendingProgress', { percent: Math.round(progress * 100) });
   
   return (
     <View style={sendingStyles.container}>
@@ -636,7 +661,7 @@ export const SendingProgressLabel: React.FC<SendingProgressLabelProps> = ({
   );
 };
 
-const sendingStyles = StyleSheet.create({
+const makeSendingStyles = (c: ColorPalette) => StyleSheet.create({
   container: {
     paddingHorizontal: 12,
     paddingTop: 3,
@@ -644,7 +669,7 @@ const sendingStyles = StyleSheet.create({
     gap: 3,
   },
   label: {
-    color: 'rgba(139, 164, 184, 0.6)',
+    color: c.textSecondary + '99', // ~60% alpha — subtle on both themes
     fontSize: 10,
     fontWeight: '500',
     letterSpacing: 0.2,

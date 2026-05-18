@@ -16,7 +16,7 @@ const fs = require('fs');
 const nacl = require('tweetnacl');
 
 // Push Notification Integration (Split-Trust)
-const { initPushIntegration, triggerPushNotification } = require('./push-integration');
+const { initPushIntegration, triggerPushNotification, recordRealActivity } = require('./push-integration');
 
 // P0: Key Transparency — optional, gateway works without it
 let createTransparencyTree = null;
@@ -61,6 +61,9 @@ const ALLOWED_RPCS = new Set([
   'upload_blob',
   'download_blob',
   'delete_blob',
+  // App notice (kill-switch / deprecation banner) — payload signé Ed25519,
+  // forward direct vers Supabase RPC public.get_app_notice().
+  'get_app_notice',
 ]);
 
 // ============================================
@@ -75,6 +78,29 @@ const SEALED_SENDER_SECRET_KEY = process.env.SEALED_SENDER_SECRET_KEY; // Base64
 const SEALED_SENDER_PUBLIC_KEY = process.env.SEALED_SENDER_PUBLIC_KEY; // Base64, 32 bytes
 const SEALED_SENDER_HMAC_KEY = process.env.SEALED_SENDER_HMAC_KEY;    // Base64, 32 bytes
 const CERTIFICATE_VALIDITY_MS = 60 * 60 * 1000; // P5 fix: 1h (was 24h)
+
+// P1-B1: Rotation 30j de la clé sealed sender avec overlap 7j.
+// Sans rotation, si la clé est volée à T0, tout l'historique d'enveloppes
+// sealed capturées devient déchiffrable. La rotation limite la fenêtre.
+//
+// ⚠️ DÉSACTIVÉ PAR DÉFAUT — REQUIERT A2 (persistance externalisée).
+//
+// La rotation nécessite un disque persistant pour survivre aux redémarrages
+// du container. Sur Cloud Run avec /tmp éphémère, l'état rotation se perd
+// et chaque redémarrage peut générer une nouvelle clé, cassant la
+// compatibilité avec les clients qui ont caché l'ancienne pubkey.
+//
+// Pour activer la rotation, deux conditions doivent être réunies :
+//   1. Disque persistant fiable (VPS, GCS Volume Mount, GCE+Filestore)
+//   2. ENABLE_SEALED_SENDER_ROTATION=true dans les env vars
+//
+// Sans rotation, la sécurité reste celle d'avant P1-B1 : la clé d'env est
+// utilisée durablement. Le compromis est : rotation manuelle nécessaire
+// si la clé est suspectée compromise (regenerate keys + redeploy).
+const SEALED_SENDER_ROTATION_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000; // 30 jours
+const SEALED_SENDER_OVERLAP_MS = 7 * 24 * 60 * 60 * 1000;             // 7 jours
+const SEALED_SENDER_PERSIST_PATH = process.env.SEALED_SENDER_PERSIST_PATH || '/tmp/ghostr_sealed_sender.json';
+const ENABLE_SEALED_SENDER_ROTATION = process.env.ENABLE_SEALED_SENDER_ROTATION === 'true';
 
 // ============================================
 // CERTIFICATE RATE LIMITING (P6 fix)
@@ -294,8 +320,159 @@ function verifyProofOfWork(pow) {
   return { valid: true, reason: 'ok' };
 }
 
+// ============================================
+// P1-B3: GATEWAY-LEVEL RATE LIMITING
+// ============================================
+//
+// PROBLÈME: Sans rate limit au gateway, chaque RPC `get_messages_by_tags` avec
+// 50 tags déclenche 50 UPSERT sur la table `rate_limits` Supabase. À 10K MAU
+// actifs, on sature PgBouncer et la table devient le hot path #1 de la DB.
+//
+// SOLUTION: Pré-vérifier le rate limit en mémoire au gateway (Map sliding window
+// 60s). Si dépassé, rejeter immédiatement sans toucher Supabase. Si OK, forward.
+//
+// Côté schéma SQL, on PEUT supprimer les check_rate_limit dans les RPCs Supabase
+// (mais on les garde en defense-in-depth pour le moment — le code est inchangé).
+//
+// LIMITES PAR TAG ET PAR TYPE (alignées sur le SQL):
+//   - send_sealed_message (send_msg) : 15 / 60s
+//   - send_call_signal (send_sig)    : 30 / 60s
+//   - get_messages_by_tags (read_msg) : 60 / 60s par tag
+//   - get_call_signals_by_tags (read_sig) : 60 / 60s par tag
+//
+// MULTI-INSTANCE: Si tu scales à plusieurs instances Cloud Run, ce Map est
+// PER-INSTANCE → un attaquant qui round-robine entre instances multiplie les
+// limites. C'est acceptable car on garde check_rate_limit côté Supabase comme
+// filet de sécurité. Pour une vraie protection multi-instance, externaliser
+// vers Redis (cf docs/MIGRATION_REDIS.md).
+
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_RULES = {
+  send_msg:  15,
+  send_sig:  30,
+  read_msg:  60,
+  read_sig:  60,
+};
+
+// Map<key, { count, windowStart }> — key = `${type}:${tag}` ou `${type}:${certNonce}`
+const gatewayRateLimits = new Map();
+let lastRateLimitCleanup = Date.now();
+
+function gatewayCheckRateLimit(type, identifier) {
+  const max = RATE_LIMIT_RULES[type];
+  if (!max) return true; // type inconnu = pas de limite (defense-in-depth)
+
+  const key = `${type}:${identifier}`;
+  const now = Date.now();
+
+  // Cleanup périodique pour éviter la croissance infinie de la Map
+  if (now - lastRateLimitCleanup > 5 * 60 * 1000) {
+    for (const [k, v] of gatewayRateLimits) {
+      if (now - v.windowStart > RATE_LIMIT_WINDOW_MS * 2) gatewayRateLimits.delete(k);
+    }
+    lastRateLimitCleanup = now;
+  }
+
+  const entry = gatewayRateLimits.get(key);
+  if (!entry || now - entry.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    // Fenêtre expirée ou première requête → reset
+    gatewayRateLimits.set(key, { count: 1, windowStart: now });
+    return true;
+  }
+
+  entry.count++;
+  return entry.count <= max;
+}
+
+// ============================================
+// END P1-B3
+// ============================================
+
+// ============================================
+// P1-B6: METRICS COUNTERS (anonymous)
+// ============================================
+//
+// Pas de logs de tags, IPs, ou identifiants.
+// Endpoint /metrics protégé par HMAC (même secret que push proxy auth).
+// Lit uniquement: compteurs, uptime, erreurs par catégorie.
+//
+// Sert à brancher Grafana Cloud / UptimeRobot pour détecter:
+//   - Pics d'erreurs (gateway en dégradation)
+//   - Stagnation des compteurs (gateway figé)
+//   - Pourcentage anormal de PoW rejetés (attaque DDoS)
+
+const METRICS = {
+  startedAt: Date.now(),
+  // Counters bruts (jamais réinitialisés)
+  rpc_total: 0,
+  rpc_send_sealed: 0,
+  rpc_get_messages: 0,
+  rpc_get_call_signals: 0,
+  rpc_get_certificate: 0,
+  rpc_kt_register: 0,
+  rpc_kt_get_proof: 0,
+  rpc_kt_get_sth: 0,
+  rpc_blob_upload: 0,
+  rpc_blob_download: 0,
+  rpc_blob_delete: 0,
+  // Erreurs
+  err_decryption: 0,
+  err_pow_rejected: 0,
+  err_cert_expired: 0,
+  err_cert_quota_exceeded: 0,
+  err_rate_limit_gateway: 0,
+  err_supabase: 0,
+  err_other: 0,
+  // Push intégration
+  push_blobs_forwarded: 0,
+  push_blobs_urgent: 0,
+  // Sealed sender rotation
+  sealed_sender_rotated_at: 0, // sera rempli au démarrage
+};
+
+function bumpMetric(name) {
+  if (METRICS[name] !== undefined) METRICS[name]++;
+}
+
+// Endpoint /metrics avec auth HMAC (même mécanisme que push proxy /health)
+// L'endpoint /health reste public (status seulement, pas de chiffres).
+
+function authenticateMetricsRequest(req) {
+  // Réutilise le shared secret push proxy si configuré, sinon refuse
+  const secret = process.env.PUSH_PROXY_SHARED_SECRET || process.env.METRICS_SHARED_SECRET;
+  if (!secret) return false;
+
+  const authHeader = req.headers['x-metrics-auth'];
+  const timestamp = req.headers['x-metrics-timestamp'];
+  if (!authHeader || !timestamp) return false;
+
+  const ts = parseInt(timestamp, 10);
+  if (isNaN(ts) || Math.abs(Date.now() - ts) > 2 * 60 * 1000) return false;
+
+  const crypto = require('crypto');
+  const sharedKey = secret.length === 64 ? Buffer.from(secret, 'hex') : Buffer.from(secret);
+  const expected = crypto.createHmac('sha256', sharedKey)
+    .update(`${timestamp}:metrics`)
+    .digest('hex');
+
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(expected, 'hex'),
+      Buffer.from(authHeader, 'hex')
+    );
+  } catch {
+    return false;
+  }
+}
+
+// ============================================
+// END P1-B6
+// ============================================
+
 let sealedSenderKeyPair = null;
+let previousSealedSenderKeyPair = null; // P1-B1: pour la fenêtre d'overlap 7j
 let sealedSenderHmacKey = null;
+let sealedSenderRotatedAt = 0;          // P1-B1: timestamp de la dernière rotation
 
 function loadSealedSenderKeys() {
   if (!SEALED_SENDER_SECRET_KEY || !SEALED_SENDER_PUBLIC_KEY || !SEALED_SENDER_HMAC_KEY) {
@@ -312,20 +489,225 @@ function loadSealedSenderKeys() {
     const crypto = require('crypto');
     sealedSenderKeyPair = nacl.box.keyPair();
     sealedSenderHmacKey = new Uint8Array(crypto.randomBytes(32));
+    sealedSenderRotatedAt = Date.now();
     console.log('🛡️ [DEV] Ephemeral keys generated. Public key:', Buffer.from(sealedSenderKeyPair.publicKey).toString('base64').slice(0, 16) + '...');
     console.log('   ⚠️  Keys are ephemeral — set env vars for persistence.');
     return;
   }
-  const sk = Buffer.from(SEALED_SENDER_SECRET_KEY, 'base64');
-  const pk = Buffer.from(SEALED_SENDER_PUBLIC_KEY, 'base64');
+
+  // P1-B1 FIX: Si la rotation est DÉSACTIVÉE (cas par défaut sans A2 persistance),
+  // toujours utiliser la clé d'env, ignorer toute persistance, et supprimer
+  // tout fichier parasite qui aurait pu être créé par une exécution précédente.
+  if (!ENABLE_SEALED_SENDER_ROTATION) {
+    // Cleanup: supprimer un éventuel fichier de persistance d'une exécution
+    // précédente où la rotation aurait été activée par erreur
+    try {
+      if (fs.existsSync(SEALED_SENDER_PERSIST_PATH)) {
+        fs.unlinkSync(SEALED_SENDER_PERSIST_PATH);
+        console.log('🧹 P1-B1: Removed stale persistence file (rotation disabled)');
+      }
+      const tmpPath = SEALED_SENDER_PERSIST_PATH + '.tmp';
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch (e) {
+      console.warn('⚠️ Could not cleanup persistence file:', e.message);
+    }
+
+    // Charger UNIQUEMENT depuis env — comportement déterministe et stable.
+    const sk = Buffer.from(SEALED_SENDER_SECRET_KEY, 'base64');
+    const pk = Buffer.from(SEALED_SENDER_PUBLIC_KEY, 'base64');
+    if (sk.length !== 32 || pk.length !== 32) {
+      console.error('❌ FATAL: Invalid sealed sender key lengths.');
+      process.exit(1);
+    }
+    sealedSenderKeyPair = { publicKey: new Uint8Array(pk), secretKey: new Uint8Array(sk) };
+    sealedSenderRotatedAt = Date.now();
+    console.log('🛡️ Sealed sender keys loaded from env (rotation disabled — set ENABLE_SEALED_SENDER_ROTATION=true after A2 to enable).');
+    console.log(`   Public key: ${SEALED_SENDER_PUBLIC_KEY.slice(0, 16)}...`);
+  } else {
+    // ROTATION ACTIVÉE — requiert disque persistant fiable (post-A2)
+    const persistedState = loadSealedSenderPersistedState();
+    if (persistedState && persistedState.rotatedAt > 0) {
+      // SAFETY: rotatedAt doit être > 0 (sinon on tombe dans la boucle de rotation)
+      sealedSenderKeyPair = persistedState.current;
+      previousSealedSenderKeyPair = persistedState.previous;
+      sealedSenderRotatedAt = persistedState.rotatedAt;
+      const ageMs = Date.now() - sealedSenderRotatedAt;
+      const ageDays = (ageMs / (24 * 3600 * 1000)).toFixed(1);
+      console.log(`🛡️ P1-B1: Sealed sender keys restored from disk (current age: ${ageDays}j)`);
+      console.log(`   Current pubkey: ${Buffer.from(sealedSenderKeyPair.publicKey).toString('base64').slice(0, 16)}...`);
+      if (previousSealedSenderKeyPair) {
+        const overlapRemaining = SEALED_SENDER_OVERLAP_MS - ageMs;
+        if (overlapRemaining > 0) {
+          console.log(`   Previous pubkey active (overlap, ${Math.round(overlapRemaining / 60000)}min remaining)`);
+          scheduleSealedSenderOverlapEnd(overlapRemaining);
+        } else {
+          console.log(`   Previous pubkey overlap expired — zeroizing`);
+          zeroizeKeyPair(previousSealedSenderKeyPair);
+          previousSealedSenderKeyPair = null;
+        }
+      }
+    } else {
+      // Premier démarrage avec rotation activée: bootstrap depuis env
+      const sk = Buffer.from(SEALED_SENDER_SECRET_KEY, 'base64');
+      const pk = Buffer.from(SEALED_SENDER_PUBLIC_KEY, 'base64');
+      if (sk.length !== 32 || pk.length !== 32) {
+        console.error('❌ FATAL: Invalid sealed sender key lengths.');
+        process.exit(1);
+      }
+      sealedSenderKeyPair = { publicKey: new Uint8Array(pk), secretKey: new Uint8Array(sk) };
+      sealedSenderRotatedAt = Date.now();
+      // Persister immédiatement pour ancrer le rotatedAt
+      persistSealedSenderState();
+      console.log('🛡️ P1-B1: Sealed sender keys bootstrapped from env (rotation enabled).');
+      console.log(`   Public key: ${SEALED_SENDER_PUBLIC_KEY.slice(0, 16)}...`);
+      console.log(`   Next rotation in ${SEALED_SENDER_ROTATION_INTERVAL_MS / (24 * 3600 * 1000)}j`);
+    }
+  }
+
+  // HMAC key (toujours depuis env, pas rotée — sert à signer les certificats)
   const hmac = Buffer.from(SEALED_SENDER_HMAC_KEY, 'base64');
-  if (sk.length !== 32 || pk.length !== 32 || hmac.length !== 32) {
-    console.error('Invalid sealed sender key lengths.');
+  if (hmac.length !== 32) {
+    console.error('❌ FATAL: Invalid sealed sender HMAC key length.');
+    process.exit(1);
+  }
+  sealedSenderHmacKey = new Uint8Array(hmac);
+}
+
+// ============================================
+// P1-B1: SEALED SENDER ROTATION (30j + 7j overlap)
+// ============================================
+
+function loadSealedSenderPersistedState() {
+  try {
+    if (!fs.existsSync(SEALED_SENDER_PERSIST_PATH)) return null;
+    const raw = JSON.parse(fs.readFileSync(SEALED_SENDER_PERSIST_PATH, 'utf8'));
+    if (!raw || !raw.current || !raw.current.publicKey || !raw.current.secretKey) return null;
+    const current = {
+      publicKey: new Uint8Array(Buffer.from(raw.current.publicKey, 'base64')),
+      secretKey: new Uint8Array(Buffer.from(raw.current.secretKey, 'base64')),
+    };
+    let previous = null;
+    if (raw.previous && raw.previous.publicKey && raw.previous.secretKey) {
+      previous = {
+        publicKey: new Uint8Array(Buffer.from(raw.previous.publicKey, 'base64')),
+        secretKey: new Uint8Array(Buffer.from(raw.previous.secretKey, 'base64')),
+      };
+    }
+    return { current, previous, rotatedAt: raw.rotatedAt || 0 };
+  } catch (e) {
+    console.warn('⚠️ P1-B1: Could not load sealed sender state:', e.message);
+    return null;
+  }
+}
+
+function persistSealedSenderState() {
+  // FIX: ne JAMAIS persister si la rotation est désactivée. Évite de créer
+  // des fichiers parasites qui pourraient être chargés à un futur boot.
+  if (!ENABLE_SEALED_SENDER_ROTATION) return;
+
+  try {
+    const obj = {
+      current: {
+        publicKey: Buffer.from(sealedSenderKeyPair.publicKey).toString('base64'),
+        secretKey: Buffer.from(sealedSenderKeyPair.secretKey).toString('base64'),
+      },
+      previous: previousSealedSenderKeyPair ? {
+        publicKey: Buffer.from(previousSealedSenderKeyPair.publicKey).toString('base64'),
+        secretKey: Buffer.from(previousSealedSenderKeyPair.secretKey).toString('base64'),
+      } : null,
+      rotatedAt: sealedSenderRotatedAt,
+    };
+    // Écriture atomique : tmp + rename pour éviter un fichier corrompu en cas de crash
+    const tmpPath = SEALED_SENDER_PERSIST_PATH + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(obj), { mode: 0o600 });
+    fs.renameSync(tmpPath, SEALED_SENDER_PERSIST_PATH);
+  } catch (e) {
+    console.error('❌ P1-B1: Failed to persist sealed sender state:', e.message);
+  }
+}
+
+function zeroizeKeyPair(kp) {
+  if (kp) {
+    try { kp.secretKey.fill(0); } catch {}
+    try { kp.publicKey.fill(0); } catch {}
+  }
+}
+
+let sealedSenderOverlapTimer = null;
+function scheduleSealedSenderOverlapEnd(delayMs) {
+  if (sealedSenderOverlapTimer) clearTimeout(sealedSenderOverlapTimer);
+  sealedSenderOverlapTimer = setTimeout(() => {
+    if (previousSealedSenderKeyPair) {
+      console.log('🔑 P1-B1: Sealed sender overlap expired — zeroizing previous key');
+      zeroizeKeyPair(previousSealedSenderKeyPair);
+      previousSealedSenderKeyPair = null;
+      persistSealedSenderState();
+    }
+  }, delayMs);
+}
+
+function rotateSealedSenderKeys() {
+  console.log('🔑 P1-B1: Rotating sealed sender keys...');
+  // Archiver la clé courante comme "previous" pour l'overlap
+  if (previousSealedSenderKeyPair) {
+    // Si une rotation précédente est encore en overlap, on la zéroize maintenant
+    // (cas pathologique : 2 rotations dans l'overlap, mais en pratique 30j > 7j)
+    console.warn('   ⚠️  Previous key was still in overlap — zeroizing early');
+    zeroizeKeyPair(previousSealedSenderKeyPair);
+  }
+  previousSealedSenderKeyPair = sealedSenderKeyPair;
+
+  // Générer la nouvelle clé
+  sealedSenderKeyPair = nacl.box.keyPair();
+  sealedSenderRotatedAt = Date.now();
+
+  console.log(`🔑 P1-B1: New sealed sender pubkey: ${Buffer.from(sealedSenderKeyPair.publicKey).toString('base64').slice(0, 16)}...`);
+  console.log(`   Previous key kept for ${SEALED_SENDER_OVERLAP_MS / (24 * 3600 * 1000)}j overlap`);
+
+  // Persister l'état (pour survivre aux redémarrages pendant l'overlap)
+  persistSealedSenderState();
+
+  // Programmer la fin de l'overlap (zeroize previous + persist)
+  scheduleSealedSenderOverlapEnd(SEALED_SENDER_OVERLAP_MS);
+}
+
+function startSealedSenderRotation() {
+  // P1-B1 FIX: Ne jamais démarrer la rotation si elle n'est pas explicitement activée.
+  if (!ENABLE_SEALED_SENDER_ROTATION) {
+    console.log('🔑 P1-B1: Rotation disabled (set ENABLE_SEALED_SENDER_ROTATION=true after A2 to enable).');
     return;
   }
-  sealedSenderKeyPair = { publicKey: new Uint8Array(pk), secretKey: new Uint8Array(sk) };
-  sealedSenderHmacKey = new Uint8Array(hmac);
-  console.log('🛡️ Sealed sender keys loaded. Public key:', SEALED_SENDER_PUBLIC_KEY.slice(0, 16) + '...');
+
+  // SAFETY: si sealedSenderRotatedAt n'est pas défini correctement, ne PAS démarrer
+  // une boucle de rotation immédiate. Refuser de démarrer plutôt que de boucler.
+  if (!sealedSenderRotatedAt || sealedSenderRotatedAt <= 0) {
+    console.error('❌ P1-B1: sealedSenderRotatedAt invalid, refusing to start rotation loop');
+    return;
+  }
+
+  const now = Date.now();
+  const timeSinceLastRotation = now - sealedSenderRotatedAt;
+
+  // SAFETY: si le delta est aberrant (>2× l'intervalle = clock skew ou boot bug),
+  // ne pas tenter une rotation immédiate. Mieux vaut attendre le prochain démarrage.
+  if (timeSinceLastRotation < 0 || timeSinceLastRotation > 2 * SEALED_SENDER_ROTATION_INTERVAL_MS) {
+    console.warn(`⚠️ P1-B1: Aberrant timeSinceLastRotation (${Math.round(timeSinceLastRotation / 1000)}s). Resetting rotatedAt to now.`);
+    sealedSenderRotatedAt = now;
+    persistSealedSenderState();
+  }
+
+  let delayUntilNextRotation = SEALED_SENDER_ROTATION_INTERVAL_MS - (Date.now() - sealedSenderRotatedAt);
+  if (delayUntilNextRotation < 0) {
+    // Cas réel : gateway éteint > 30j. Délai minimum 1h pour éviter une rotation
+    // dans les premières secondes du boot (qui pourrait piéger les clients qui
+    // viennent juste de fetcher le manifest).
+    delayUntilNextRotation = 60 * 60 * 1000;
+  }
+  console.log(`🔑 P1-B1: Next sealed sender rotation in ${Math.round(delayUntilNextRotation / (24 * 3600 * 1000) * 10) / 10}j`);
+  setTimeout(function rotateAndReschedule() {
+    rotateSealedSenderKeys();
+    setTimeout(rotateAndReschedule, SEALED_SENDER_ROTATION_INTERVAL_MS);
+  }, delayUntilNextRotation);
 }
 
 /**
@@ -672,6 +1054,14 @@ async function requestHandlerInner(req, res) {
       sealedSenderPubkey: sealedSenderKeyPair 
         ? Buffer.from(sealedSenderKeyPair.publicKey).toString('base64') 
         : null,
+      // P1-B1: Pendant la fenêtre overlap, expose aussi la previous pubkey
+      // pour que les clients qui ont caché l'ancienne valeur puissent toujours
+      // déchiffrer leurs réponses en cours et bascule transparente vers la
+      // nouvelle pour les nouveaux envois. Le client préfère TOUJOURS la
+      // clé courante pour les nouveaux envois.
+      sealedSenderPreviousPubkey: previousSealedSenderKeyPair
+        ? Buffer.from(previousSealedSenderKeyPair.publicKey).toString('base64')
+        : null,
       // GH-16: keyRotatedAt and version REMOVED — facilitates fingerprinting
     };
     // P1-A6: Ajouter la clé d'identité et la signature si disponibles
@@ -715,9 +1105,30 @@ async function requestHandlerInner(req, res) {
     res.writeHead(code, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status,
-      uptime: process.uptime(),
-      sealedSender: sealedSenderOk ? 'loaded' : 'MISSING — messages will fail',
-      keyTransparency: ktOk ? `${ktTree.getStats().treeSize} keys` : 'NOT INITIALIZED',
+      // GH-16-fix: ne pas exposer uptime ni treeSize publiquement (corrélation
+      // avec rotation de clés / redémarrage). Status binaire suffit pour
+      // les healthchecks Cloud Run / Fly / UptimeRobot.
+    }));
+    return;
+  }
+
+  // P1-B6: GET /metrics — compteurs anonymes pour monitoring
+  // AUTH HMAC obligatoire. Pas de tags, pas d'IPs, juste des chiffres globaux.
+  if (req.method === 'GET' && req.url === '/metrics') {
+    if (!authenticateMetricsRequest(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Authentication required' }));
+      return;
+    }
+    METRICS.sealed_sender_rotated_at = sealedSenderRotatedAt;
+    const uptime_seconds = Math.floor((Date.now() - METRICS.startedAt) / 1000);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      uptime_seconds,
+      ...METRICS,
+      kt_tree_size: ktTree ? ktTree.getStats().treeSize : -1,
+      gateway_rate_limit_entries: gatewayRateLimits.size,
+      cert_usage_entries: certUsage.size,
     }));
     return;
   }
@@ -766,6 +1177,7 @@ async function requestHandlerInner(req, res) {
         const powResult = verifyProofOfWork(pow);
         if (!powResult.valid) {
           console.log(`❌ PoW rejected: ${powResult.reason}`);
+          bumpMetric('err_pow_rejected');
           const errResp = encryptResponse(
             JSON.stringify({ data: null, error: `Invalid or missing proof-of-work: ${powResult.reason}` }),
             ephemeralPubKey, usedSecretKey
@@ -780,6 +1192,8 @@ async function requestHandlerInner(req, res) {
           : { data: null, error: 'Sealed sender not configured' };
         const certResponse = encryptResponse(JSON.stringify(result), ephemeralPubKey, usedSecretKey);
         console.log(`✅ get_sealed_certificate (PoW verified) → ${cert ? 'issued' : 'not configured'}`);
+        bumpMetric('rpc_get_certificate');
+        bumpMetric('rpc_total');
         res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
         res.end(Buffer.from(certResponse));
         return;
@@ -909,6 +1323,24 @@ async function requestHandlerInner(req, res) {
           return;
         }
 
+        // P1-B3: Rate limit gateway-level avant déchiffrement coûteux.
+        // Limite par tag = 15 sends/min (aligné sur send_msg du SQL).
+        // P1-B3-NOTE: on rate-limite par tag d'enveloppe (visible avant decrypt).
+        // C'est moins fin que par certificat (le certificat est dans le ciphertext)
+        // mais ça suffit ici car le tag rote toutes les 24h et on a déjà checkCertRateLimit
+        // par cert (100 msg/cert) qui fait le contrôle fin par expéditeur.
+        const sendTag = request.params && request.params.p_tag;
+        if (sendTag && !gatewayCheckRateLimit('send_msg', sendTag)) {
+          bumpMetric('err_rate_limit_gateway');
+          const errResp = encryptResponse(
+            JSON.stringify({ error: 'Rate limit exceeded (gateway)' }),
+            ephemeralPubKey, usedSecretKey
+          );
+          res.writeHead(429, { 'Content-Type': 'application/octet-stream' });
+          res.end(Buffer.from(errResp));
+          return;
+        }
+
         try {
           const params = request.params || {};
           const sealedContentB64 = params.p_sealed_content;
@@ -923,12 +1355,26 @@ async function requestHandlerInner(req, res) {
           const ssNonce = sealedContent.slice(32, 56);
           const ssCiphertext = sealedContent.slice(56);
 
-          const ssPlaintext = nacl.box.open(
-            new Uint8Array(ssCiphertext),
-            new Uint8Array(ssNonce),
-            new Uint8Array(ssEphPubKey),
-            sealedSenderKeyPair.secretKey
-          );
+          const ssPlaintext = (() => {
+            // P1-B1: Essayer la clé courante d'abord, puis la previous (overlap 7j).
+            // Pendant la fenêtre de rotation, certains clients peuvent encore chiffrer
+            // pour l'ancienne clé (cache navigateur ou délai de propagation manifest).
+            let pt = nacl.box.open(
+              new Uint8Array(ssCiphertext),
+              new Uint8Array(ssNonce),
+              new Uint8Array(ssEphPubKey),
+              sealedSenderKeyPair.secretKey
+            );
+            if (!pt && previousSealedSenderKeyPair) {
+              pt = nacl.box.open(
+                new Uint8Array(ssCiphertext),
+                new Uint8Array(ssNonce),
+                new Uint8Array(ssEphPubKey),
+                previousSealedSenderKeyPair.secretKey
+              );
+            }
+            return pt;
+          })();
           if (!ssPlaintext) {
             throw new Error('Sealed sender decryption failed');
           }
@@ -988,19 +1434,40 @@ async function requestHandlerInner(req, res) {
 
           const sealedResp = encryptResponse(JSON.stringify(supabaseResult), ephemeralPubKey, usedSecretKey);
           console.log(`✅ send_sealed_message → unwrapped & forwarded (cert valid, tag: ${tag.slice(0, 12)}...)`);
+          bumpMetric('rpc_send_sealed');
+          bumpMetric('rpc_total');
           
           // Push notification: forward le blob opaque au Push Proxy.
           // Le Gateway ne fait AUCUN lookup — il forward CHAQUE blob.
           // Vrais blobs et blobs aléatoires sont indistinguables.
+          //
+          // P0-A4: Le client peut signaler qu'un message est URGENT (signal d'appel,
+          // annulation d'appel) via p_urgent: true. Le push proxy reçoit alors le
+          // blob avec un jitter réduit (200-1500ms vs 1000-8000ms standard).
+          //
+          // TRADE-OFF PRIVACY: Le gateway apprend qu'un message est "urgent" (binaire).
+          // Mais il voit déjà le timing de tous les sends, et un signal d'appel a un
+          // pattern temporel distinct (rafale de plusieurs en quelques secondes vs
+          // message isolé). On formalise donc ce qui est déjà inférable.
           if (params.p_push_blob) {
-            triggerPushNotification(params.p_push_blob);
+            const isUrgent = params.p_urgent === true;
+            triggerPushNotification(params.p_push_blob, isUrgent);
           }
+
+          // P1-B5: enregistrer l'activité réelle pour le cover traffic intelligent
+          recordRealActivity();
           
           res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
           res.end(Buffer.from(sealedResp));
 
         } catch (sealedErr) {
           console.error(`❌ send_sealed_message failed: ${sealedErr.message}`);
+          // P1-B6: catégoriser l'erreur pour les métriques
+          const msg = String(sealedErr.message || '');
+          if (msg.includes('Certificate expired')) bumpMetric('err_cert_expired');
+          else if (msg.includes('quota exceeded')) bumpMetric('err_cert_quota_exceeded');
+          else if (msg.includes('Sealed sender decryption failed') || msg.includes('Tag commitment')) bumpMetric('err_decryption');
+          else bumpMetric('err_other');
           const errResp = encryptResponse(
             JSON.stringify({ error: `Sealed sender: ${sealedErr.message}` }),
             ephemeralPubKey, usedSecretKey
@@ -1237,8 +1704,35 @@ async function requestHandlerInner(req, res) {
       // END LEGACY MEDIA RPCs
       // ============================================
 
+      // P1-B3: Rate limit gateway-level pour les RPCs de lecture.
+      // Pré-vérifie en mémoire avant de saturer Supabase. Si une instance
+      // gateway est seule (Cloud Run max=1 ou VPS), c'est fiable. En multi-
+      // instance, garder check_rate_limit SQL en defense-in-depth.
+      if (request.rpc === 'get_messages_by_tags' || request.rpc === 'get_call_signals_by_tags') {
+        const rlType = request.rpc === 'get_messages_by_tags' ? 'read_msg' : 'read_sig';
+        const tags = (request.params && request.params.p_tags) || [];
+        if (Array.isArray(tags)) {
+          // Limite : un seul tag dépassé suffit à rejeter (cohérent avec le SQL)
+          for (const t of tags) {
+            if (!gatewayCheckRateLimit(rlType, t)) {
+              bumpMetric('err_rate_limit_gateway');
+              const errResp = encryptResponse(
+                JSON.stringify({ data: null, error: 'Rate limit exceeded (gateway)' }),
+                ephemeralPubKey, usedSecretKey
+              );
+              res.writeHead(429, { 'Content-Type': 'application/octet-stream' });
+              res.end(Buffer.from(errResp));
+              return;
+            }
+          }
+        }
+        bumpMetric(rlType === 'read_msg' ? 'rpc_get_messages' : 'rpc_get_call_signals');
+        bumpMetric('rpc_total');
+      }
+
       // Forward to Supabase
       const supabaseResult = await forwardToSupabase(request.rpc, request.params || {});
+      if (supabaseResult.error) bumpMetric('err_supabase');
 
       // Encrypt the response
       const encryptedResponse = encryptResponse(
@@ -1328,6 +1822,7 @@ if (TLS_CERT_PATH && TLS_KEY_PATH) {
 loadKeys();
 loadSealedSenderKeys();
 startKeyRotation(); // ACTION 10: Schedule automatic key rotation
+startSealedSenderRotation(); // P1-B1: Rotation 30j sealed sender
 
 // PRODUCTION FIX: Load persisted state and schedule periodic saves
 loadCertUsage();
@@ -1336,11 +1831,13 @@ setInterval(() => { saveCertUsage(); saveRecentChallenges(); }, PERSIST_INTERVAL
 process.on('SIGTERM', () => {
   console.log('💾 Saving state before shutdown...');
   saveCertUsage(); saveRecentChallenges();
+  if (sealedSenderKeyPair) persistSealedSenderState(); // P1-B1
   process.exit(0);
 });
 process.on('SIGINT', () => {
   console.log('💾 Saving state before shutdown...');
   saveCertUsage(); saveRecentChallenges();
+  if (sealedSenderKeyPair) persistSealedSenderState(); // P1-B1
   process.exit(0);
 });
 

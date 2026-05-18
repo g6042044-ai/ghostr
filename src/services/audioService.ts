@@ -30,7 +30,7 @@ import { Platform, DeviceEventEmitter } from 'react-native';
 import * as Device from 'expo-device';
 import InCallManager from 'react-native-incall-manager';
 import { getRandomBytes } from './crypto';
-import { setSpeakerSyncCallback, isRingtoneActive, stopInCallManager, setCallTonesSpeakerState } from './callTones';
+import { isRingtoneActive, stopInCallManager, setCallTonesSpeakerState } from './callTones';
 import { setAndroidSpeaker, clearAndroidRoute } from './speakerRoute';
 
 // ============================================
@@ -915,7 +915,6 @@ export async function cleanupAudio(): Promise<void> {
   if (playing) await stopPlayback();
   captureCallback = null;
   earlyAudioBuffer = [];
-  setSpeakerSyncCallback(null);
 
   // Reset InCallManager route override
   if (!isWeb()) { try { InCallManager.setForceSpeakerphoneOn(null); } catch {} }

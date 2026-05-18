@@ -1,11 +1,11 @@
 // src/services/encryptedBlobService.ts
-// v27.0: Encrypted Blob Storage — OHTTP-only (ACTION-03 Phase 1 Security)
+// v28.0: Encrypted Blob Storage — OHTTP-only + iOS performance fix
 //
 // ARCHITECTURE (v27.0 — CHANGED from v26.0):
 //   Upload: data → nacl.secretbox(random key) → pad to tier → base64 → OHTTP relay → gateway → Supabase Storage
 //   Download: OHTTP relay → gateway → Supabase Storage → base64 → unpad → nacl.secretbox.open → data
 //
-// v26.0 VULNERABILITY FIXED:
+// v27.0 VULNERABILITY FIXED:
 //   Previously, uploads/downloads went through CF Relay's /storage/* proxy.
 //   The CF Relay saw the client's IP AND the blob path (UUID) in the URL.
 //   Supabase saw the blob UUID AND the timestamp/size.
@@ -21,18 +21,49 @@
 //   Base64 encoding adds ~33% overhead on the OHTTP payload.
 //   A 16MB blob becomes ~21.3MB in transit through the tunnel.
 //   This is acceptable for the anonymity guarantee.
+//
+// ============================================================================
+// v28.0 — iOS PERFORMANCE FIX:
+//
+// PROBLÈMES CORRIGÉS (latence iOS sur l'envoi d'images):
+//
+//   1. PADDING RANDOM EXPLOSIF:
+//      L'ancienne implémentation de padToTier appelait getRandomBytes() en
+//      boucle avec des chunks de 64KB, mais en interne chaque chunk était
+//      lui-même découpé en 64 appels de 1024 bytes vers Crypto.getRandomBytes
+//      (limite expo-crypto). Pour le tier 16MB: 256 × 64 = 16 384 appels JSI.
+//      → CORRIGÉ via fillRandomBytes (naclSetup.ts) qui utilise crypto.getRandomValues
+//        (limite 64KB) directement en place. 16 384 → 256 appels.
+//
+//   2. DOUBLE ALLOCATION CIPHERTEXT + PADDED:
+//      L'ancien code allouait `ciphertext` (taille X+16), puis `padded`
+//      (taille tier), puis copiait ciphertext dans padded. Pour 16MB: deux
+//      allocations distinctes + memcpy.
+//      → CORRIGÉ: padToTier alloue UNE fois la taille tier puis copie
+//        ciphertext + fillRandomBytes en place. Pas de copie supplémentaire.
+//
+//   3. THREAD JS BLOQUÉ:
+//      nacl.secretbox sur 4-10MB d'image bloque le thread JS plusieurs
+//      secondes (tweetnacl est pur JS). Pendant ce temps, l'UI freeze.
+//      → CORRIGÉ: on yield au thread JS avant chaque opération lourde
+//        (encryptBlob, padToTier, encodeBase64) via yieldToUI() pour que
+//        React puisse rafraîchir l'overlay de progression et les indicateurs.
+//
+//   4. encryptBlob N'EST PLUS SYNCHRONE:
+//      Avant: function encryptBlob(data) → EncryptedBlobResult
+//      Après: async function encryptBlob(data) → Promise<EncryptedBlobResult>
+//      Seul caller interne (encryptAndUploadBlob) est mis à jour.
+// ============================================================================
 
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 import { getRandomBytes } from './crypto';
+import { fillRandomBytes } from './naclSetup';
 import { secureRpc } from './relayTransport';
 
 // ============================================
 // CONSTANTS
 // ============================================
-
-/** Bucket Supabase pour les blobs anonymes chiffrés */
-const BLOB_BUCKET = 'ghostr-blobs';
 
 /**
  * Tiers de padding pour les blobs chiffrés.
@@ -48,7 +79,7 @@ const BLOB_BUCKET = 'ghostr-blobs';
  *   Gros fichier          → 16MB
  */
 const BLOB_TIERS = [
-  256 * 1024,     //  256 KB
+  256 * 1024,       //  256 KB
   1 * 1024 * 1024,  //   1 MB
   4 * 1024 * 1024,  //   4 MB
   16 * 1024 * 1024, //  16 MB
@@ -56,6 +87,23 @@ const BLOB_TIERS = [
 
 /** Taille max acceptée (doit correspondre à la config Supabase bucket) */
 const MAX_BLOB_SIZE = 20 * 1024 * 1024; // 20 MB
+
+// ============================================
+// UTILITAIRES
+// ============================================
+
+/**
+ * Yield au thread JS pour laisser l'UI se rafraîchir entre deux étapes lourdes.
+ * Sur iOS, ceci permet à React de redessiner l'overlay de progression et
+ * aux gestes tactiles de rester réactifs pendant l'envoi d'un média.
+ *
+ * setTimeout(0) traverse la file de macrotasks, ce qui force un tick complet
+ * de l'event loop (rendering, animations, gestes). Promise.resolve() ne
+ * suffirait pas — elle reste dans la file microtask.
+ */
+function yieldToUI(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
 
 // ============================================
 // ENCRYPTION
@@ -79,19 +127,28 @@ export interface EncryptedBlobResult {
  *
  * Pipeline: data → nacl.secretbox(key, nonce) → ciphertext → pad(tier) → blob
  *
- * Le padding utilise des bytes aléatoires (pas des zéros) pour que
- * la compression HTTP ne puisse pas révéler la taille originale.
+ * Le padding utilise des bytes aléatoires (pas des zéros) pour que toute
+ * compression au niveau transport ne puisse pas révéler la taille originale.
+ *
+ * v28.0: Async — yield au thread JS entre encryption et padding pour
+ *        garder l'UI réactive pendant les transferts >1MB.
  */
-export function encryptBlob(data: Uint8Array): EncryptedBlobResult {
+export async function encryptBlob(data: Uint8Array): Promise<EncryptedBlobResult> {
   // Clé et nonce aléatoires (CSPRNG)
   const key = getRandomBytes(nacl.secretbox.keyLength); // 32 bytes
   const nonce = getRandomBytes(nacl.secretbox.nonceLength); // 24 bytes
 
-  // Chiffrement XSalsa20-Poly1305
+  // Yield avant l'opération lourde (nacl.secretbox est pur JS)
+  await yieldToUI();
+
+  // Chiffrement XSalsa20-Poly1305 — bloquant ~100-500ms pour 1-10MB sur iOS
   const ciphertext = nacl.secretbox(data, nonce, key);
   if (!ciphertext) {
     throw new Error('[BlobService] Encryption failed');
   }
+
+  // Yield avant le padding (lui aussi peut être lourd pour les gros tiers)
+  await yieldToUI();
 
   // Padding au tier supérieur
   const tier = selectTier(ciphertext.length);
@@ -110,6 +167,9 @@ export function encryptBlob(data: Uint8Array): EncryptedBlobResult {
  * Déchiffre un blob téléchargé.
  *
  * Pipeline: paddedBlob → unpad(ciphertextSize) → nacl.secretbox.open → data
+ *
+ * Reste synchrone — la réception passe déjà par un setState async et le
+ * volume traité ici est borné par l'image décodée que l'utilisateur regarde.
  */
 export function decryptBlob(
   paddedBlob: Uint8Array,
@@ -117,8 +177,8 @@ export function decryptBlob(
   nonce: Uint8Array,
   ciphertextSize: number
 ): Uint8Array {
-  // Retirer le padding
-  const ciphertext = paddedBlob.slice(0, ciphertextSize);
+  // Retirer le padding (subarray = zéro-copy)
+  const ciphertext = paddedBlob.subarray(0, ciphertextSize);
 
   // Déchiffrement
   const data = nacl.secretbox.open(ciphertext, nonce, key);
@@ -148,25 +208,28 @@ function selectTier(size: number): number {
 
 /**
  * Padde le ciphertext à exactement `tierSize` bytes avec des bytes aléatoires.
- * Les bytes aléatoires empêchent la compression HTTP de révéler la taille originale.
+ * Les bytes aléatoires empêchent la compression HTTP / au stockage de
+ * révéler la taille originale.
+ *
+ * v28.0: Une seule allocation (le buffer paddé final), pas de copie
+ * intermédiaire. Le random est écrit DIRECTEMENT dans la queue du buffer
+ * via fillRandomBytes(subarray) → un seul appel JSI par 64KB de padding.
  */
 function padToTier(ciphertext: Uint8Array, tierSize: number): Uint8Array {
   if (ciphertext.length >= tierSize) {
     return ciphertext; // Déjà ≥ tier (ne devrait pas arriver)
   }
 
+  // Une seule allocation: le buffer de la taille tier finale.
   const padded = new Uint8Array(tierSize);
+  // Préfixe = ciphertext (memcpy natif via Uint8Array.set)
   padded.set(ciphertext, 0);
 
-  // Remplir le reste avec des bytes aléatoires
-  const paddingSize = tierSize - ciphertext.length;
-  // Générer le padding en blocs de 64KB (plus efficace)
-  const CHUNK = 65536;
-  for (let offset = ciphertext.length; offset < tierSize; offset += CHUNK) {
-    const remaining = Math.min(CHUNK, tierSize - offset);
-    const randomPad = getRandomBytes(remaining);
-    padded.set(randomPad, offset);
-  }
+  // Queue = bytes aléatoires écrits EN PLACE.
+  // fillRandomBytes utilise crypto.getRandomValues (1 appel natif / 64KB)
+  // au lieu de la chaîne Crypto.getRandomBytes (1 appel natif / 1024B).
+  // Gain pour le tier 16MB: ~64× moins d'appels au pont natif iOS.
+  fillRandomBytes(padded.subarray(ciphertext.length));
 
   return padded;
 }
@@ -205,6 +268,9 @@ export interface UploadBlobResult {
  * The gateway decrypts, extracts the blob data, and uploads to Supabase Storage.
  * → No single entity sees both IP and blob UUID.
  *
+ * v28.0: Async encryptBlob + yield avant l'encodage base64 pour ne pas
+ * bloquer le thread JS pendant l'envoi.
+ *
  * @param data - Données brutes à chiffrer (Uint8Array)
  * @returns Métadonnées du blob pour inclusion dans le message E2E
  */
@@ -213,21 +279,30 @@ export async function encryptAndUploadBlob(data: Uint8Array): Promise<UploadBlob
     throw new Error(`[BlobService] Data too large: ${Math.round(data.length / 1024 / 1024)}MB > ${MAX_BLOB_SIZE / 1024 / 1024}MB`);
   }
 
-  // 1. Chiffrer + padder
-  const encrypted = encryptBlob(data);
+  // 1. Chiffrer + padder (async — yield JS thread entre étapes)
+  const encrypted = await encryptBlob(data);
 
   __DEV__ && console.log(
     `[BlobService] 🔐 Encrypted: ${Math.round(data.length / 1024)}KB → ${Math.round(encrypted.ciphertextSize / 1024)}KB → padded to ${Math.round(encrypted.tier / 1024)}KB`
   );
 
-  // 2. Upload via OHTTP relay (v27.0: no more /storage/* proxy)
+  // 2. Yield avant l'encodage base64 (qui sur 16MB = ~21MB string en JS)
+  await yieldToUI();
+
+  // 3. Upload via OHTTP relay (v27.0: no more /storage/* proxy)
   const blobId = generateBlobId();
   const blobPath = `${blobId}.bin`;
 
-  // Base64 encode the padded blob for JSON transport through OHTTP
+  // Base64 encode the padded blob for JSON transport through OHTTP.
+  // encodeBase64 sur 16MB ≈ 21.3MB string — opération lourde mais
+  // inévitable car le tunnel OHTTP est JSON-based.
   const blobB64 = encodeBase64(encrypted.paddedBlob);
 
-  const { data: result, error } = await secureRpc('upload_blob', {
+  // Yield juste avant le RPC réseau pour que les indicateurs UI se mettent
+  // à jour avant que le thread JS ne soit absorbé par le NaCl box du RPC.
+  await yieldToUI();
+
+  const { error } = await secureRpc('upload_blob', {
     blob_data: blobB64,
     blob_path: blobPath,
     content_type: 'application/octet-stream',
@@ -370,12 +445,12 @@ export async function fetchMediaViaRelay(url: string): Promise<Uint8Array> {
     // Fallback: URL non-Supabase ou format inconnu — ne devrait pas arriver
     // dans le flux normal, mais on log et on retente via fetch direct
     __DEV__ && console.warn(
-      '[BlobService] ⚠️ URL non reconnue, impossible de router via OHTTP:',
+      '[BlobService] ⚠️ Unrecognized URL, cannot route via OHTTP:',
       url.slice(0, 80)
     );
     throw new Error(
-      `[BlobService] URL de média non reconnue. Le proxy /storage/* a été supprimé. ` +
-      `Toutes les URLs doivent pointer vers ghostr-blobs. URL: ${url.slice(0, 80)}...`
+      `[BlobService] Unrecognized media URL. The /storage/* proxy has been removed. ` +
+      `All URLs must point to ghostr-blobs. URL: ${url.slice(0, 80)}...`
     );
   }
 

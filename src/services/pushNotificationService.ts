@@ -20,11 +20,11 @@
 import * as Notifications from 'expo-notifications';
 import * as Device from 'expo-device';
 import { Platform, Vibration, AppState } from 'react-native';
-import { Asset } from 'expo-asset';
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { encryptIfEnabled, decryptIfNeeded } from './localCrypto';
+import i18n, { initI18n } from '../i18n';
 
 // ============================================
 // CONFIGURATION
@@ -35,10 +35,20 @@ const PUSH_ENABLED_KEY = '@ghostr_push_enabled';
 const PEER_TOKEN_PREFIX = '@ghostr_peer_push_';
 const NOTIF_ONBOARDING_KEY = '@ghostr_notif_onboarding_done';
 
+// Tracks the last known own native push token (FCM/APNs) across cold starts.
+// Written every time we successfully fetch a token so we can detect rotations
+// that happened while the app was killed (where addPushTokenListener cannot fire).
+const LAST_KNOWN_TOKEN_KEY = '@ghostr_last_known_own_push_token';
+
+// Versioned one-shot purge of stored peer push tokens. Bump this string to
+// force every device, on next launch, to drop its cache of peer tokens and
+// re-exchange fresh ones via push_token_update messages. Used to recover from
+// a fleet-wide stale-token situation (e.g., after a build that rotated tokens
+// without notifying peers).
+const PEER_TOKEN_PURGE_VERSION_KEY = '@ghostr_peer_token_purge_version';
+
 const PADDED_PLAINTEXT_SIZE = 256;
 const ENCRYPTED_BLOB_SIZE = 32 + 24 + PADDED_PLAINTEXT_SIZE + 16;
-
-const CALL_RING_TIMEOUT_MS = 90_000;
 
 // Ring re-trigger (iOS + fallback)
 const RING_RETRIGGER_MS = 28_000;
@@ -209,6 +219,88 @@ export function getOwnPushTokenInfo(): { token: string; platform: 'fcm' | 'apns'
 }
 
 // ============================================
+// TOKEN ROTATION RECOVERY
+// ============================================
+// Push tokens (FCM on Android, APNs on iOS) are NOT stable identifiers. Per
+// Apple/Google, they may rotate at any time without notice. Since our peers
+// cache each other's tokens locally for 7 days (PEER_TOKEN_TTL_MS), a rotation
+// can leave them sending pushes to a stale-but-still-200-OK token, with the
+// device receiving nothing. The two helpers below close that gap.
+
+/**
+ * One-shot purge of every cached peer push token in AsyncStorage.
+ * Idempotent across calls with the same `version` string — only the first
+ * call after a version bump actually purges. Use this to recover from a
+ * fleet-wide stale-token state (e.g., a release where everyone's tokens
+ * rotated without being repropagated).
+ *
+ * After the purge, the very next push attempt to each peer will produce a
+ * `generateRandomPushBlob()` decoy (decrypts to garbage at the proxy and is
+ * silently dropped). Real notifications resume as soon as both peers exchange
+ * a fresh `push_token_update` message — which `sendPushTokenToAllPeers()`
+ * handles automatically at app startup and on rotation.
+ *
+ * @param version Bump this string to trigger a new purge cycle.
+ * @returns Number of peer tokens purged, or `-1` if this version was already processed.
+ */
+export async function purgeAllPeerPushTokens(version: string): Promise<number> {
+  try {
+    const lastVersion = await AsyncStorage.getItem(PEER_TOKEN_PURGE_VERSION_KEY);
+    if (lastVersion === version) return -1;
+
+    const allKeys = await AsyncStorage.getAllKeys();
+    const peerKeys = allKeys.filter(k => k.startsWith(PEER_TOKEN_PREFIX));
+    if (peerKeys.length > 0) {
+      await AsyncStorage.multiRemove(peerKeys);
+    }
+    await AsyncStorage.setItem(PEER_TOKEN_PURGE_VERSION_KEY, version);
+    __DEV__ && console.log(`[PushService] 🧹 Purged ${peerKeys.length} stale peer push token(s) — version=${version}`);
+    return peerKeys.length;
+  } catch (err) {
+    __DEV__ && console.warn('[PushService] purgeAllPeerPushTokens failed:', err);
+    return 0;
+  }
+}
+
+/**
+ * Re-fetch our own native push token from the OS and, if it differs from the
+ * value we currently hold, update local state and broadcast it to all peers.
+ *
+ * Designed to be called on app foreground transitions: when the app was in
+ * deep background or was OS-killed, FCM/APNs may have rotated the token
+ * without our `addPushTokenListener` firing. This helper restores
+ * synchronization without requiring a cold start.
+ *
+ * No-ops if push is disabled, permissions are missing, or we're not on a
+ * physical device. Safe to call frequently (it only triggers a network
+ * broadcast when the token actually changed).
+ *
+ * @returns `true` if the token had changed and a propagation was triggered.
+ */
+export async function refreshOwnTokenIfChanged(): Promise<boolean> {
+  if (!_pushEnabled || !Device.isDevice) return false;
+  try {
+    const r = await Notifications.getDevicePushTokenAsync();
+    const newToken = r.data as string;
+    if (!newToken || newToken === _nativeToken) return false;
+
+    __DEV__ && console.log('[PushService] 🔄 Token rotation detected on foreground refresh → propagating to peers');
+    _nativeToken = newToken;
+    try { await AsyncStorage.setItem(LAST_KNOWN_TOKEN_KEY, newToken); } catch {}
+    try {
+      const { sendPushTokenToAllPeers } = require('./api1to1');
+      await sendPushTokenToAllPeers();
+    } catch (err) {
+      __DEV__ && console.warn('[PushService] refreshOwnTokenIfChanged propagation failed:', err);
+    }
+    return true;
+  } catch (err) {
+    __DEV__ && console.warn('[PushService] refreshOwnTokenIfChanged failed:', err);
+    return false;
+  }
+}
+
+// ============================================
 // PERMISSIONS & CHANNELS
 // ============================================
 
@@ -219,12 +311,12 @@ async function requestNativeToken(): Promise<{ token: string; platform: 'fcm' | 
 
   if (Platform.OS === 'android') {
     await Notifications.setNotificationChannelAsync('ghostr-messages', {
-      name: 'Messages', importance: Notifications.AndroidImportance.HIGH,
+      name: i18n.t('pushNotifications.channelMessages'), importance: Notifications.AndroidImportance.HIGH,
       vibrationPattern: [0, 250, 250, 250], lightColor: '#6C63FF',
       lockscreenVisibility: Notifications.AndroidNotificationVisibility.SECRET,
     });
     await Notifications.setNotificationChannelAsync('ghostr-missed-calls', {
-      name: 'Appels manqués', importance: Notifications.AndroidImportance.HIGH,
+      name: i18n.t('pushNotifications.channelMissedCalls'), importance: Notifications.AndroidImportance.HIGH,
       vibrationPattern: [0, 300], lightColor: '#FF6B6B',
       lockscreenVisibility: Notifications.AndroidNotificationVisibility.SECRET,
     });
@@ -237,7 +329,7 @@ async function requestNativeToken(): Promise<{ token: string; platform: 'fcm' | 
     try { await Notifications.deleteNotificationChannelAsync('ghostr-incoming-calls'); } catch {}
 
     await Notifications.setNotificationChannelAsync('ghostr-incoming-calls-v2', {
-      name: 'Appels entrants', importance: Notifications.AndroidImportance.MAX,
+      name: i18n.t('pushNotifications.channelIncomingCalls'), importance: Notifications.AndroidImportance.MAX,
       // ~10s de vibration distincte des messages
       vibrationPattern: [
         0,   800, 200, 800,
@@ -355,8 +447,8 @@ async function _scheduleCallNotification(): Promise<void> {
     identifier: 'ghostr_incoming_call',
     content: {
       title: 'Ghostr',
-      body: `Quelqu'un essaie de vous joindre`,
-      subtitle: Platform.OS === 'ios' ? 'Appel chiffré' : undefined,
+      body: i18n.t('pushNotifications.someoneCalling'),
+      subtitle: Platform.OS === 'ios' ? i18n.t('pushNotifications.encryptedCallSubtitle') : undefined,
       categoryIdentifier: 'incoming_call',
       sound: Platform.OS === 'ios' ? 'ghostr_ringtone.mp3' : 'incallmanager_ringback',
       data: { t: 'call_ring', isCall: true },
@@ -403,8 +495,8 @@ export async function showMissedCallNotification(callerName: string): Promise<vo
   await Notifications.scheduleNotificationAsync({
     content: {
       title: 'Ghostr',
-      body: 'Appel manqué',
-      subtitle: Platform.OS === 'ios' ? 'Ouvrez pour voir les détails' : undefined,
+      body: i18n.t('pushNotifications.missedCallTitle'),
+      subtitle: Platform.OS === 'ios' ? i18n.t('pushNotifications.missedCallSubtitle') : undefined,
       data: { t: 'missed' },
       ...(Platform.OS === 'android' && { channelId: 'ghostr-missed-calls' }),
     },
@@ -419,9 +511,19 @@ export async function dismissCallNotification(): Promise<void> {
     for (const n of all) {
       const d = n.request.content.data;
       const b = n.request.content.body || '';
+      // Primary check: data type tags (language-independent).
+      // Secondary check: body content — kept multilingual to handle notifications
+      // that were posted under another language (e.g. user changed language since).
+      const callBodies = [
+        i18n.t('call.voiceCall'),
+        i18n.t('pushNotifications.missedCallTitle'),
+        i18n.t('pushNotifications.someoneCalling'),
+        // English fallbacks (cover legacy notifications posted before i18n existed)
+        'Voice call', 'Missed call', 'Incoming call',
+        'Appel vocal', 'Appel entrant', 'essaie de vous joindre',
+      ];
       if (d?.t === 'c' || d?.t === 'call_ring' || d?.t === 'h' || d?.isCall
-        || b.includes('Appel vocal') || b.includes('Appel entrant')
-        || b.includes('essaie de vous joindre'))
+        || callBodies.some(s => b.includes(s)))
         await Notifications.dismissNotificationAsync(n.request.identifier);
     }
   } catch {}
@@ -434,9 +536,24 @@ export async function dismissCallNotification(): Promise<void> {
 const IOS_DISMISS_ACTION_ID = 'com.apple.UNNotificationDismissActionIdentifier';
 
 async function setupCallNotificationCategory(): Promise<void> {
+  // Les boutons de la catégorie iOS sont LUS UNE FOIS au moment de l'enregistrement
+  // (iOS les met en cache jusqu'au prochain lancement de l'app). On s'assure donc
+  // que i18next est prêt avant de lire les libellés ; sinon on récupèrerait la
+  // clé brute (ex: "pushNotifications.answerAction") au lieu de la traduction.
+  // initI18n() est idempotent — réutilise sa promesse en cache.
+  await initI18n();
+
   await Notifications.setNotificationCategoryAsync('incoming_call', [
-    { identifier: 'answer_call', buttonTitle: 'Ouvrir', options: { opensAppToForeground: true } },
-    { identifier: 'decline_call', buttonTitle: 'Ignorer', options: { opensAppToForeground: false, isDestructive: true } },
+    {
+      identifier: 'answer_call',
+      buttonTitle: i18n.t('pushNotifications.answerAction', { defaultValue: 'Answer' }),
+      options: { opensAppToForeground: true },
+    },
+    {
+      identifier: 'decline_call',
+      buttonTitle: i18n.t('pushNotifications.declineAction', { defaultValue: 'Decline' }),
+      options: { opensAppToForeground: false, isDestructive: true },
+    },
   ], { customDismissAction: true });
 }
 
@@ -456,9 +573,47 @@ export async function initPushNotifications(onWakeUp: () => Promise<void>): Prom
   _platform = tokenResult.platform;
   _pushEnabled = true;
 
+  // Track the freshly fetched token across cold starts. If the OS rotated the
+  // token while the app was killed (i.e., the listener below could not fire),
+  // we'll see a mismatch here — log it for diagnostics. The caller of
+  // initPushNotifications always invokes sendPushTokenToAllPeers() on success,
+  // so the rotation is propagated automatically; we just persist the new value.
+  try {
+    const lastKnownToken = await AsyncStorage.getItem(LAST_KNOWN_TOKEN_KEY);
+    if (lastKnownToken && lastKnownToken !== tokenResult.token) {
+      __DEV__ && console.log('[PushService] 🔄 Own token rotated since last cold start (peers will be notified by caller)');
+    }
+    await AsyncStorage.setItem(LAST_KNOWN_TOKEN_KEY, tokenResult.token);
+  } catch {}
+
   await setupCallNotificationCategory();
 
-  _tokenChangeSubscription = Notifications.addPushTokenListener((t) => { _nativeToken = t.data as string; });
+  // ── Native push token rotation listener ──────────────────────────────────
+  // FCM/APNs may roll the device push token at any time during runtime
+  // (background sync, OS-level re-registration, periodic security rotation).
+  // When this happens, peers' cached copy of OUR token becomes invalid:
+  //  - their proxy pings target a token that FCM/APNs may still accept (200)
+  //    but route to a defunct registration → silent delivery failure.
+  // We MUST therefore propagate the new token to all peers immediately.
+  // The 'await' ensures sequential cleanup of the persistent record before
+  // attempting the (network-dependent) propagation. Errors are swallowed
+  // because a failed propagation here will be retried on the next foreground
+  // refresh / cold start anyway, and we don't want to crash the listener.
+  _tokenChangeSubscription = Notifications.addPushTokenListener(async (t) => {
+    const newToken = t.data as string;
+    if (!newToken || newToken === _nativeToken) return;
+    __DEV__ && console.log('[PushService] 🔄 Native token rotated (listener fired) → propagating to peers');
+    _nativeToken = newToken;
+    try { await AsyncStorage.setItem(LAST_KNOWN_TOKEN_KEY, newToken); } catch {}
+    try {
+      // Lazy require to avoid a circular import: api1to1 already imports from
+      // this file (e.g., getOwnPushTokenInfo, encryptPushBlob).
+      const { sendPushTokenToAllPeers } = require('./api1to1');
+      await sendPushTokenToAllPeers();
+    } catch (err) {
+      __DEV__ && console.warn('[PushService] Token rotation propagation failed:', err);
+    }
+  });
 
   _notificationSubscription = Notifications.addNotificationReceivedListener((n) => {
     const d = n.request.content.data;

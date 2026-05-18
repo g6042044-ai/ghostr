@@ -114,17 +114,6 @@ function getRandomInt(min: number, max: number): number {
 }
 
 /**
- * Génère un fingerprint réaliste (16 caractères hex)
- * Identique au format utilisé par sessionService
- */
-function generateRealisticFingerprint(): string {
-  const bytes = getRandomBytes(8);
-  return Array.from(bytes)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-/**
  * Génère un tag réaliste (32 caractères hex)
  * Identique au format utilisé pour les vrais tags de session
  */
@@ -133,13 +122,6 @@ function generateRealisticTag(): string {
   return Array.from(bytes)
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
-}
-
-/**
- * Génère un device ID anonyme réaliste
- */
-function generateRealisticDeviceId(): string {
-  return encodeBase64(getRandomBytes(16));
 }
 
 // ============================================
@@ -301,30 +283,6 @@ async function sendDecoyMessage(forceTier?: 'small' | 'medium'): Promise<boolean
     __DEV__ && console.error('[Decoy] ❌ Exception:', e);
     return false;
   }
-}
-
-/**
- * Planifie le prochain decoy avec un délai aléatoire
- */
-function scheduleNextDecoy(): void {
-  if (!state.isRunning) {
-    __DEV__ && console.log('[Decoy] Service not running, skip scheduling');
-    return;
-  }
-
-  if (state.timeoutId) {
-    clearTimeout(state.timeoutId);
-  }
-
-  const interval = getRandomInt(CONFIG.minIntervalMs, CONFIG.maxIntervalMs);
-  __DEV__ && console.log(`[Decoy] ⏰ Next decoy in ${Math.round(interval / 1000)}s`);
-
-  state.timeoutId = setTimeout(async () => {
-    if (state.isRunning) {
-      await sendDecoyMessage();
-      scheduleNextDecoy();
-    }
-  }, interval);
 }
 
 // ============================================

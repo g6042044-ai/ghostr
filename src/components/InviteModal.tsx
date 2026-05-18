@@ -2,21 +2,14 @@
 // Modal pour inviter quelqu'un à rejoindre une conversation
 // Design moderne et épuré
 
-import React, { useState, useEffect } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  Share,
-  Modal,
-  ScrollView,
-  Platform,
-} from 'react-native';
+import { useState, useEffect } from 'react';
+import { View, Text, TouchableOpacity, Share, Modal, ScrollView, Platform } from 'react-native';
 import QRCode from 'react-native-qrcode-svg';
 import * as Clipboard from 'expo-clipboard';
+import { useTranslation } from 'react-i18next';
 import { masterKeyToCode } from '../services/crypto';
-import { theme, Button } from './ui';
+import { withExternalActivity } from '../services/lockGuard';
+import { theme, Button, useThemedStyles, type ColorPalette } from './ui';
 
 interface InviteModalProps {
   visible: boolean;
@@ -31,6 +24,8 @@ export function InviteModal({
   masterKey,
   conversationName,
 }: InviteModalProps) {
+  const { t } = useTranslation();
+  const styles = useThemedStyles(makeStyles);
   const [code, setCode] = useState<string>('');
   const [copied, setCopied] = useState(false);
   const [shared, setShared] = useState(false);
@@ -50,10 +45,18 @@ export function InviteModal({
 
   const handleShare = async () => {
     try {
-      await Share.share({
-        message: `🔐 Rejoins la conversation "${conversationName}" sur Ghostr!\n\n📱 Code d'invitation:\n${code}\n\n👉 Ouvre Ghostr > Rejoindre > Entre ce code`,
-        title: 'Invitation Ghostr',
-      });
+      // withExternalActivity supprime le verrouillage automatique pendant
+      // l'ouverture de la sheet de partage système (Android ouvre une vraie
+      // Activity externe → AppState devient 'background' → verrouillage
+      // déclenché sans cette garde). La grâce de 5s couvre le délai Android
+      // entre la résolution de la Promise (au choix de la cible) et le
+      // retour effectif de l'utilisateur dans Ghostr.
+      await withExternalActivity(() =>
+        Share.share({
+          message: t('inviteModal.shareMessage', { name: conversationName, code }),
+          title: t('inviteModal.shareTitle'),
+        })
+      );
       setShared(true);
       setTimeout(() => setShared(false), 2000);
     } catch (error) {
@@ -80,9 +83,9 @@ export function InviteModal({
         {/* Header */}
         <View style={styles.header}>
           <TouchableOpacity onPress={onClose} style={styles.closeButton}>
-            <Text style={styles.closeText}>Fermer</Text>
+            <Text style={styles.closeText}>{t('inviteModal.closeBtn')}</Text>
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Inviter</Text>
+          <Text style={styles.headerTitle}>{t('inviteModal.inviteHeader')}</Text>
           <View style={styles.closeButton} />
         </View>
 
@@ -94,7 +97,7 @@ export function InviteModal({
           {/* Titre et nom de conversation */}
           <View style={styles.titleSection}>
             <Text style={styles.emoji}>👥</Text>
-            <Text style={styles.title}>Inviter quelqu'un</Text>
+            <Text style={styles.title}>{t('inviteModal.inviteSomeone')}</Text>
             <View style={styles.conversationBadge}>
               <Text style={styles.conversationName}>{conversationName}</Text>
             </View>
@@ -114,7 +117,7 @@ export function InviteModal({
                   />
                 ) : (
                   <View style={styles.qrPlaceholder}>
-                    <Text style={styles.qrPlaceholderText}>Génération...</Text>
+                    <Text style={styles.qrPlaceholderText}>{t('inviteModal.generating')}</Text>
                   </View>
                 )}
               </View>
@@ -127,14 +130,14 @@ export function InviteModal({
             </View>
             
             <Text style={styles.qrHint}>
-              Scannez ce QR code pour rejoindre
+              {t('inviteModal.qrHint')}
             </Text>
           </View>
 
           {/* Divider */}
           <View style={styles.divider}>
             <View style={styles.dividerLine} />
-            <Text style={styles.dividerText}>ou partagez le code</Text>
+            <Text style={styles.dividerText}>{t('inviteModal.orShareCode')}</Text>
             <View style={styles.dividerLine} />
           </View>
 
@@ -162,7 +165,7 @@ export function InviteModal({
                   styles.copyText,
                   copied && styles.copyTextActive
                 ]}>
-                  {copied ? 'Copié !' : 'Appuyez pour copier'}
+                  {copied ? t('inviteModal.copied') : t('inviteModal.tapToCopy')}
                 </Text>
               </View>
             </TouchableOpacity>
@@ -172,15 +175,14 @@ export function InviteModal({
           <View style={styles.infoCard}>
             <Text style={styles.infoIcon}>ℹ️</Text>
             <Text style={styles.infoText}>
-              Partagez ce code uniquement avec les personnes que vous souhaitez inviter. 
-              Toute personne possédant ce code peut rejoindre la conversation.
+              {t('inviteModal.infoText')}
             </Text>
           </View>
 
           {/* Actions */}
           <View style={styles.actions}>
             <Button
-              title={shared ? '✓ Partagé !' : 'Partager l\'invitation'}
+              title={shared ? t('inviteModal.shared') : t('inviteModal.shareInvite')}
               onPress={handleShare}
               variant="primary"
               size="large"
@@ -194,10 +196,10 @@ export function InviteModal({
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   container: {
     flex: 1,
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
   },
   header: {
     flexDirection: 'row',
@@ -206,20 +208,20 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 16,
     borderBottomWidth: 1,
-    borderBottomColor: theme.colors.divider,
+    borderBottomColor: colors.divider,
   },
   closeButton: {
     width: 70,
   },
   closeText: {
     fontSize: 16,
-    color: theme.colors.primary,
+    color: colors.primary,
     fontWeight: '500',
   },
   headerTitle: {
     fontSize: 17,
     fontWeight: '600',
-    color: theme.colors.text,
+    color: colors.text,
   },
   scrollView: {
     flex: 1,
@@ -241,18 +243,18 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 24,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
     marginBottom: 12,
   },
   conversationBadge: {
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     paddingVertical: 8,
     paddingHorizontal: 16,
     borderRadius: 12,
   },
   conversationName: {
     fontSize: 15,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
     fontWeight: '500',
   },
   
@@ -277,17 +279,17 @@ const styles = StyleSheet.create({
     height: 180,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 8,
   },
   qrPlaceholderText: {
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
   },
   qrCorner: {
     position: 'absolute',
     width: 24,
     height: 24,
-    borderColor: theme.colors.primary,
+    borderColor: colors.primary,
   },
   qrCornerTL: {
     top: 8,
@@ -319,7 +321,7 @@ const styles = StyleSheet.create({
   },
   qrHint: {
     fontSize: 14,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     textAlign: 'center',
   },
   
@@ -333,11 +335,11 @@ const styles = StyleSheet.create({
   dividerLine: {
     flex: 1,
     height: 1,
-    backgroundColor: theme.colors.divider,
+    backgroundColor: colors.divider,
   },
   dividerText: {
     fontSize: 13,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     paddingHorizontal: 16,
   },
   
@@ -347,10 +349,10 @@ const styles = StyleSheet.create({
     marginBottom: 24,
   },
   codeBox: {
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 16,
     borderWidth: 1.5,
-    borderColor: theme.colors.border,
+    borderColor: colors.border,
     overflow: 'hidden',
   },
   codeContent: {
@@ -360,7 +362,7 @@ const styles = StyleSheet.create({
   codeText: {
     fontSize: 15,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-    color: theme.colors.text,
+    color: colors.text,
     letterSpacing: 1,
     lineHeight: 24,
   },
@@ -368,14 +370,14 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: theme.colors.surfaceLight,
+    backgroundColor: colors.surfaceLight,
     paddingVertical: 14,
     gap: 8,
     borderTopWidth: 1,
-    borderTopColor: theme.colors.divider,
+    borderTopColor: colors.divider,
   },
   copyIndicatorActive: {
-    backgroundColor: theme.colors.success + '20',
+    backgroundColor: colors.success + '20',
   },
   copyIcon: {
     fontSize: 16,
@@ -383,16 +385,16 @@ const styles = StyleSheet.create({
   copyText: {
     fontSize: 14,
     fontWeight: '500',
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
   },
   copyTextActive: {
-    color: theme.colors.success,
+    color: colors.success,
   },
   
   // Info Card
   infoCard: {
     flexDirection: 'row',
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 14,
     padding: 14,
     marginBottom: 24,
@@ -404,7 +406,7 @@ const styles = StyleSheet.create({
   infoText: {
     flex: 1,
     fontSize: 13,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
     lineHeight: 19,
   },
   
@@ -412,6 +414,6 @@ const styles = StyleSheet.create({
   actions: {
     width: '100%',
   },
-});
+}) as const;
 
 export default InviteModal;

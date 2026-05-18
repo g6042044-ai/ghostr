@@ -14,43 +14,19 @@
 //   - Les notifications OS restent 100% génériques ("Appel chiffré")
 //   - Aucune fuite de métadonnées via la bannière (rendue côté client uniquement)
 
-import React, {
-  createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode,
-} from 'react';
-import {
-  View, Text, TouchableOpacity, StyleSheet, Animated, Vibration,
-  Modal, Platform, Image, Easing,
-} from 'react-native';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from 'react';
+import { View, Text, TouchableOpacity, StyleSheet, Animated, Modal, Easing } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
-import { theme } from '../components/ui/theme';
+import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 import { Avatar } from '../components/Avatar';
-import {
-  Call1to1Info,
-  CallSignalData,
-  startCall1to1,
-  acceptCall1to1,
-  declineCall1to1,
-  hangupCall1to1,
-  toggleMute1to1,
-  toggleSpeaker1to1,
-  addCall1to1StateListener,
-  addIncomingCall1to1Listener,
-  setCall1to1SignalCallback,
-  handleCall1to1Signal,
-  getCall1to1State,
-} from '../services/call1to1Service';
+import { useTranslation } from 'react-i18next';
+import { Call1to1Info, CallSignalData, startCall1to1, acceptCall1to1, declineCall1to1, hangupCall1to1, toggleMute1to1, toggleSpeaker1to1, addCall1to1StateListener, addIncomingCall1to1Listener, setCall1to1SignalCallback, handleCall1to1Signal, getCall1to1State } from '../services/call1to1Service';
 import { sendCallSignal1to1, onCallSignal, consumePendingCallSignals, pollAllSessions } from '../services/api1to1';
 import { stopRinging, setNativeCallCallbacks } from '../services/pushNotificationService';
 
 // ── Helpers ──
-
-function getInitials(name: string): string {
-  if (!name.trim()) return '?';
-  const p = name.trim().split(/\s+/);
-  return p.length >= 2 ? (p[0][0] + p[1][0]).toUpperCase() : name.trim().substring(0, 2).toUpperCase();
-}
 
 function avatarColor(name: string): string {
   const c = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#A78BFA','#F7DC6F','#DDA0DD','#FF8C42','#6BCB77','#4D96FF'];
@@ -85,6 +61,43 @@ export const Call1to1Provider: React.FC<{ children: ReactNode }> = ({ children }
   } | null>(null);
 
   useEffect(() => {
+    // ════════════════════════════════════════════════════════════════════
+    // FIX P3: Enregistrer les callbacks de signal AVANT les listeners React.
+    //
+    // Réduit la fenêtre où un signal arrivant pendant le mount pourrait être
+    // encore buffé par api1to1 au lieu d'être routé directement vers
+    // handleCall1to1Signal. La fenêtre n'est que de quelques ms, mais sur
+    // un device chargé elle peut s'étendre, et c'est gratuit de la fermer.
+    //
+    // Ordre:
+    //   1. signalCallback (pour envoyer)
+    //   2. onCallSignal (pour recevoir → globalCallSignalCallback non-null)
+    //   3. addCall1to1StateListener (mise à jour UI)
+    //   4. addIncomingCall1to1Listener (mise à jour UI)
+    //   5. consumePendingCallSignals (traiter le retard)
+    //   6. pollAllSessions (vérifier qu'on n'a rien manqué)
+    // ════════════════════════════════════════════════════════════════════
+
+    // 1. Callback d'envoi de signaux (utilisé par call1to1Service)
+    setCall1to1SignalCallback(async (sid: string, sig: CallSignalData) => {
+      await sendCallSignal1to1(sid, sig.type, sig.callId, sig.roomTag, sig.authToken,
+        sig.senderKey ? JSON.stringify(sig.senderKey) : undefined,
+        sig.cryptoSignal ? JSON.stringify(sig.cryptoSignal) : undefined,
+        sig.callStartedAt);
+    });
+
+    // 2. Callback de réception — CRUCIAL d'enregistrer en premier pour
+    //    fermer la fenêtre de buffering inutile.
+    const unsub3 = onCallSignal((sid, sig, name, avatar) => {
+      handleCall1to1Signal(sid, {
+        type: sig.type, callId: sig.callId, roomTag: sig.roomTag, authToken: sig.authToken,
+        senderKey: sig.senderKeyDistribution ? JSON.parse(sig.senderKeyDistribution) : undefined,
+        cryptoSignal: sig.cryptoSignal ? JSON.parse(sig.cryptoSignal) : undefined,
+        callStartedAt: sig.callStartedAt, timestamp: sig.timestamp,
+      }, name, avatar);
+    });
+
+    // 3-4. Listeners pour synchroniser l'UI avec l'état du manager
     const unsub1 = addCall1to1StateListener((info) => {
       if (info?.state === 'ended' || !info) {
         // ── CLEANUP: stopper sonnerie + notification native ──
@@ -106,23 +119,14 @@ export const Call1to1Provider: React.FC<{ children: ReactNode }> = ({ children }
       setIncomingCallInfo({ sessionId: sid, callId: cid, callerName: name, callerAvatarBase64: avatar });
     });
 
-    setCall1to1SignalCallback(async (sid: string, sig: CallSignalData) => {
-      await sendCallSignal1to1(sid, sig.type, sig.callId, sig.roomTag, sig.authToken,
-        sig.senderKey ? JSON.stringify(sig.senderKey) : undefined,
-        sig.cryptoSignal ? JSON.stringify(sig.cryptoSignal) : undefined,
-        sig.callStartedAt);
-    });
-
-    const unsub3 = onCallSignal((sid, sig, name, avatar) => {
-      handleCall1to1Signal(sid, {
-        type: sig.type, callId: sig.callId, roomTag: sig.roomTag, authToken: sig.authToken,
-        senderKey: sig.senderKeyDistribution ? JSON.parse(sig.senderKeyDistribution) : undefined,
-        cryptoSignal: sig.cryptoSignal ? JSON.parse(sig.cryptoSignal) : undefined,
-        callStartedAt: sig.callStartedAt, timestamp: sig.timestamp,
-      }, name, avatar);
-    });
-
-    // Check for pending incoming call (app opened from native notification)
+    // ════════════════════════════════════════════════════════════════════
+    // 5. Restaurer un éventuel état d'appel entrant pré-existant.
+    //
+    // Cas: l'utilisateur a tapé "Ouvrir" sur une notification native, ce qui
+    // a déclenché setNativeCallCallbacks().onAnswer → pollAllSessions() qui
+    // a traité l'offer ET notifié le manager AVANT que React ne monte ce hook.
+    // Dans ce cas, getCall1to1State() retourne un état 'incoming' à restaurer.
+    // ════════════════════════════════════════════════════════════════════
     const pendingState = getCall1to1State();
     if (pendingState?.state === 'incoming') {
       setCallInfo(pendingState);
@@ -132,15 +136,16 @@ export const Call1to1Provider: React.FC<{ children: ReactNode }> = ({ children }
         callerName: pendingState.remoteDisplayName,
         callerAvatarBase64: pendingState.remoteAvatarBase64,
       });
-      // Poll immédiat: vérifier que l'appel est toujours actif.
-      // Si l'appelant a raccroché entre-temps (cancel push raté ou
-      // traité pendant que l'app était killed), le poll récupère le
-      // signal hangup → endCall('remote_hangup') → state='ended'
-      // → le listener ci-dessus fera setIncomingCallInfo(null).
-      pollAllSessions().catch(() => {});
     }
 
-    // Consume buffered call signals
+    // ════════════════════════════════════════════════════════════════════
+    // 6. Consommer les signaux buffés pendant que React n'était pas monté.
+    //
+    // FIX P1 (côté api1to1): consumePendingCallSignals() filtre maintenant
+    // automatiquement les signaux dont le callId a déjà reçu un hangup en
+    // background. Plus besoin de logique défensive ici — la garantie est en
+    // amont, et si un offer passe ici, c'est qu'aucun hangup n'a été reçu.
+    // ════════════════════════════════════════════════════════════════════
     const pendingSignals = consumePendingCallSignals();
     for (const p of pendingSignals) {
       try {
@@ -158,6 +163,23 @@ export const Call1to1Provider: React.FC<{ children: ReactNode }> = ({ children }
         __DEV__ && console.error('[useCall1to1] Error processing pending call signal:', e);
       }
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // FIX P2: TOUJOURS poller au mount, indépendamment de l'état.
+    //
+    // Couvre tous les scénarios où des signaux pourraient être restés sur
+    // le serveur sans être capturés:
+    //   - Cold start après notification (background task a polled, mais
+    //     d'autres signaux ont pu arriver entre-temps)
+    //   - Warm reopen depuis background (le polling était paused)
+    //   - Cas extrême: hangup arrivé sur le serveur mais jamais delivré
+    //     en push (FCM throttling, mode silencieux, etc.)
+    //
+    // Idempotent et non-bloquant — coût minime, défense en profondeur
+    // maximale contre toute future race condition.
+    // ════════════════════════════════════════════════════════════════════
+    __DEV__ && console.log('[useCall1to1] 🔄 Mount poll triggered (defensive)');
+    pollAllSessions().catch(() => {});
 
     // Native call callbacks (Android notification, iOS CallKit)
     //
@@ -256,6 +278,9 @@ const IncomingCallOverlay: React.FC<{
   callerName: string; callerAvatarBase64?: string; onAccept: () => void; onDecline: () => void;
 }> = ({ callerName, callerAvatarBase64, onAccept, onDecline }) => {
   const insets = useSafeAreaInsets();
+  const { t } = useTranslation();
+  const { colors, isDark } = useTheme();
+  const s = useThemedStyles(makeStyles);
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const avatarScale = useRef(new Animated.Value(0.6)).current;
   const nameSlide = useRef(new Animated.Value(30)).current;
@@ -304,18 +329,35 @@ const IncomingCallOverlay: React.FC<{
   });
 
   return (
-    <Modal visible transparent animationType="none" statusBarTranslucent>
+    // ════════════════════════════════════════════════════════════════════════
+    // SÉCURITÉ APPEL ENTRANT — RETOUR BLOQUÉ
+    // ════════════════════════════════════════════════════════════════════════
+    // onRequestClose obligatoire sur Android : sans ce handler, RN émet un
+    // warning ET le bouton retour matériel ferme la Modal côté natif sans
+    // passer par notre code → l'utilisateur fait disparaître la sonnerie sans
+    // avoir explicitement accepté/refusé. On retourne un no-op : pour fermer
+    // l'overlay, l'utilisateur DOIT taper "Accepter" ou "Refuser".
+    // ════════════════════════════════════════════════════════════════════════
+    <Modal
+      visible
+      transparent
+      animationType="none"
+      statusBarTranslucent
+      onRequestClose={() => { /* no-op : retour bloqué pendant un appel entrant */ }}
+    >
       <Animated.View style={[{ flex: 1, opacity: fadeAnim }]}>
         <LinearGradient
-          colors={['#080C10', '#0D1218', '#080C10']}
+          colors={isDark
+            ? ['#080C10', '#0D1218', '#080C10']
+            : [colors.background, colors.surface, colors.background]}
           style={[StyleSheet.absoluteFillObject]}
         />
         <View style={[s.incomingWrap, { paddingTop: insets.top + 24, paddingBottom: insets.bottom + 24 }]}>
           {/* Top */}
           <View style={s.incomingTop}>
             <View style={s.encBadge}>
-              <Ionicons name="shield-checkmark" size={13} color={theme.colors.success} />
-              <Text style={s.encText}>Appel chiffré de bout en bout</Text>
+              <Ionicons name="shield-checkmark" size={13} color={colors.success} />
+              <Text style={s.encText}>{t('call.encryptedFull')}</Text>
             </View>
           </View>
 
@@ -338,7 +380,7 @@ const IncomingCallOverlay: React.FC<{
 
             <Animated.View style={{ alignItems: 'center', opacity: fadeAnim, transform: [{ translateY: nameSlide }] }}>
               <Text style={s.inName}>{callerName}</Text>
-              <Text style={s.inSubtitle}>Appel vocal entrant…</Text>
+              <Text style={s.inSubtitle}>{t('call.incomingVoiceSubtitle')}</Text>
             </Animated.View>
           </View>
 
@@ -373,6 +415,9 @@ const ActiveCallOverlay: React.FC<{
   onToggleSpeaker: () => boolean;
 }> = ({ callInfo, onHangup, onToggleMute, onToggleSpeaker }) => {
   const insets = useSafeAreaInsets();
+  const { t } = useTranslation();
+  const { colors, isDark } = useTheme();
+  const s = useThemedStyles(makeStyles);
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const accent = avatarColor(callInfo.remoteDisplayName);
   const isConnected = callInfo.state === 'connected';
@@ -413,16 +458,39 @@ const ActiveCallOverlay: React.FC<{
   };
 
   return (
-    <Modal visible transparent animationType="none" statusBarTranslucent>
+    // ════════════════════════════════════════════════════════════════════════
+    // SÉCURITÉ APPEL ACTIF — RETOUR BLOQUÉ
+    // ════════════════════════════════════════════════════════════════════════
+    // Sans onRequestClose, le retour matériel Android ferme la Modal au niveau
+    // natif tandis que le service d'appel (WebRTC + crypto) reste actif :
+    // l'utilisateur croirait avoir raccroché alors que son micro est toujours
+    // ouvert et l'appel chiffré E2E continue. Risque de fuite d'audio.
+    //
+    // On retourne un no-op : la SEULE façon de quitter un appel est de taper
+    // explicitement le bouton "Raccrocher". Comportement conforme aux apps
+    // d'appel sécurisé (Signal, WhatsApp, FaceTime).
+    // ════════════════════════════════════════════════════════════════════════
+    <Modal
+      visible
+      transparent
+      animationType="none"
+      statusBarTranslucent
+      onRequestClose={() => { /* no-op : retour bloqué pendant un appel actif */ }}
+    >
       <Animated.View style={[{ flex: 1, opacity: fadeAnim }]}>
-        <LinearGradient colors={['#080C10', '#0E1319', '#080C10']} style={StyleSheet.absoluteFillObject} />
+        <LinearGradient
+          colors={isDark
+            ? ['#080C10', '#0E1319', '#080C10']
+            : [colors.background, colors.surface, colors.background]}
+          style={StyleSheet.absoluteFillObject}
+        />
 
         <View style={[s.activeWrap, { paddingTop: insets.top + 20, paddingBottom: insets.bottom + 20 }]}>
           {/* Top bar */}
           <View style={s.activeTop}>
             <View style={s.encBadge}>
-              <Ionicons name="shield-checkmark" size={13} color={theme.colors.success} />
-              <Text style={s.encText}>Chiffré de bout en bout</Text>
+              <Ionicons name="shield-checkmark" size={13} color={colors.success} />
+              <Text style={s.encText}>{t('call.encryptedShort')}</Text>
             </View>
           </View>
 
@@ -448,7 +516,7 @@ const ActiveCallOverlay: React.FC<{
             ) : (
               <View style={s.connectingRow}>
                 <Text style={s.connectingText}>
-                  {callInfo.state === 'outgoing' ? 'Appel en cours' : 'Connexion'}
+                  {callInfo.state === 'outgoing' ? t('call.outgoing') : t('call.connecting')}
                 </Text>
                 <View style={s.dotsRow}>
                   <Animated.View style={[s.dot, { opacity: dot1 }]} />
@@ -488,6 +556,8 @@ const ActiveCallOverlay: React.FC<{
 const ControlButton: React.FC<{
   icon: string; active: boolean; onPress: () => any;
 }> = ({ icon, active, onPress }) => {
+  const { colors } = useTheme();
+  const s = useThemedStyles(makeStyles);
   const scaleAnim = useRef(new Animated.Value(1)).current;
 
   const handlePress = () => {
@@ -508,7 +578,11 @@ const ControlButton: React.FC<{
         <Ionicons
           name={icon as any}
           size={26}
-          color={active ? '#0A0F14' : '#F0F4F8'}
+          // Active state: icon picks the inverse of `colors.text` (the
+          // active button's background colour) to maintain AA contrast on
+          // both themes. Inactive state: icon is `colors.text` over the
+          // alpha-faded text-coloured tile.
+          color={active ? colors.background : colors.text}
         />
       </Animated.View>
     </TouchableOpacity>
@@ -523,14 +597,14 @@ const AVATAR_SIZE = 110;
 const CTRL_SIZE = 64;
 const HANGUP_SIZE = 68;
 
-const s = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   // ── Shared ──
   encBadge: {
     flexDirection: 'row', alignItems: 'center', gap: 6,
     backgroundColor: 'rgba(0, 217, 166, 0.08)',
     paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20,
   },
-  encText: { fontSize: 12, fontWeight: '600', color: theme.colors.success },
+  encText: { fontSize: 12, fontWeight: '600', color: colors.success },
 
   // ── Incoming Expanded ──
   incomingWrap: {
@@ -542,8 +616,8 @@ const s = StyleSheet.create({
     width: AVATAR_SIZE * 2.4, height: AVATAR_SIZE * 2.4,
     alignItems: 'center', justifyContent: 'center',
   },
-  inName: { fontSize: 30, fontWeight: '700', color: theme.colors.text, letterSpacing: -0.5, textAlign: 'center' },
-  inSubtitle: { fontSize: 16, color: theme.colors.textSecondary, marginTop: 6 },
+  inName: { fontSize: 30, fontWeight: '700', color: colors.text, letterSpacing: -0.5, textAlign: 'center' },
+  inSubtitle: { fontSize: 16, color: colors.textSecondary, marginTop: 6 },
   inActions: {
     flexDirection: 'row', justifyContent: 'center', width: '100%', gap: 64,
   },
@@ -571,17 +645,17 @@ const s = StyleSheet.create({
     shadowColor: '#000', shadowOffset: { width: 0, height: 10 }, shadowOpacity: 0.5, shadowRadius: 20, elevation: 14,
     marginBottom: 24,
   },
-  acName: { fontSize: 28, fontWeight: '700', color: theme.colors.text, letterSpacing: -0.5, marginBottom: 10 },
+  acName: { fontSize: 28, fontWeight: '700', color: colors.text, letterSpacing: -0.5, marginBottom: 10 },
   timerRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  liveDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: theme.colors.success },
+  liveDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.success },
   timerText: {
-    fontSize: 18, fontWeight: '600', color: theme.colors.success,
+    fontSize: 18, fontWeight: '600', color: colors.success,
     fontVariant: ['tabular-nums'],
   },
   connectingRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  connectingText: { fontSize: 16, fontWeight: '500', color: theme.colors.textSecondary },
+  connectingText: { fontSize: 16, fontWeight: '500', color: colors.textSecondary },
   dotsRow: { flexDirection: 'row', gap: 3, marginLeft: 2, marginTop: 2 },
-  dot: { width: 4, height: 4, borderRadius: 2, backgroundColor: theme.colors.textSecondary },
+  dot: { width: 4, height: 4, borderRadius: 2, backgroundColor: colors.textSecondary },
 
   // ── Controls ──
   controls: { alignItems: 'center', width: '100%' },
@@ -591,18 +665,23 @@ const s = StyleSheet.create({
   ctrlCol: { alignItems: 'center' },
   ctrlBtn: {
     width: CTRL_SIZE, height: CTRL_SIZE, borderRadius: CTRL_SIZE / 2,
-    backgroundColor: 'rgba(240, 244, 248, 0.08)',
+    // Semi-transparent background built from `colors.text` so the button
+    // sits readably on either palette's overlay background.
+    backgroundColor: colors.text + '14',  // ~8% alpha
     alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: 'rgba(240, 244, 248, 0.05)',
+    borderWidth: 1, borderColor: colors.text + '0D',  // ~5% alpha
   },
   ctrlBtnActive: {
-    backgroundColor: '#F0F4F8', borderColor: '#F0F4F8',
+    // Active state: solid text-coloured pill. Icon inside picks
+    // background-coloured ink for contrast (see iconColor lookup in
+    // ControlButton render).
+    backgroundColor: colors.text, borderColor: colors.text,
   },
   hangup: {
     width: HANGUP_SIZE, height: HANGUP_SIZE, borderRadius: HANGUP_SIZE / 2,
     backgroundColor: '#E74C3C', alignItems: 'center', justifyContent: 'center',
     shadowColor: '#E74C3C', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.5, shadowRadius: 20, elevation: 10,
   },
-});
+}) as const;
 
 export default Call1to1Provider;

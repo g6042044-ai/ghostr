@@ -5,6 +5,13 @@
 //   - Suppression de createCallEndedMessageFromInfo (utilisait api.ts legacy sendMessage)
 //   - Le système actif utilise call1to1Service → api1to1.sendCallEndedMessage1to1
 //   - Ce fichier ne conserve que les types et helpers d'affichage purs
+//
+// v14.0 - i18n:
+//   - getCallStatusText utilise i18n.t() côté caller au moment de l'affichage.
+//     Les messages stockés gardent uniquement le payload JSON (type:'call', status…),
+//     donc changer de langue traduit instantanément les anciens messages.
+
+import i18n from '../i18n';
 
 // ============================================
 // TYPES
@@ -49,8 +56,12 @@ export function formatCallDuration(seconds: number): string {
 }
 
 /**
- * Retourne le texte à afficher selon le statut
- * 
+ * Retourne le texte à afficher selon le statut.
+ *
+ * IMPORTANT: cette fonction est appelée à chaque render → la traduction
+ * suit la langue actuelle, même pour des messages d'appel persistés
+ * il y a des mois dans une autre langue.
+ *
  * @param status - Le statut de l'appel
  * @param isMine - true si j'ai envoyé ce message (= j'ai initié l'appel)
  * @param callerName - Le nom de l'appelant (displayName du message)
@@ -62,17 +73,17 @@ export function getCallStatusText(
 ): string {
   // Appel terminé normalement - afficher la durée
   if (status === 'ended') {
-    return 'Appel vocal';
+    return i18n.t('call.voiceCall');
   }
   
   // Appel non abouti (missed, declined, cancelled)
   // Si ce n'est pas mon message → quelqu'un m'a appelé → "Appel manqué de XXX"
   if (!isMine && callerName) {
-    return `Appel manqué de ${callerName}`;
+    return i18n.t('call.missedCallFrom', { name: callerName });
   }
   
   // Si c'est mon message → j'ai appelé quelqu'un → "Appel sans réponse"
-  return 'Appel sans réponse';
+  return i18n.t('call.noAnswer');
 }
 
 /**

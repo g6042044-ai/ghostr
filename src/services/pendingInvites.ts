@@ -8,7 +8,7 @@
 // le contact accepte l'invitation des jours/semaines plus tard.
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { encryptIfEnabled, decryptIfNeeded, isEncryptionEnabled } from './localCrypto';
+import { encryptIfEnabled, decryptIfNeeded, hasAnyEncryptionKey } from './localCrypto';
 
 const STORAGE_KEY = 'ghostr_pending_invites';
 const COUNTER_KEY = 'ghostr_pending_invite_counter';
@@ -57,13 +57,43 @@ class PendingInviteStore {
     try {
       const raw = await AsyncStorage.getItem(STORAGE_KEY);
       if (raw) {
-        // Si les données sont chiffrées mais la clé n'est pas encore disponible
-        // (startup avant unlock), on reporte le chargement
-        if (raw.startsWith('enc1:') && !isEncryptionEnabled()) {
+        // Si les données sont chiffrées mais AUCUNE clé (PIN ni hardware) n'est
+        // encore disponible (startup avant unlock OU promote pas encore fait),
+        // on reporte le chargement. FIX migration: voir hasAnyEncryptionKey().
+        if (raw.startsWith('enc1:') && !hasAnyEncryptionKey()) {
           __DEV__ && console.warn('[PendingInvites] Data encrypted, key not yet available — deferring load');
           return; // this.loaded reste false → retry après unlock
         }
-        const json = decryptIfNeeded(raw);
+        let json: string;
+        try {
+          json = decryptIfNeeded(raw);
+        } catch (decErr) {
+          // ──────────────────────────────────────────────────────────────────
+          // RÉSIDU LEGACY — purge silencieuse (cf. fix migration mai 2026)
+          // ──────────────────────────────────────────────────────────────────
+          // Une donnée chiffrée avec une clé qui n'existe plus (typiquement :
+          // ancien import bugué d'avant le fix `promoteHardwareKeyToDeviceKey`,
+          // où `tryRecoverFromPreFixBug` avait généré une nouvelle deviceKey
+          // orphelinant les writes précédentes) ne pourra jamais être déchiffrée.
+          // Plutôt que de logger une erreur à chaque boot, on purge la clé.
+          // Les pending invites sont elles-mêmes éphémères (30 jours par défaut),
+          // donc cette perte est sans conséquence durable — la prochaine
+          // invitation créée régénérera une entrée propre.
+          __DEV__ && console.warn(
+            '[PendingInvites] ⚠️ Could not decrypt invites data — purging legacy/corrupt entry:',
+            (decErr as Error)?.message
+          );
+          try {
+            await AsyncStorage.removeItem(STORAGE_KEY);
+            await AsyncStorage.removeItem(COUNTER_KEY);
+          } catch {
+            // Best-effort: si removeItem échoue, on retentera au prochain boot
+          }
+          this.invites.clear();
+          this.counter = 0;
+          this.loaded = true;
+          return;
+        }
         const items: PendingInvite[] = JSON.parse(json);
         for (const inv of items) {
           this.invites.set(inv.tag, inv);
@@ -71,11 +101,19 @@ class PendingInviteStore {
       }
       const rawCounter = await AsyncStorage.getItem(COUNTER_KEY);
       if (rawCounter) {
-        if (rawCounter.startsWith('enc1:') && !isEncryptionEnabled()) {
+        if (rawCounter.startsWith('enc1:') && !hasAnyEncryptionKey()) {
           return; // Même logique, reporter
         }
-        const counterStr = decryptIfNeeded(rawCounter);
-        this.counter = parseInt(counterStr, 10) || 0;
+        try {
+          const counterStr = decryptIfNeeded(rawCounter);
+          this.counter = parseInt(counterStr, 10) || 0;
+        } catch {
+          // Counter corrompu indépendamment des invites → reset à 0.
+          // Numéroter à partir de 1 n'a aucune conséquence cryptographique :
+          // c'est juste le label "Invite #N" affiché à l'utilisateur.
+          try { await AsyncStorage.removeItem(COUNTER_KEY); } catch {}
+          this.counter = 0;
+        }
       }
       this.loaded = true;
       this.cleanupExpired();

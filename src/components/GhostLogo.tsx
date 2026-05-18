@@ -14,11 +14,14 @@
 // Ring entrances use separate one-shot Animated.timing with native `delay`.
 // Combined via Animated.multiply (also native).
 
-import React, { useEffect, useRef, useMemo } from 'react';
-import { View, StyleSheet, Platform, Animated, Easing } from 'react-native';
-import { theme } from './ui/theme';
+import { useEffect, useRef, useMemo } from 'react';
+import { StyleSheet, Platform, Animated, Easing } from 'react-native';
+import { useTheme } from './ui';
 
-const ACCENT = theme.colors.primary;
+// NOTE: previous versions defined `const ACCENT = theme.colors.primary;` at
+// module top-level which froze the value to the boot palette. The accent is
+// now resolved at render time via `useTheme()` so it follows live theme
+// changes.
 const CLOCK_DURATION = 60000; // 60s — covers any splash duration
 
 // ── Generate sine-wave oscillation points for .interpolate() ──
@@ -60,9 +63,23 @@ function sineWaveDeg(
 
 export interface GhostLogoProps {
   size?: number;
+  /**
+   * Si true, les Animated.Value d'entrée (entranceOpacity, entranceScale,
+   * r1/r2/r3 entrance) sont pré-positionnées à leurs valeurs FINALES (1).
+   * Le logo et les rings apparaissent en plein bloom dès le 1er paint,
+   * sans fade-in d'entrée. La master clock 60s (qui pilote les
+   * oscillations breathing/rotation) tourne normalement — instant n'affecte
+   * QUE les animations d'entrée one-shot.
+   *
+   * Voir SplashScreen pour le cas d'usage (continuité visuelle entre deux
+   * instances de SplashScreen rendues dans des branches React différentes).
+   */
+  instant?: boolean;
 }
 
-export function GhostLogo({ size = 150 }: GhostLogoProps) {
+export function GhostLogo({ size = 150, instant = false }: GhostLogoProps) {
+  const { colors } = useTheme();
+  const ACCENT = colors.primary;
   const R1 = size + 36;
   const R2 = size + 80;
   const R3 = size + 130;
@@ -71,11 +88,12 @@ export function GhostLogo({ size = 150 }: GhostLogoProps) {
   const clock = useRef(new Animated.Value(0)).current;
 
   // ── Entrance values (one-shot, not looped) ──
-  const entranceOpacity = useRef(new Animated.Value(0)).current;
-  const entranceScale = useRef(new Animated.Value(0.85)).current;
-  const r1Entrance = useRef(new Animated.Value(0)).current;
-  const r2Entrance = useRef(new Animated.Value(0)).current;
-  const r3Entrance = useRef(new Animated.Value(0)).current;
+  // En mode instant, on les pré-positionne à leurs valeurs finales.
+  const entranceOpacity = useRef(new Animated.Value(instant ? 1 : 0)).current;
+  const entranceScale = useRef(new Animated.Value(instant ? 1 : 0.85)).current;
+  const r1Entrance = useRef(new Animated.Value(instant ? 1 : 0)).current;
+  const r2Entrance = useRef(new Animated.Value(instant ? 1 : 0)).current;
+  const r3Entrance = useRef(new Animated.Value(instant ? 1 : 0)).current;
 
   // ── Derived oscillations from master clock via interpolate (100% native) ──
   // Cycle counts = CLOCK_DURATION / period
@@ -110,12 +128,18 @@ export function GhostLogo({ size = 150 }: GhostLogoProps) {
     // ═══ ONE master timing — drives ALL oscillations via interpolation ═══
     // This is the ONLY long-running animation. It's a single Animated.timing
     // with useNativeDriver:true. No loops, no sequences, no JS callbacks.
+    // Tourne TOUJOURS, indépendamment d'instant — c'est elle qui anime les
+    // dots pulsants, le breathing, etc. via les .interpolate().
     Animated.timing(clock, {
       toValue: 1,
       duration: CLOCK_DURATION,
       easing: Easing.linear,
       useNativeDriver: true,
     }).start();
+
+    // En mode instant, on saute toutes les entrées one-shot — leurs valeurs
+    // ont déjà été initialisées à leur cible (1) ci-dessus.
+    if (instant) return;
 
     // ═══ ENTRANCE — one-shot timings with native delay, fire-and-forget ═══
     Animated.timing(entranceOpacity, {

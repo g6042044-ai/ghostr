@@ -2,21 +2,11 @@
 // Écran d'accueil - Design professionnel et épuré
 // v2.0 - Sans emojis, typographie élégante
 
-import React, { useState, useRef, useEffect } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  Dimensions,
-  TouchableOpacity,
-  Image,
-  Animated,
-  FlatList,
-  Platform,
-  StatusBar,
-} from 'react-native';
+import { useState, useRef, useEffect } from 'react';
+import { View, Text, Dimensions, TouchableOpacity, Image, Animated, FlatList, Platform, StatusBar } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { theme } from '../components/ui/theme';
+import { useTranslation } from 'react-i18next';
+import { useThemedStyles, type ColorPalette } from '../components/ui';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -28,43 +18,41 @@ interface WelcomeScreenProps {
   onComplete: () => void;
 }
 
-interface SlideData {
+// Le contenu textuel des slides est chargé via i18n au render. On garde
+// uniquement la structure (id, isHero, icônes) statique car celle-ci ne
+// dépend pas de la langue.
+interface SlideStruct {
   id: string;
-  title: string;
-  subtitle: string;
-  features?: { icon: string; text: string }[];
   isHero?: boolean;
+  // Pour les feature slides : clés i18n des features avec leurs icônes.
+  features?: { icon: string; textKey: string }[];
+  titleKey?: string;
+  subtitleKey?: string;
 }
 
-// ============================================
-// DATA
-// ============================================
-
-const slides: SlideData[] = [
+const SLIDE_STRUCTS: SlideStruct[] = [
   {
     id: '1',
-    title: 'Ghostr',
-    subtitle: 'Vos conversations,\nvotre vie privée',
     isHero: true,
   },
   {
     id: '2',
-    title: 'Chiffrement local',
-    subtitle: 'Vos messages sont chiffrés sur votre appareil avant d\'être envoyés.',
+    titleKey: 'welcome.slides.encryption.title',
+    subtitleKey: 'welcome.slides.encryption.subtitle',
     features: [
-      { icon: '📱', text: 'Clés générées sur votre téléphone' },
-      { icon: '🚫', text: 'Serveur aveugle aux contenus' },
-      { icon: '🔑', text: 'Vous seul détenez vos clés' },
+      { icon: '📱', textKey: 'welcome.slides.encryption.feature1' },
+      { icon: '🚫', textKey: 'welcome.slides.encryption.feature2' },
+      { icon: '🔑', textKey: 'welcome.slides.encryption.feature3' },
     ],
   },
   {
     id: '3',
-    title: 'Protection avancée',
-    subtitle: 'Des technologies uniques pour masquer votre activité.',
+    titleKey: 'welcome.slides.advanced.title',
+    subtitleKey: 'welcome.slides.advanced.subtitle',
     features: [
-      { icon: '🔄', text: 'Nouvelle clé générée à chaque message' },
-      { icon: '👻', text: 'Faux trafic pour noyer vos vrais messages' },
-      { icon: '🛡️', text: 'Résistant aux ordinateurs quantiques' },
+      { icon: '🔄', textKey: 'welcome.slides.advanced.feature1' },
+      { icon: '👻', textKey: 'welcome.slides.advanced.feature2' },
+      { icon: '🛡️', textKey: 'welcome.slides.advanced.feature3' },
     ],
   },
 ];
@@ -78,6 +66,8 @@ interface HeroSlideProps {
 }
 
 const HeroSlide = ({ isActive }: HeroSlideProps) => {
+  const { t } = useTranslation();
+  const styles = useThemedStyles(makeStyles);
   const logoFloat = useRef(new Animated.Value(0)).current;
   const logoScale = useRef(new Animated.Value(0.8)).current;
   const logoOpacity = useRef(new Animated.Value(0)).current;
@@ -158,18 +148,18 @@ const HeroSlide = ({ isActive }: HeroSlideProps) => {
             { opacity: titleOpacity, transform: [{ translateY: titleTranslate }] },
           ]}
         >
-          Ghostr
+          {t('welcome.slides.hero.title')}
         </Animated.Text>
         
         {/* Subtitle */}
         <Animated.Text style={[styles.heroSubtitle, { opacity: subtitleOpacity }]}>
-          Vos conversations,{'\n'}votre vie privée
+          {t('welcome.slides.hero.subtitle')}
         </Animated.Text>
         
         {/* Tagline */}
         <Animated.View style={[styles.taglineRow, { opacity: taglineOpacity }]}>
           <View style={styles.taglineLine} />
-          <Text style={styles.taglineText}>MESSAGERIE CHIFFRÉE</Text>
+          <Text style={styles.taglineText}>{t('welcome.tagline')}</Text>
           <View style={styles.taglineLine} />
         </Animated.View>
       </View>
@@ -182,11 +172,13 @@ const HeroSlide = ({ isActive }: HeroSlideProps) => {
 // ============================================
 
 interface FeatureSlideProps {
-  data: SlideData;
+  data: SlideStruct;
   isActive: boolean;
 }
 
 const FeatureSlide = ({ data, isActive }: FeatureSlideProps) => {
+  const { t } = useTranslation();
+  const styles = useThemedStyles(makeStyles);
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(30)).current;
   
@@ -211,10 +203,10 @@ const FeatureSlide = ({ data, isActive }: FeatureSlideProps) => {
         ]}
       >
         {/* Title */}
-        <Text style={styles.featureTitle}>{data.title}</Text>
+        {data.titleKey && <Text style={styles.featureTitle}>{t(data.titleKey as any)}</Text>}
         
         {/* Subtitle */}
-        <Text style={styles.featureSubtitle}>{data.subtitle}</Text>
+        {data.subtitleKey && <Text style={styles.featureSubtitle}>{t(data.subtitleKey as any)}</Text>}
         
         {/* Features list */}
         {data.features && (
@@ -224,7 +216,7 @@ const FeatureSlide = ({ data, isActive }: FeatureSlideProps) => {
                 <View style={styles.featureIconContainer}>
                   <Text style={styles.featureEmoji}>{feature.icon}</Text>
                 </View>
-                <Text style={styles.featureText}>{feature.text}</Text>
+                <Text style={styles.featureText}>{t(feature.textKey as any)}</Text>
               </View>
             ))}
           </View>
@@ -238,13 +230,16 @@ const FeatureSlide = ({ data, isActive }: FeatureSlideProps) => {
 // PAGINATION
 // ============================================
 
-const Pagination = ({ currentIndex, total }: { currentIndex: number; total: number }) => (
-  <View style={styles.pagination}>
-    {Array.from({ length: total }).map((_, i) => (
-      <View key={i} style={[styles.dot, i === currentIndex && styles.dotActive]} />
-    ))}
-  </View>
-);
+const Pagination = ({ currentIndex, total }: { currentIndex: number; total: number }) => {
+  const styles = useThemedStyles(makeStyles);
+  return (
+    <View style={styles.pagination}>
+      {Array.from({ length: total }).map((_, i) => (
+        <View key={i} style={[styles.dot, i === currentIndex && styles.dotActive]} />
+      ))}
+    </View>
+  );
+};
 
 // ============================================
 // MAIN COMPONENT
@@ -252,6 +247,8 @@ const Pagination = ({ currentIndex, total }: { currentIndex: number; total: numb
 
 export function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
   const insets = useSafeAreaInsets();
+  const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
   const flatListRef = useRef<FlatList>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const buttonFade = useRef(new Animated.Value(0)).current;
@@ -271,14 +268,14 @@ export function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
   };
   
   const handleNext = () => {
-    if (currentIndex < slides.length - 1) {
+    if (currentIndex < SLIDE_STRUCTS.length - 1) {
       flatListRef.current?.scrollToIndex({ index: currentIndex + 1, animated: true });
     } else {
       onComplete();
     }
   };
   
-  const isLastSlide = currentIndex === slides.length - 1;
+  const isLastSlide = currentIndex === SLIDE_STRUCTS.length - 1;
   
   return (
     <View style={styles.container}>
@@ -288,7 +285,14 @@ export function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
       {!isLastSlide && (
         <Animated.View style={[styles.skipContainer, { top: insets.top + 16, opacity: buttonFade }]}>
           <TouchableOpacity onPress={onComplete} style={styles.skipButton}>
-            <Text style={styles.skipText}>Passer</Text>
+            <Text
+              style={styles.skipText}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.85}
+            >
+              {t('welcome.skip')}
+            </Text>
           </TouchableOpacity>
         </Animated.View>
       )}
@@ -296,7 +300,7 @@ export function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
       {/* Slides */}
       <FlatList
         ref={flatListRef}
-        data={slides}
+        data={SLIDE_STRUCTS}
         renderItem={({ item, index }) =>
           item.isHero ? (
             <HeroSlide isActive={index === currentIndex} />
@@ -314,13 +318,20 @@ export function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
       
       {/* Bottom */}
       <Animated.View style={[styles.bottom, { paddingBottom: insets.bottom + 24, opacity: buttonFade }]}>
-        <Pagination currentIndex={currentIndex} total={slides.length} />
+        <Pagination currentIndex={currentIndex} total={SLIDE_STRUCTS.length} />
         
         <TouchableOpacity onPress={handleNext} style={styles.button} activeOpacity={0.8}>
-          <Text style={styles.buttonText}>{isLastSlide ? 'Commencer' : 'Suivant'}</Text>
+          <Text
+            style={styles.buttonText}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+            minimumFontScale={0.82}
+          >
+            {isLastSlide ? t('welcome.start') : t('welcome.next')}
+          </Text>
         </TouchableOpacity>
-        
-        <Text style={styles.techNote}>Triple Ratchet · X25519 · ML-KEM-768</Text>
+
+        <Text style={styles.techNote}>{t('welcome.techNote')}</Text>
       </Animated.View>
     </View>
   );
@@ -330,10 +341,10 @@ export function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
 // STYLES
 // ============================================
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   container: {
     flex: 1,
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
   },
   
   // Skip
@@ -348,7 +359,7 @@ const styles = StyleSheet.create({
   },
   skipText: {
     fontSize: 15,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     fontWeight: '500',
   },
   
@@ -378,14 +389,14 @@ const styles = StyleSheet.create({
   heroTitle: {
     fontSize: 44,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
     letterSpacing: -1.5,
     marginBottom: 20,
   },
   heroSubtitle: {
     fontSize: 26,
     fontWeight: '300',
-    color: theme.colors.text,
+    color: colors.text,
     textAlign: 'center',
     lineHeight: 36,
     opacity: 0.9,
@@ -399,13 +410,13 @@ const styles = StyleSheet.create({
   taglineLine: {
     width: 24,
     height: 1,
-    backgroundColor: theme.colors.textMuted,
+    backgroundColor: colors.textMuted,
     opacity: 0.4,
   },
   taglineText: {
     fontSize: 11,
     fontWeight: '600',
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     letterSpacing: 2,
   },
   
@@ -417,14 +428,14 @@ const styles = StyleSheet.create({
   featureTitle: {
     fontSize: 28,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
     textAlign: 'center',
     marginBottom: 12,
     letterSpacing: -0.5,
   },
   featureSubtitle: {
     fontSize: 16,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
     textAlign: 'center',
     lineHeight: 24,
     marginBottom: 40,
@@ -436,18 +447,31 @@ const styles = StyleSheet.create({
   featureItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 14,
     padding: 16,
+    // ════════════════════════════════════════════════════════════════════
+    // STABILITÉ I18N — hauteur minimale
+    // ════════════════════════════════════════════════════════════════════
+    // Sur DE/RU/AR, certaines features ont des chaînes ~50% plus longues
+    // qu'en EN, ce qui fait wrapper le texte sur 2 lignes. Sans minHeight,
+    // les 3 cellules de la liste ont alors des hauteurs différentes →
+    // alignement visuel cassé. Avec minHeight=76, on garantit une cellule
+    // qui accueille proprement 1 OU 2 lignes de texte, et les 3 features
+    // ont la même empreinte verticale quelle que soit la langue.
+    // ════════════════════════════════════════════════════════════════════
+    minHeight: 76,
   },
   featureIconContainer: {
     width: 44,
     height: 44,
     borderRadius: 22,
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 14,
+    // Empêche l'icône d'être compressée si le texte adjacent est long
+    flexShrink: 0,
   },
   featureEmoji: {
     fontSize: 20,
@@ -455,8 +479,9 @@ const styles = StyleSheet.create({
   featureText: {
     flex: 1,
     fontSize: 15,
-    color: theme.colors.text,
+    color: colors.text,
     fontWeight: '500',
+    lineHeight: 20,
   },
   
   // Bottom
@@ -473,16 +498,16 @@ const styles = StyleSheet.create({
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
   },
   dotActive: {
     width: 24,
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
   },
   button: {
     width: '100%',
     paddingVertical: 16,
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
     borderRadius: 12,
     alignItems: 'center',
   },
@@ -494,11 +519,11 @@ const styles = StyleSheet.create({
   techNote: {
     marginTop: 16,
     fontSize: 10,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     letterSpacing: 0.3,
     opacity: 0.5,
   },
-});
+}) as const;
 
 export default WelcomeScreen;

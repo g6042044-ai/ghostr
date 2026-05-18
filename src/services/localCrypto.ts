@@ -281,7 +281,63 @@ export async function setEncryptionKeyAndRotate(key: Uint8Array | string): Promi
   // ── Activer la nouvelle clé ──
   encryptionKey = new Uint8Array(newKey);
   
-  // Clean up device-level key from ensureDeviceLevelEncryption (no longer needed, PIN takes over)
+  // ──────────────────────────────────────────────────────────────────────────
+  // CRASH RECOVERY — entrées orphelines sur DEVICE_ENCRYPTION_KEY
+  // ──────────────────────────────────────────────────────────────────────────
+  // Si une `transitionPinToHardware` (désactivation du PIN) a crashé en cours,
+  // certaines entrées AsyncStorage peuvent encore être chiffrées avec le device
+  // key au lieu de la rotation key. Le pass standard ci-dessus (Phase B) a
+  // raté ces entrées car ni `activeKey` ni `newKey` ne peuvent les déchiffrer.
+  //
+  // Sans cette récupération, la suppression de DEVICE_ENCRYPTION_KEY juste
+  // après rendrait ces entrées DÉFINITIVEMENT illisibles. Avec elle, on les
+  // migre proprement vers la nouvelle rotation key avant cleanup.
+  //
+  // Cas normal (pas de crash récent) : aucune entrée n'est sur deviceKey →
+  // reencryptAllEntries termine son `getAllKeys` rapidement avec `errorCount`
+  // sur tout, sans aucune écriture. Coût ~10-50 ms par unlock, acceptable.
+  //
+  // Skip si activeKey === deviceKey (cas où le device key était déjà la clé
+  // active utilisée par le pass standard) : pas besoin de re-itérer.
+  // ──────────────────────────────────────────────────────────────────────────
+  let deviceKeyRecover: Uint8Array | null = null;
+  try {
+    const deviceKeyB64 = await SecureStore.getItemAsync('ghostr_device_encryption_key_v1');
+    if (deviceKeyB64) {
+      const decoded = decodeBase64(deviceKeyB64);
+      if (decoded.length === 32) {
+        // Vérifier si c'est la même clé que activeKey (déjà traitée)
+        let same = activeKey.length === decoded.length;
+        if (same) {
+          for (let i = 0; i < activeKey.length; i++) {
+            if (activeKey[i] !== decoded[i]) { same = false; break; }
+          }
+        }
+        if (!same) {
+          deviceKeyRecover = decoded;
+        } else {
+          decoded.fill(0);
+        }
+      } else {
+        decoded.fill(0);
+      }
+    }
+  } catch {
+    // SecureStore inaccessible → pas de récupération possible, mais
+    // si la clé était lisible avant, le pass standard suffit dans la majorité
+    // des cas. Continuer sans bloquer.
+  }
+  
+  if (deviceKeyRecover) {
+    __DEV__ && console.log('[localCrypto] 🔄 Recovery pass: migrating any device-key entries to new rotation key');
+    await reencryptAllEntries(deviceKeyRecover, newKey);
+    deviceKeyRecover.fill(0);
+  }
+  
+  // Clean up device-level key from ensureDeviceLevelEncryption.
+  // Now safe : si des entrées étaient encore sur cette clé (crash recovery
+  // ci-dessus), elles ont été migrées vers newKey juste avant. Aucune perte
+  // de données possible ici.
   try {
     await SecureStore.deleteItemAsync('ghostr_device_encryption_key_v1');
   } catch {
@@ -401,10 +457,42 @@ export function clearEncryptionKey(): void {
 }
 
 /**
- * Vérifie si le chiffrement local est actif
+ * Vérifie si le chiffrement local est actif (PIN-mode).
+ *
+ * ⚠️ ATTENTION SÉMANTIQUE : retourne false si SEULE la `hardwareKey` est
+ * chargée (mode "no-PIN"). Le rest du codebase utilisait historiquement ce
+ * prédicat comme "le PIN est actif". Pour vérifier si on peut chiffrer ou
+ * déchiffrer (PIN OU hardware), utiliser `hasAnyEncryptionKey()`.
  */
 export function isEncryptionEnabled(): boolean {
   return encryptionKey !== null;
+}
+
+/**
+ * Vérifie si UNE clé (PIN ou hardware) est disponible pour chiffrer/déchiffrer.
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * POURQUOI CE PRÉDICAT EXISTE — bug de migration (mai 2026)
+ * ════════════════════════════════════════════════════════════════════════════
+ * `isEncryptionEnabled()` ne regarde QUE `encryptionKey` (la clé PIN-derivée),
+ * jamais `hardwareKey`. Or `encryptIfEnabled` / `decryptIfNeeded` utilisent
+ * `getActiveKey()` qui retourne `encryptionKey || hardwareKey`. Cela créait
+ * une asymétrie : les écritures réussissent (chiffrées avec hardwareKey) mais
+ * les lectures via secureGet() ailleurs dans le code échouent parce qu'elles
+ * gardent `if (raw.startsWith('enc1:') && !isEncryptionEnabled()) return null;`.
+ *
+ * Symptôme observé : après import de migration sans PIN, les conversations
+ * sont visibles (lues via getConversations qui utilise conversationsHardwareKey)
+ * mais les messages reviennent vides et l'envoi/réception est cassé (secureGet
+ * dans api1to1.ts retourne null sur toutes les entrées chiffrées).
+ *
+ * Ce prédicat est ce qu'il aurait toujours dû y avoir dans les gardes
+ * "données chiffrées mais pas de clé en RAM" : on veut savoir s'il existe UNE
+ * clé permettant le déchiffrement, pas si l'utilisateur a un PIN.
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+export function hasAnyEncryptionKey(): boolean {
+  return getActiveKey() !== null;
 }
 
 // ============================================
@@ -751,21 +839,56 @@ export async function initHardwareEncryption(): Promise<boolean> {
 }
 
 /**
- * Transition from PIN-based encryption to hardware-backed encryption.
+ * Transition from PIN-based encryption to no-PIN device-level encryption.
  * Called when the user disables the lock/PIN protection.
  *
- * Re-encrypts ALL AsyncStorage entries from the current active key (PIN-derived
- * rotation key) to a fresh hardware-backed key. Without this step, disabling
- * the PIN leaves data encrypted with a key that no longer exists on next boot,
- * making everything unreadable.
+ * ════════════════════════════════════════════════════════════════════════════
+ * INVARIANT CRITIQUE — À LIRE AVANT TOUTE MODIFICATION
+ * ════════════════════════════════════════════════════════════════════════════
+ * Cette fonction DOIT re-chiffrer les données vers la MÊME clé que
+ * `sessionService.ensureDeviceLevelEncryption()` chargera au prochain boot,
+ * c'est-à-dire la clé device-level stockée sous DEVICE_ENCRYPTION_KEY
+ * ('ghostr_device_encryption_key_v1') dans SecureStore.
+ *
+ * Si on re-chiffre vers une autre clé (par exemple `getOrCreateHardwareKey`
+ * de hardwareKeyProvider, qui génère une clé DIFFÉRENTE) :
+ *   - La transition réussit visuellement dans la session courante (la clé
+ *     est en RAM, les données sont lisibles).
+ *   - Mais au prochain cold start, `ensureDeviceLevelEncryption` ne trouve
+ *     pas de DEVICE_ENCRYPTION_KEY (puisque setupLock l'a supprimée et
+ *     personne ne l'a recréée), génère une NOUVELLE clé, et active cette
+ *     dernière comme `encryptionKey`. La clé qui chiffre réellement les
+ *     données sur disque (l'ancienne clé hardware) n'est plus utilisée.
+ *   - Toutes les lectures AsyncStorage échouent (MAC Poly1305 invalide) :
+ *     messages invisibles, participants disparus, sessions Triple Ratchet
+ *     régénérées par les blocs catch → identités cryptographiques détruites.
+ *
+ * Le bug a été découvert en mai 2026 par un utilisateur qui rapportait
+ * "perdre toutes les conversations et contacts" après avoir activé puis
+ * désactivé le PIN. La séquence buggée était :
+ *   setupLock → unlock → setEncryptionKeyAndRotate (supprime DEVICE_KEY) →
+ *   disableLock → transition (re-chiffre vers hwKey ≠ DEVICE_KEY) →
+ *   restart → ensureDeviceLevelEncryption génère NEW DEVICE_KEY → mismatch.
+ *
+ * Le correctif : utiliser/recréer DEVICE_ENCRYPTION_KEY ici, puis activer
+ * cette même clé via `encryptionKey = deviceKey`. Au prochain boot,
+ * `ensureDeviceLevelEncryption` trouvera la clé existante (au lieu d'en
+ * générer une nouvelle) et l'activera dans `encryptionKey` à l'identique.
+ * Les données restent lisibles indéfiniment.
+ * ════════════════════════════════════════════════════════════════════════════
  *
  * Sequence:
- *   1. Read current active key (PIN rotation key or hardware key)
- *   2. Generate/load hardware key
- *   3. Re-encrypt all enc1: entries from current → hardware
- *   4. Clear PIN rotation keys from SecureStore
- *   5. Switch module state: encryptionKey = null, hardwareKey = new
+ *   1. Read current active key (PIN rotation key, device key, or hardware key)
+ *   2. Load existing DEVICE_ENCRYPTION_KEY from SecureStore, or create one
+ *      (recréée si supprimée par setupLock précédent — boot-cohérent)
+ *   3. Re-encrypt all enc1: entries from current → device key
+ *   4. Clear PIN rotation keys from SecureStore (wrapped by localKey, useless
+ *      maintenant que le PIN est désactivé)
+ *   5. Switch module state: encryptionKey = device key (cohérent avec ce que
+ *      ensureDeviceLevelEncryption fera au prochain boot)
  */
+const DEVICE_ENCRYPTION_KEY_STORE = 'ghostr_device_encryption_key_v1';
+
 export async function transitionPinToHardware(): Promise<boolean> {
   try {
     const currentKey = getActiveKey();
@@ -774,32 +897,354 @@ export async function transitionPinToHardware(): Promise<boolean> {
       return false;
     }
 
-    // Load or create hardware-backed key
-    const hwKey = await getOrCreateHardwareKey();
-    const newHwKey = new Uint8Array(hwKey);
+    // ────────────────────────────────────────────────────────────────────────
+    // ÉTAPE 1 : Charger ou recréer le device key.
+    //
+    // Le device key persiste entre lock/unlock/relock/disable. Il a pu être
+    // supprimé par `setEncryptionKeyAndRotate` (ligne 286 de ce fichier) lors
+    // de la première activation du PIN. Dans ce cas on le régénère — la clé
+    // précédente était de toute façon désactivée et toutes les données ont
+    // depuis été ré-écrites avec la rotation key.
+    //
+    // IMPORTANT: les options SecureStore sont identiques à celles utilisées
+    // par sessionService.ensureDeviceLevelEncryption (WHEN_UNLOCKED_THIS_DEVICE_ONLY)
+    // pour que la clé soit lisible par le prochain boot sans friction.
+    // ────────────────────────────────────────────────────────────────────────
+    let deviceKey: Uint8Array;
+    let needsWrite = false;
 
-    // Re-encrypt ALL AsyncStorage entries from PIN key → hardware key
-    await reencryptAllEntries(currentKey, newHwKey);
+    try {
+      const stored = await SecureStore.getItemAsync(DEVICE_ENCRYPTION_KEY_STORE);
+      if (stored) {
+        const parsed = decodeBase64(stored);
+        if (parsed.length === 32) {
+          deviceKey = parsed;
+          __DEV__ && console.log('[localCrypto] 🔄 Reusing existing device-level key for transition');
+        } else {
+          // Clé corrompue (taille inattendue) → regénérer
+          deviceKey = nacl.randomBytes(32);
+          needsWrite = true;
+          __DEV__ && console.warn('[localCrypto] ⚠️ Existing device key has wrong length, regenerating');
+        }
+      } else {
+        // Clé absente (cas typique : setupLock l'a supprimée)
+        deviceKey = nacl.randomBytes(32);
+        needsWrite = true;
+        __DEV__ && console.log('[localCrypto] 🔑 No device key found, generating fresh one for transition');
+      }
+    } catch (e) {
+      // SecureStore inaccessible → générer une clé volatile pour ne pas
+      // bloquer la session courante. Le prochain boot tentera une nouvelle
+      // génération via ensureDeviceLevelEncryption.
+      __DEV__ && console.warn('[localCrypto] ⚠️ SecureStore read failed during transition:', e);
+      deviceKey = nacl.randomBytes(32);
+      needsWrite = true;
+    }
 
-    // Clear PIN rotation keys (wrapped with PIN-derived key, now useless)
+    // ────────────────────────────────────────────────────────────────────────
+    // ÉTAPE 2 : Persister le device key AVANT la re-encryption.
+    //
+    // Si l'app crashe entre la persistence et la re-encryption, on aura juste
+    // un device key non-utilisé en SecureStore — inoffensif. Si on faisait
+    // l'inverse (re-encrypt PUIS persist) et que ça crashait entre les deux,
+    // les données seraient chiffrées avec un device key qui n'existe nulle
+    // part → unreadable. L'ordre matters.
+    // ────────────────────────────────────────────────────────────────────────
+    if (needsWrite) {
+      try {
+        await SecureStore.setItemAsync(
+          DEVICE_ENCRYPTION_KEY_STORE,
+          encodeBase64(deviceKey),
+          { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY }
+        );
+      } catch (e) {
+        // Échec d'écriture SecureStore : on ne peut pas garantir la cohérence
+        // au prochain boot. Abort la transition pour ne pas corrompre les données.
+        __DEV__ && console.error('[localCrypto] ❌ Failed to persist device key, aborting transition:', e);
+        deviceKey.fill(0);
+        return false;
+      }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // ÉTAPE 3 : Re-chiffrer toutes les entrées AsyncStorage.
+    // currentKey (rotation key PIN-derived) → deviceKey (persistant en SecureStore)
+    //
+    // No-op gracieux si currentKey === deviceKey (cas rare : disableLock
+    // appelé juste après setupLock sans unlock entre les deux). reencryptAllEntries
+    // déchiffre puis re-chiffre avec un nonce frais — overhead léger mais safe.
+    // ────────────────────────────────────────────────────────────────────────
+    await reencryptAllEntries(currentKey, deviceKey);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // ÉTAPE 4 : Effacer les clés de rotation PIN (wrappées par localKey,
+    // désormais inutiles puisque le PIN est désactivé).
+    // ────────────────────────────────────────────────────────────────────────
     try {
       await SecureStore.deleteItemAsync(ROTATION_KEY_STORE);
       await SecureStore.deleteItemAsync(ROTATION_KEY_PENDING_STORE);
     } catch {
-      // Non-critical
+      // Non-critique : si la suppression échoue, ces clés resteront en place
+      // mais ne pourront pas être déwrappées (localKey perdu) — donc inertes.
     }
 
-    // Switch module state: PIN off, hardware on
+    // ────────────────────────────────────────────────────────────────────────
+    // ÉTAPE 5 : Activer le device key dans l'état module.
+    //
+    // On set encryptionKey (PAS hardwareKey) pour être cohérent avec ce que
+    // ensureDeviceLevelEncryption fera au prochain boot (`localCryptoSetKey(deviceKey)`
+    // qui set encryptionKey). Ainsi getActiveKey() retournera la même clé
+    // dans la session courante et après redémarrage : la donnée est lisible
+    // de manière déterministe à travers tous les cycles d'app.
+    //
+    // hardwareKey reste tel qu'il était (peut être null si on était en flow
+    // PIN, ou hwKey si initHardwareEncryption a été appelé). Sans importance :
+    // encryptionKey a la priorité dans getActiveKey().
+    // ────────────────────────────────────────────────────────────────────────
     if (encryptionKey) {
       encryptionKey.fill(0);
     }
-    encryptionKey = null;
-    hardwareKey = newHwKey;
+    encryptionKey = new Uint8Array(deviceKey);
+    deviceKey.fill(0); // la copie originale n'est plus utile
 
-    __DEV__ && console.log('[localCrypto] ✅ Transitioned from PIN to hardware encryption');
+    __DEV__ && console.log('[localCrypto] ✅ Transitioned PIN → device-level encryption (boot-consistent)');
     return true;
   } catch (error) {
-    __DEV__ && console.error('[localCrypto] ❌ PIN→hardware transition failed:', error);
+    __DEV__ && console.error('[localCrypto] ❌ PIN→device transition failed:', error);
     return false;
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// RÉCUPÉRATION POST-BUG (mai 2026) — adopt hardwareKey as deviceKey
+// ════════════════════════════════════════════════════════════════════════════
+/**
+ * Tente de récupérer un état orphelin causé par l'ancienne version buggée de
+ * `transitionPinToHardware` (avant mai 2026). À cette époque, désactiver le
+ * PIN re-chiffrait les données AsyncStorage avec `hwKey` (de hardwareKeyProvider)
+ * mais ne créait pas de DEVICE_ENCRYPTION_KEY. Au prochain boot,
+ * `ensureDeviceLevelEncryption` ne trouvait pas de DEVICE_ENCRYPTION_KEY,
+ * en générait une nouvelle, et perdait l'accès aux données chiffrées avec hwKey.
+ *
+ * Cette fonction est appelée par `ensureDeviceLevelEncryption` AVANT de générer
+ * une nouvelle clé. Elle vérifie si les données AsyncStorage existantes sont
+ * déchiffrables avec `hardwareKey` (qui est toujours dans SecureStore et chargée
+ * en mémoire par `initHardwareEncryptionAll`). Si oui, c'est la signature de
+ * l'ancien bug : on adopte `hardwareKey` comme `deviceKey` permanent en la
+ * persistant dans `DEVICE_ENCRYPTION_KEY` et en l'activant dans `encryptionKey`.
+ *
+ * SÉCURITÉ DE LA DÉTECTION :
+ *   - Le test repose sur le déchiffrement AEAD (XSalsa20-Poly1305).
+ *   - Probabilité de faux positif (MAC valide avec mauvaise clé) : ~2⁻¹²⁸
+ *   - On exige TOUS les échantillons valides (zéro tolérance aux échecs)
+ *   - Il faut au moins 1 entrée chiffrée pour activer la récupération
+ *     (un fresh install n'a rien et tombera dans le chemin "génération")
+ *
+ * @returns true si la récupération a réussi (encryptionKey est activée),
+ *          false si non applicable (laisse l'appelant générer une nouvelle clé)
+ */
+const SAMPLE_SIZE_FOR_RECOVERY = 5;
+
+export async function tryRecoverFromPreFixBug(): Promise<boolean> {
+  // Pré-condition : hardwareKey doit être déjà chargée (par initHardwareEncryptionAll)
+  if (!hardwareKey) {
+    return false;
+  }
+
+  // Pré-condition : DEVICE_ENCRYPTION_KEY doit être absent (sinon pas besoin de
+  // récupération — le chemin normal s'occupe du chargement)
+  try {
+    const existing = await SecureStore.getItemAsync(DEVICE_ENCRYPTION_KEY_STORE);
+    if (existing) {
+      return false; // Pas un cas de récupération
+    }
+  } catch {
+    return false;
+  }
+
+  // Sample quelques entrées AsyncStorage chiffrées et tester avec hardwareKey
+  let allKeys: readonly string[];
+  try {
+    allKeys = await AsyncStorageImport.getAllKeys();
+  } catch {
+    return false;
+  }
+
+  let testedSamples = 0;
+  let successfulDecryptions = 0;
+
+  for (const storageKey of allKeys) {
+    if (testedSamples >= SAMPLE_SIZE_FOR_RECOVERY) break;
+    try {
+      const value = await AsyncStorageImport.getItem(storageKey);
+      if (!value || !value.startsWith(ENCRYPTED_PREFIX)) continue;
+
+      testedSamples++;
+      if (decryptRaw(value, hardwareKey) !== null) {
+        successfulDecryptions++;
+      } else {
+        // Un échec suffit à abandonner la récupération — pas de "majorité"
+        // possible ici, on est strict pour ne jamais corrompre des données.
+        __DEV__ && console.log('[localCrypto] Recovery aborted: sample failed to decrypt with hardwareKey');
+        return false;
+      }
+    } catch {
+      // Erreur de lecture isolée → ignore cette entrée, continue
+      continue;
+    }
+  }
+
+  // Aucune donnée chiffrée trouvée → fresh install, pas de récupération
+  if (testedSamples === 0) {
+    return false;
+  }
+
+  // Tous les échantillons (au moins 1) ont déchiffré avec succès → c'est bien
+  // hardwareKey qui chiffre les données. Adopter cette clé comme deviceKey.
+  if (successfulDecryptions === testedSamples && testedSamples > 0) {
+    try {
+      await SecureStore.setItemAsync(
+        DEVICE_ENCRYPTION_KEY_STORE,
+        encodeBase64(hardwareKey),
+        { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY }
+      );
+    } catch (e) {
+      __DEV__ && console.error('[localCrypto] Recovery: failed to persist adopted key:', e);
+      return false; // Sans persistence on ne peut pas garantir le prochain boot
+    }
+
+    // Activer dans encryptionKey (cohérent avec le contrat post-fix de
+    // ensureDeviceLevelEncryption : encryptionKey != null après init).
+    if (encryptionKey) encryptionKey.fill(0);
+    encryptionKey = new Uint8Array(hardwareKey);
+
+    __DEV__ && console.log(
+      `[localCrypto] 🔧 Pre-fix bug recovered: adopted hardwareKey as deviceKey ` +
+      `(${testedSamples}/${testedSamples} samples decrypted successfully)`
+    );
+    return true;
+  }
+
+  return false;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PROMOTION PROACTIVE — utilisée par la migration import (mai 2026)
+// ════════════════════════════════════════════════════════════════════════════
+/**
+ * Promeut la `hardwareKey` actuellement en RAM en clé device-level persistante.
+ *
+ * Effets, dans l'ordre :
+ *   1. Persiste `hardwareKey` dans SecureStore sous `DEVICE_ENCRYPTION_KEY_STORE`
+ *      (= `ghostr_device_encryption_key_v1`). Au prochain cold boot,
+ *      `sessionService.ensureDeviceLevelEncryption()` chargera CETTE valeur
+ *      via `localCryptoSetKey(deviceKeyB64)`. La clé est donc stable à travers
+ *      les redémarrages.
+ *   2. Active `encryptionKey = hardwareKey` en mémoire. Conséquence immédiate :
+ *      `isEncryptionEnabled()` retourne true, ce qui débloque les gardes
+ *      `!isEncryptionEnabled()` éparpillées dans le codebase (api1to1.secureGet,
+ *      pendingInvites.load, etc.) qui sinon retourneraient `null` sur toutes
+ *      les entrées `enc1:` fraîchement écrites.
+ *
+ * RATIONALE — pourquoi cette fonction existe :
+ *
+ * Le flow d'IMPORT de migration faisait :
+ *   nuclearReset()
+ *     ├─ supprime DEVICE_ENCRYPTION_KEY
+ *     └─ supprime les hardware keys
+ *   initHardwareEncryptionAll()
+ *     ├─ régénère hardwareKey
+ *     └─ NE PERSISTE PAS DEVICE_ENCRYPTION_KEY
+ *   writeEncrypted(...) × N
+ *     └─ chiffre avec hardwareKey, mais encryptionKey reste null
+ *
+ * Au prochain boot, `ensureDeviceLevelEncryption` cherchait DEVICE_ENCRYPTION_KEY,
+ * ne le trouvait pas, et déléguait à `tryRecoverFromPreFixBug()`. Cette
+ * récupération est un mécanisme post-mortem : elle sample 5 entrées AsyncStorage
+ * et exige qu'elles déchiffrent toutes avec `hardwareKey`. Si une seule échoue
+ * (entrée écrite par un autre service avec une clé éphémère, donnée corrompue,
+ * etc.) → recovery abandonnée → génération d'une NOUVELLE deviceKey → les
+ * données chiffrées avec l'ancienne hardwareKey deviennent illisibles → toutes
+ * les sessions Triple Ratchet sont chargées vides → l'app génère une nouvelle
+ * identité → "tout a disparu" du point de vue utilisateur.
+ *
+ * En appelant cette fonction au moment de l'import, on transforme un chemin
+ * de récupération fragile en un chemin nominal déterministe.
+ *
+ * Idempotente : safe à appeler plusieurs fois (la 2e écriture est identique
+ * à la 1re puisque hardwareKey n'a pas changé).
+ *
+ * @returns true si la promotion a réussi (persistence + activation),
+ *          false si hardwareKey n'est pas en RAM ou si la persistence a échoué.
+ */
+export async function promoteHardwareKeyToDeviceKey(): Promise<boolean> {
+  if (!hardwareKey) {
+    __DEV__ && console.warn(
+      '[localCrypto] promoteHardwareKeyToDeviceKey: no hardwareKey in RAM — ' +
+      'call initHardwareEncryption() first'
+    );
+    return false;
+  }
+
+  // 1. Persister AVANT d'activer en mémoire.
+  //    Si un crash survient entre la persistence et l'activation, le prochain
+  //    boot trouvera DEVICE_ENCRYPTION_KEY et chargera la bonne clé — état
+  //    cohérent. À l'inverse, si on activait d'abord puis crashait avant
+  //    persister, le prochain boot ne trouverait rien et régénérerait une
+  //    clé différente → toutes les données enc1: deviennent illisibles.
+  try {
+    await SecureStore.setItemAsync(
+      DEVICE_ENCRYPTION_KEY_STORE,
+      encodeBase64(hardwareKey),
+      { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY }
+    );
+  } catch (e) {
+    __DEV__ && console.error(
+      '[localCrypto] promoteHardwareKeyToDeviceKey: SecureStore write failed:',
+      e
+    );
+    return false;
+  }
+
+  // 2. Vérification défensive : relire ce qu'on vient d'écrire. Sur certains
+  //    appareils (vieux Android, émulateurs avec Keystore défaillant), une
+  //    écriture SecureStore peut renvoyer sans erreur mais ne pas être
+  //    réellement persistée. Sans cette vérif, on activerait encryptionKey
+  //    et tout marcherait jusqu'au reboot, où les données seraient orphelines.
+  try {
+    const verify = await SecureStore.getItemAsync(DEVICE_ENCRYPTION_KEY_STORE);
+    if (!verify) {
+      __DEV__ && console.error(
+        '[localCrypto] promoteHardwareKeyToDeviceKey: persistence verification ' +
+        'failed (write returned but readback is empty)'
+      );
+      return false;
+    }
+    // Sanity check sur la valeur écrite
+    const decoded = decodeBase64(verify);
+    if (decoded.length !== 32) {
+      __DEV__ && console.error(
+        '[localCrypto] promoteHardwareKeyToDeviceKey: persisted key has ' +
+        `unexpected length ${decoded.length}, expected 32`
+      );
+      return false;
+    }
+  } catch (e) {
+    __DEV__ && console.error(
+      '[localCrypto] promoteHardwareKeyToDeviceKey: readback failed:',
+      e
+    );
+    return false;
+  }
+
+  // 3. Activer dans encryptionKey. À partir d'ici, `isEncryptionEnabled()`
+  //    retourne true et tous les call sites peuvent lire/écrire normalement.
+  if (encryptionKey) encryptionKey.fill(0);
+  encryptionKey = new Uint8Array(hardwareKey);
+
+  __DEV__ && console.log(
+    '[localCrypto] ✅ hardwareKey promoted to persistent deviceKey ' +
+    '(encryptionKey activated, DEVICE_ENCRYPTION_KEY persisted)'
+  );
+  return true;
 }

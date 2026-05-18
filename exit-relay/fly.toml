@@ -1,15 +1,12 @@
 # exit-relay/fly.toml
 # Configuration Fly.io pour Whisper Exit Relay
-# Version 3.0
+# Version 4.1 — P1-B4: HA + capacité ×3 (corrigé contraintes Fly memory)
 #
 # Déploiement:
 #   fly deploy --config fly.toml
 #
 # Pour créer l'app initialement:
 #   fly apps create whisper-exit-relay-eu
-#
-# Configuration des secrets (NE PAS COMMITER):
-#   fly secrets set SFU_URL=wss://votre-sfu.workers.dev
 
 app = "whisper-exit-relay-eu-summer-surf-1900"
 primary_region = "cdg"  # Paris
@@ -22,19 +19,22 @@ primary_region = "cdg"  # Paris
   LOG_LEVEL = "error"
   ACCESS_LOG = "false"
   # SFU_URL doit être défini via fly secrets
-  # fly secrets set SFU_URL=wss://whisper-sfu.ghostcrypt.workers.dev
 
 [http_service]
   internal_port = 8080
   force_https = true
   auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 1
+  # P1-B4: min=1 → min=2 pour HA réelle.
+  # Une machine peut crasher/redémarrer sans coupure du service voix.
+  min_machines_running = 2
 
   [http_service.concurrency]
     type = "connections"
-    hard_limit = 1000
-    soft_limit = 800
+    # P1-B4: 1000 → 800 (laisser marge sécurité avant saturation event loop).
+    # 800 conns = 400 appels concurrents par machine, 800 appels au total.
+    hard_limit = 800
+    soft_limit = 600
 
 # Configuration des healthchecks
 [[services]]
@@ -52,11 +52,26 @@ primary_region = "cdg"  # Paris
     method = "GET"
     path = "/health"
 
-# Configuration VM
+# Configuration VM — P1-B4 (v4.1): shared-cpu-2x avec 1GB
+#
+# CONTRAINTE FLY: les VM "performance" exigent une RAM par incréments de 1024 MiB
+# (1GB minimum). Pour notre usage (forwarding WebSocket pur, pas de calcul lourd),
+# performance-1x à 30€/mois est overkill. shared-cpu-2x donne 2 vCPUs partagés
+# avec burst quota, largement suffisant pour ~800 connexions WS, à ~3-4€/mois.
+#
+# Détails du sizing:
+#   - Chaque WebSocket = 2 sockets OS + buffers + ping timer.
+#   - 800 conns = ~150-200MB RAM minimum. 1GB donne marge confortable + overhead Node.
+#   - 2 vCPUs partagés permettent au moins un core "presque-dédié" pour event loop
+#     pendant que l'autre gère les forwards.
+#   - Avec 2 machines (P1-B4 HA), capacité totale = 1600 conns simultanées = 800 appels.
+#
+# Si à terme tu hits le plafond (>800 appels concurrents soutenus), passer à
+# performance-1x 1GB (~30€/mois/machine). À ce moment-là, tu seras déjà à plusieurs
+# milliers d'utilisateurs simultanés et la marge sur la voix justifie le coût.
 [[vm]]
-  cpu_kind = "shared"
-  cpus = 1
-  memory_mb = 256
+  size = "shared-cpu-2x"
+  memory_mb = 1024
 
 # Métriques désactivées pour la vie privée
 # [metrics]

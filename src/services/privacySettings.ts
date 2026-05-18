@@ -7,6 +7,7 @@ import {
   getDecoyServiceStatus,
 } from './decoyService';
 import { isRelayEnabled, getApiUrl } from './api';
+import i18n, { getActiveLanguage } from '../i18n';
 
 // ============================================
 // TYPES
@@ -53,7 +54,7 @@ export function getPrivacyStatus(): PrivacyStatus {
 }
 
 export function formatRelativeTime(date: Date | null): string {
-  if (!date) return 'Jamais';
+  if (!date) return i18n.t('time.never');
   
   const now = new Date();
   const diffMs = now.getTime() - date.getTime();
@@ -62,12 +63,12 @@ export function formatRelativeTime(date: Date | null): string {
   const diffHours = Math.floor(diffMinutes / 60);
   
   if (diffSeconds < 60) {
-    return 'À l\'instant';
+    return i18n.t('time.justNow');
   } else if (diffMinutes < 60) {
-    return `Il y a ${diffMinutes} min`;
+    return i18n.t('time.minutesAgoFull', { count: diffMinutes });
   } else if (diffHours < 24) {
-    return `Il y a ${diffHours}h`;
+    return i18n.t('time.hoursAgoFull', { count: diffHours });
   } else {
-    return date.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' });
+    return date.toLocaleDateString(getActiveLanguage(), { day: 'numeric', month: 'short' });
   }
 }

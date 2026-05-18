@@ -11,6 +11,7 @@ import { Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
 import { securityLogger } from './securityLogger';
+import i18n from '../i18n';
 
 // ============================================
 // TYPES
@@ -240,28 +241,28 @@ export async function performSecurityCheck(): Promise<SecurityCheckResult> {
     const type = Platform.OS === 'ios' ? 'JAILBREAK_DETECTED' : 'ROOT_DETECTED';
     await securityLogger.logDeviceSecurity(type);
     warnings.push(Platform.OS === 'ios' 
-      ? 'Appareil jailbreaké détecté'
-      : 'Appareil rooté détecté'
+      ? i18n.t('deviceSecurity.warnings.jailbroken')
+      : i18n.t('deviceSecurity.warnings.rooted')
     );
   }
   
   if (isEmulator) {
     await securityLogger.logDeviceSecurity('EMULATOR_DETECTED');
-    warnings.push('Application exécutée sur un émulateur/simulateur');
+    warnings.push(i18n.t('deviceSecurity.warnings.emulator'));
   }
   
   if (!hasSecureStorage) {
-    warnings.push('Stockage sécurisé non disponible ou compromis');
+    warnings.push(i18n.t('deviceSecurity.warnings.secureStorageUnavailable'));
   }
   
   if (isDebuggerAttached) {
     await securityLogger.logDeviceSecurity('DEBUGGER_DETECTED');
-    warnings.push('Débogueur détecté en production');
+    warnings.push(i18n.t('deviceSecurity.warnings.debuggerDetected'));
   }
   
   if (hasHookingFramework) {
     await securityLogger.logDeviceSecurity('HOOK_DETECTED', 'Xposed/Frida/Substrate');
-    warnings.push('Framework de hooking détecté (Xposed/Frida/Substrate)');
+    warnings.push(i18n.t('deviceSecurity.warnings.hookingFramework'));
   }
   
   let level: SecurityLevel = 'safe';
@@ -307,27 +308,27 @@ export function getSecurityWarningMessage(result: SecurityCheckResult): string |
   
   if (result.level === 'compromised') {
     return (
-      `Votre appareil présente des risques de sécurité importants :\n\n` +
+      i18n.t('deviceSecurity.compromisedHeader') +
       `• ${result.warnings.join('\n• ')}\n\n` +
-      `Les clés de chiffrement de vos conversations pourraient être extraites par un attaquant.\n\n` +
-      `L'utilisation de Ghostr sur cet appareil n'est pas recommandée pour des communications sensibles.`
+      i18n.t('deviceSecurity.encryptionRiskMessage') +
+      i18n.t('deviceSecurity.notRecommendedMessage')
     );
   }
   
   return (
     `${result.warnings.join('. ')}.\n\n` +
-    `La sécurité de vos conversations pourrait être réduite.`
+    i18n.t('deviceSecurity.warningMessage')
   );
 }
 
 export function getSecurityAlertTitle(result: SecurityCheckResult): string {
   switch (result.level) {
     case 'compromised':
-      return '🚨 Sécurité Compromise';
+      return i18n.t('deviceSecurity.titles.compromised');
     case 'warning':
-      return '⚠️ Avertissement de Sécurité';
+      return i18n.t('deviceSecurity.titles.warning');
     default:
-      return 'Sécurité';
+      return i18n.t('deviceSecurity.titles.security');
   }
 }
 

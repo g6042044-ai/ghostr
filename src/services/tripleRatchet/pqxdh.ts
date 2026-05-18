@@ -20,57 +20,14 @@
 //
 // RÉFÉRENCE: Signal PQXDH Specification (2023)
 
-import {
-  X25519KeyPair,
-  X25519PublicKey,
-  Ed25519PublicKey,
-  Ed25519Signature,
-  SymmetricKey,
-  IdentityKeyPair,
-  SignedPreKey,
-  OneTimePreKey,
-  PreKeyBundle,
-  X3DHInitialMessage,
-  CRYPTO_CONSTANTS,
-} from './types';
+import { X25519KeyPair, X25519PublicKey, Ed25519PublicKey, Ed25519Signature, SymmetricKey, IdentityKeyPair, SignedPreKey, OneTimePreKey, PreKeyBundle } from './types';
 
-import {
-  generateX25519KeyPair,
-  x25519,
-  sign,
-  verify,
-  protocolHkdf,
-  hkdfSync,
-  hmacSha256,
-  zeroize,
-  zeroizeAll,
-  createSymmetricKey,
-  ed25519PublicKeyToX25519,
-  bytesToHex,
-  hexToBytes,
-  getSecureRandomBytes,
-} from './primitives';
+import { generateX25519KeyPair, x25519, sign, verify, protocolHkdf, hkdfSync, hmacSha256, zeroize, zeroizeAll, createSymmetricKey, ed25519PublicKeyToX25519, getSecureRandomBytes } from './primitives';
 
 // @noble/hashes - bibliothèque auditée pour SHA-256
 import { sha256 } from '@noble/hashes/sha256';
 
-import {
-  KyberKeyPair,
-  KyberPublicKey,
-  KyberSecretKey,
-  KyberCiphertext,
-  KyberSharedSecret,
-  kyberKeyGen,
-  kyberEncapsulate,
-  kyberDecapsulate,
-  serializeKyberPublicKey,
-  deserializeKyberPublicKey,
-  serializeKyberCiphertext,
-  deserializeKyberCiphertext,
-  zeroizeKyberSecretKey,
-  zeroizeKyberSharedSecret,
-  KYBER_CONSTANTS,
-} from './pqPrimitives';
+import { KyberKeyPair, KyberPublicKey, KyberCiphertext, kyberKeyGen, kyberEncapsulate, kyberDecapsulate, serializeKyberPublicKey, deserializeKyberPublicKey, serializeKyberCiphertext, deserializeKyberCiphertext, zeroizeKyberSharedSecret, KYBER_CONSTANTS } from './pqPrimitives';
 
 // ============================================
 // TYPES PQXDH
@@ -650,15 +607,7 @@ export function validatePQPreKeyBundle(
 // ============================================
 
 // Note: encodeBase64/decodeBase64 are imported from primitives.ts which re-exports them
-import { 
-  serializePublicKey, 
-  deserializeX25519PublicKey, 
-  deserializeEd25519PublicKey,
-  deserializeSignature,
-  createEd25519Signature,
-  encodeBase64,
-  decodeBase64,
-} from './primitives';
+import { serializePublicKey, deserializeX25519PublicKey, deserializeEd25519PublicKey, deserializeSignature, encodeBase64, decodeBase64 } from './primitives';
 // SignedPreKey and OneTimePreKey already imported at top of file
 
 /**

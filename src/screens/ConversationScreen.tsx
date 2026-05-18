@@ -35,113 +35,52 @@
 // - Haptic feedback ready
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  FlatList,
-  TextInput,
-  TouchableOpacity,
-  Platform,
-  ActivityIndicator,
-  Animated,
-  Keyboard,
-  Alert,
-  Modal,
-  Image,
-  Pressable,
-  useWindowDimensions,
-  ScrollView,
-  PanResponder,
-  Easing,
-  LayoutAnimation,
-  UIManager,
-} from 'react-native';
+import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, Platform, ActivityIndicator, Animated, Keyboard, Alert, Modal, Image, Pressable, useWindowDimensions, ScrollView, Easing, UIManager, Dimensions, StatusBar } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSafeAreaInsets, SafeAreaView } from 'react-native-safe-area-context';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RouteProp } from '@react-navigation/native';
-import Svg, { Path, Circle, Defs, LinearGradient, Stop } from 'react-native-svg';
+import Svg, { Path, Circle } from 'react-native-svg';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
 import { suppressLock, releaseLock } from '../services/lockGuard';
-import { useUnifiedMessages, UnifiedMessage, ConversationInfo } from '../hooks/useUnifiedMessages';
+import { ensureCameraPermission, ensureMediaLibraryPermission, ensureSaveToLibraryPermission } from '../services/permissions';
+import { useUnifiedMessages, UnifiedMessage } from '../hooks/useUnifiedMessages';
 import { MessageStatus } from '../services/messageStatus';
-import { LocalMessage, getConversation, StoredConversation, getConversationKeys, getMasterKey } from '../services/storage';
+import { LocalMessage, getConversationKeys, getMasterKey } from '../services/storage';
 
 // Type alias pour compatibilité avec l'ancien code
 type MessageWithStatus = UnifiedMessage;
 // v6.1 - Import sessionService pour les changements de profil en temps réel
 import { sessionService } from '../services/tripleRatchet';
 // v15.0 - Utiliser les nouvelles fonctions média pour Triple Ratchet
-import { 
-  sendImageMessage1to1, 
-  sendFileMessage1to1, 
-  sendVoiceMessage1to1,
-  base64ToTempUri,
-  downloadMediaBlob,
-} from '../services/media1to1';
-import { 
-  getCachedThumbnail, 
-  getCachedImage,
-  getCachedFile,
-  pickFile,
-  validateFileSize,
-  getFileIcon,
-  formatFileSize,
-  getMediaPublicUrl,
-} from '../services/mediaService';
-import {
-  initializeVoiceService,
-  startRecording,
-  stopRecording,
-  cancelRecording,
-  isRecording as isVoiceRecording,
-  playVoice,
-  pauseVoice,
-  stopVoice,
-  seekVoice,
-  setPlaybackRate,
-  getCurrentPlayingId,
-  getCachedVoice,
-  getVoicePublicUrl,
-  formatVoiceDuration,
-  cleanupVoiceService,
-  VoiceMessagePayload,
-  isRecording as isRecordingActive,
-} from '../services/voiceMessageService';
+import { downloadMediaBlob } from '../services/media1to1';
+import { getCachedThumbnail, getCachedImage, getCachedFile, pickFile, validateFileSize, getFileIcon, formatFileSize, getMediaPublicUrl } from '../services/mediaService';
+import { initializeVoiceService, startRecording, stopRecording, cancelRecording, playVoice, pauseVoice, stopVoice, getCachedVoice, getVoicePublicUrl, formatVoiceDuration, cleanupVoiceService, VoiceMessagePayload, isRecording as isRecordingActive } from '../services/voiceMessageService';
 import * as Sharing from 'expo-sharing';
 import { resolveImageUri, resolveMediaToBase64, isMediaRef } from '../services/mediaFileStore';
-import {
-  theme,
-  ChatHeader,
-  SelectionHeader,
-  ActionSheet,
-  AlertModal,
-} from '../components/ui';
+import { ChatHeader, SelectionHeader, ActionSheet, AlertModal } from '../components/ui';
 import { generateColorFromToken } from '../services/crypto';
 import { InviteModal } from '../components/InviteModal';
 import { CallButton1to1 } from '../components/CallButton1to1';
 import { useCall1to1 } from '../hooks/useCall1to1';
 import { Avatar } from '../components/Avatar';
-import {
-  isCallMessage,
-  getCallPayload,
-  formatCallDuration,
-  getCallStatusText,
-  CallMessagePayload,
-} from '../services/callMessages';
+import { isCallMessage, getCallPayload, formatCallDuration, getCallStatusText, CallMessagePayload } from '../services/callMessages';
 import { VoiceRecordButton } from '../components/VoiceRecordButton';
 import { useChunkingProgress } from '../hooks/useChunkingProgress';
-import {
-  MediaProgressOverlay,
-  FileProgressBar,
-  VoiceProgressBar,
-  IncomingMediaPlaceholder,
-  SendingProgressLabel,
-} from '../components/MediaProgressOverlay';
+import { MediaProgressOverlay, FileProgressBar, VoiceProgressBar, IncomingMediaPlaceholder } from '../components/MediaProgressOverlay';
+// v28.0: Placeholder moderne pour les médias chiffrés en cours de téléchargement
+// (forme native par type: image-shaped / voice-shaped / file-row).
+import { BlobMediaPlaceholder as NewBlobMediaPlaceholder } from '../components/BlobMediaPlaceholder';
+import { useTranslation } from 'react-i18next';
+import i18n, { getActiveLanguage } from '../i18n';
+
+// PERF FIX (4) : SwipeableMessage et AnimatedMessage extraits dans un fichier dédié
+// pour réduire la taille monolithique de ce screen et permettre une mémoïsation
+// propre. Voir ./conversation/MessageWrappers.tsx pour les détails.
+import { SwipeableMessage, AnimatedMessage } from './conversation/MessageWrappers';
 
 // Enable LayoutAnimation on Android
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -152,86 +91,106 @@ if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental
 // DESIGN SYSTEM - Modern Premium Dark Theme
 // ============================================
 
-const MAX_FILE_SIZE_MB = 20;
 const MESSAGE_AVATAR_SIZE = 28;
-const SWIPE_THRESHOLD = 60; // Distance to trigger reply
 const REACTION_EMOJIS = ['❤️', '👍', '😂', '😮', '😢', '🔥'];
 
 // Premium Color Palette - ALIGNED WITH GLOBAL THEME (theme.ts)
 // v12.1 - Cohérence visuelle avec le reste de l'application
-const Colors = {
-  // Backgrounds - Alignés avec theme.colors
-  bg: {
-    primary: '#0A0F14',      // theme.colors.background
-    secondary: '#0F161C',    // theme.colors.surface
-    tertiary: '#1A252F',     // theme.colors.surfaceLight
-    elevated: '#243240',     // theme.colors.surfaceElevated
-    hover: 'rgba(139, 164, 184, 0.12)',  // theme.colors.border
-    glass: 'rgba(26, 37, 47, 0.85)',     // theme.colors.glass
-    glassLight: 'rgba(36, 50, 64, 0.6)', // theme.colors.glassLight
-  },
-  
-  // Message bubbles - Alignés avec theme.colors
-  bubble: {
-    outgoing: '#005C4B',                 // theme.colors.messageMine
-    outgoingGradientStart: '#006D5B',    // theme.colors.messageMineLight
-    outgoingGradientEnd: '#004D3F',
-    outgoingPressed: '#004A3D',
-    incoming: '#1A252F',                 // theme.colors.messageTheirs (surfaceLight)
-    incomingGradientStart: '#243240',    // theme.colors.surfaceElevated
-    incomingGradientEnd: '#1A252F',      // theme.colors.surfaceLight
-    incomingPressed: '#0F161C',          // theme.colors.surface
-    reply: 'rgba(0, 217, 166, 0.12)',    // theme.colors.replyBg
-    replyBorder: 'rgba(0, 217, 166, 0.4)', // theme.colors.replyBorder
-  },
-  
-  // Accent colors - Alignés avec theme.colors
-  accent: {
-    primary: '#00D9A6',                  // theme.colors.primary
-    primaryMuted: 'rgba(0, 217, 166, 0.15)',
-    secondary: '#00B4D8',                // theme.colors.secondary/info
-    tertiary: '#00B38A',                 // theme.colors.primaryDark
-    warning: '#FFB547',                  // theme.colors.warning
-    error: '#FF6B6B',                    // theme.colors.error
-    success: '#00D9A6',                  // theme.colors.success
-  },
-  
-  // Text hierarchy - Alignés avec theme.colors
-  text: {
-    primary: '#F0F4F8',                  // theme.colors.text
-    secondary: '#8BA4B8',                // theme.colors.textSecondary
-    tertiary: '#5D7485',                 // theme.colors.textMuted
-    inverse: '#FFFFFF',
-    link: '#00B4D8',                     // theme.colors.info
-    onBubbleMine: '#FFFFFF',
-    onBubbleTheirs: '#F0F4F8',           // theme.colors.text
-    quoted: '#00D9A6',                   // theme.colors.primary
-  },
-  
-  // Status indicators - WhatsApp style
-  status: {
-    sent: 'rgba(255,255,255,0.5)',       // 1 check gris
-    delivered: 'rgba(255,255,255,0.75)', // 2 checks gris  
-    read: '#53BDEB',                     // 2 checks BLEU (WhatsApp style)
-  },
-  
-  // UI elements - Alignés avec theme.colors
-  ui: {
-    border: 'rgba(139, 164, 184, 0.12)', // theme.colors.border
-    borderLight: 'rgba(139, 164, 184, 0.06)', // theme.colors.borderLight
-    divider: 'rgba(240, 244, 248, 0.06)', // theme.colors.divider
-    overlay: 'rgba(10, 15, 20, 0.95)',   // theme.colors.overlay
-    shadow: 'rgba(0, 0, 0, 0.4)',
-    glow: 'rgba(0, 217, 166, 0.3)',
-  },
-  
-  // Reactions - Alignés avec theme.colors
-  reaction: {
-    bg: 'rgba(26, 37, 47, 0.95)',        // theme.colors.reactionBg
-    border: 'rgba(139, 164, 184, 0.15)', // theme.colors.reactionBorder
-    selected: 'rgba(0, 217, 166, 0.2)',  // theme.colors.reactionSelected
-  },
-};
+// ════════════════════════════════════════════════════════════════════════════
+// THEMED COLOR PALETTE
+// ════════════════════════════════════════════════════════════════════════════
+// v3.0 — was a static dark-only constant; now a FACTORY that builds the same
+// nested shape from the active ColorPalette. The component calls
+// `useThemedColors()` to get a live palette, and the three module-level
+// StyleSheet.create blocks below use a frozen boot-time palette captured
+// once (so the module loads cleanly). The component overrides via inline
+// styles where the boot/live palette differs, but in practice the boot
+// palette = the OS scheme captured synchronously in theme.ts, which matches
+// the system theme. Manual theme overrides still need a JS reload to
+// fully propagate to these legacy StyleSheets — that's the `requiresReload`
+// flag exposed by useTheme(). See docs/THEME_MIGRATION.md.
+//
+// Important: every key here mirrors a `theme.colors.X` entry. If you add a
+// key to one palette, add the equivalent here.
+import { theme as _theme } from '../components/ui/theme';
+import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
+
+function makeColorsFromPalette(c: ColorPalette) {
+  return {
+    bg: {
+      primary: c.background,
+      secondary: c.surface,
+      tertiary: c.surfaceLight,
+      elevated: c.surfaceElevated,
+      hover: c.border,
+      glass: c.glass,
+      glassLight: c.glassLight,
+    },
+    bubble: {
+      outgoing: c.messageMine,
+      outgoingGradientStart: c.messageMineLight,
+      // Slightly darker than messageMine for the gradient end — preserved
+      // from the original dark palette since it's an absolute gradient
+      // stop rather than a semantic role. On light theme the message
+      // bubble is teal so a darker teal still makes sense.
+      outgoingGradientEnd: '#004D3F',
+      outgoingPressed: '#004A3D',
+      incoming: c.messageTheirs,
+      incomingGradientStart: c.surfaceElevated,
+      incomingGradientEnd: c.surfaceLight,
+      incomingPressed: c.surface,
+      reply: c.replyBg,
+      replyBorder: c.replyBorder,
+    },
+    accent: {
+      primary: c.primary,
+      primaryMuted: c.primary + '26', // ~15% alpha
+      secondary: c.secondary,
+      tertiary: c.primaryDark ?? c.primary,
+      warning: c.warning,
+      error: c.error,
+      success: c.success,
+    },
+    text: {
+      primary: c.text,
+      secondary: c.textSecondary,
+      tertiary: c.textMuted,
+      // Inverse and on-bubble stay white because the bubble background
+      // (teal `messageMine`) is the same on both themes.
+      inverse: '#FFFFFF',
+      link: c.info,
+      onBubbleMine: '#FFFFFF',
+      onBubbleTheirs: c.text,
+      quoted: c.primary,
+    },
+    status: {
+      sent: c.statusSent,
+      delivered: c.statusDelivered,
+      read: '#53BDEB',  // WhatsApp-style blue checkmark, same on both themes
+    },
+    ui: {
+      border: c.border,
+      borderLight: c.borderLight,
+      divider: c.divider,
+      overlay: c.overlay,
+      shadow: 'rgba(0, 0, 0, 0.4)',
+      glow: c.primary + '4D', // ~30% alpha
+    },
+    reaction: {
+      bg: c.reactionBg,
+      border: c.reactionBorder,
+      selected: c.reactionSelected,
+    },
+  };
+}
+
+// Boot-time palette — used by the three module-level StyleSheet.create
+// blocks below. Captured once at module load from the (already-resolved)
+// boot theme. After ThemeProvider mounts, this object is frozen; the
+// component uses `useThemedColors()` to get live values inline.
+const Colors = makeColorsFromPalette(_theme.colors as ColorPalette);
+
+
 
 // Spacing scale (4px base unit)
 const Space = {
@@ -507,9 +466,18 @@ interface MessageStatusIconProps {
   isMine: boolean;
 }
 
-const MessageStatusIcon: React.FC<MessageStatusIconProps> = ({ status, isMine }) => {
+// PERF FIX (3) : React.memo. Composant foliaire pur, props primitives
+// (status: string, isMine: boolean) → la comparaison shallow est triviale et
+// elle évite le re-render quand le parent change pour une raison non liée
+// au statut du message. Apparaît dans CHAQUE message texte → multiplicatif.
+const MessageStatusIcon: React.FC<MessageStatusIconProps> = React.memo(({ status, isMine }) => {
   if (!isMine) return null;
-  
+  // Component-local live colours — flips with theme without a reload.
+  // eslint-disable-next-line @typescript-eslint/no-shadow
+  const { colors: liveColors } = useTheme();
+  // eslint-disable-next-line @typescript-eslint/no-shadow
+  const Colors = makeColorsFromPalette(liveColors);
+
   switch (status) {
     case 'sending':
       return <Icons.StatusClock size={14} color={Colors.status.sent} />;
@@ -524,88 +492,7 @@ const MessageStatusIcon: React.FC<MessageStatusIconProps> = ({ status, isMine })
     default:
       return <Icons.DoubleCheck size={14} color={Colors.status.read} />;
   }
-};
-
-// ============================================
-// TYPING INDICATOR COMPONENT
-// ============================================
-
-const TypingIndicator: React.FC<{ senderName?: string }> = ({ senderName }) => {
-  const dot1 = useRef(new Animated.Value(0)).current;
-  const dot2 = useRef(new Animated.Value(0)).current;
-  const dot3 = useRef(new Animated.Value(0)).current;
-  
-  useEffect(() => {
-    const animateDots = () => {
-      const createDotAnimation = (dot: Animated.Value, delay: number) => {
-        return Animated.loop(
-          Animated.sequence([
-            Animated.delay(delay),
-            Animated.timing(dot, {
-              toValue: 1,
-              duration: 300,
-              easing: Easing.bezier(0.4, 0, 0.2, 1),
-              useNativeDriver: true,
-            }),
-            Animated.timing(dot, {
-              toValue: 0,
-              duration: 300,
-              easing: Easing.bezier(0.4, 0, 0.2, 1),
-              useNativeDriver: true,
-            }),
-          ])
-        );
-      };
-      
-      Animated.parallel([
-        createDotAnimation(dot1, 0),
-        createDotAnimation(dot2, 150),
-        createDotAnimation(dot3, 300),
-      ]).start();
-    };
-    
-    animateDots();
-    return () => {
-      dot1.setValue(0);
-      dot2.setValue(0);
-      dot3.setValue(0);
-    };
-  }, []);
-  
-  const renderDot = (anim: Animated.Value, index: number) => (
-    <Animated.View
-      key={index}
-      style={[
-        styles.typingDot,
-        {
-          opacity: anim.interpolate({
-            inputRange: [0, 1],
-            outputRange: [0.4, 1],
-          }),
-          transform: [{
-            translateY: anim.interpolate({
-              inputRange: [0, 1],
-              outputRange: [0, -4],
-            }),
-          }],
-        },
-      ]}
-    />
-  );
-  
-  return (
-    <View style={styles.typingContainer}>
-      <View style={styles.typingBubble}>
-        <View style={styles.typingDotsRow}>
-          {[dot1, dot2, dot3].map(renderDot)}
-        </View>
-      </View>
-      {senderName && (
-        <Text style={styles.typingText}>{senderName} écrit...</Text>
-      )}
-    </View>
-  );
-};
+});
 
 // ============================================
 // REACTION PICKER COMPONENT - Messenger Style
@@ -626,6 +513,8 @@ const ReactionPicker: React.FC<ReactionPickerProps> = ({
   onClose,
   selectedEmojis = [],
 }) => {
+  // Component-local themed styles — flip with theme without a JS reload.
+  const styles = useThemedStyles(makeStyles);
   const scaleAnim = useRef(new Animated.Value(0)).current;
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
   const insets = useSafeAreaInsets();
@@ -733,57 +622,6 @@ const ReactionPicker: React.FC<ReactionPickerProps> = ({
 };
 
 // ============================================
-// QUOTED MESSAGE COMPONENT
-// ============================================
-
-interface QuotedMessageProps {
-  replyTo: ReplyTo;
-  onPress?: () => void;
-  compact?: boolean;
-}
-
-const QuotedMessage: React.FC<QuotedMessageProps> = ({ replyTo, onPress, compact }) => {
-  const isImage = replyTo.content.includes('"type":"image"');
-  const isFile = replyTo.content.includes('"type":"file"');
-  
-  const getPreviewContent = () => {
-    if (isImage) return '📷 Photo';
-    if (isFile) return '📎 Fichier';
-    return replyTo.content.length > 50 
-      ? replyTo.content.substring(0, 50) + '...' 
-      : replyTo.content;
-  };
-  
-  return (
-    <TouchableOpacity 
-      style={[
-        styles.quotedMessage,
-        compact && styles.quotedMessageCompact,
-        replyTo.isMine && styles.quotedMessageMine,
-      ]}
-      onPress={onPress}
-      activeOpacity={0.8}
-    >
-      <View style={[
-        styles.quotedBorder,
-        replyTo.isMine && styles.quotedBorderMine,
-      ]} />
-      <View style={styles.quotedContent}>
-        <Text style={[
-          styles.quotedSender,
-          replyTo.isMine && styles.quotedSenderMine,
-        ]}>
-          {replyTo.isMine ? 'Vous' : replyTo.senderName}
-        </Text>
-        <Text style={styles.quotedText} numberOfLines={1}>
-          {getPreviewContent()}
-        </Text>
-      </View>
-    </TouchableOpacity>
-  );
-};
-
-// ============================================
 // REPLY INPUT BAR COMPONENT - Fluid Animation
 // ============================================
 
@@ -793,6 +631,13 @@ interface ReplyBarProps {
 }
 
 const ReplyBar: React.FC<ReplyBarProps> = ({ replyTo, onCancel }) => {
+  // Component-local themed styles — flip with theme without a JS reload.
+  const styles = useThemedStyles(makeStyles);
+  // eslint-disable-next-line @typescript-eslint/no-shadow
+  const { colors: _liveColors } = useTheme();
+  // eslint-disable-next-line @typescript-eslint/no-shadow
+  const Colors = makeColorsFromPalette(_liveColors);
+  const { t } = useTranslation();
   const slideAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0.95)).current;
   const borderAnim = useRef(new Animated.Value(0)).current;
@@ -852,8 +697,12 @@ const ReplyBar: React.FC<ReplyBarProps> = ({ replyTo, onCancel }) => {
     if (!replyTo) return '';
     try {
       const parsed = JSON.parse(replyTo.content);
-      if (parsed.type === 'image') return '📷 Photo';
-      if (parsed.type === 'file') return `📎 ${parsed.metadata?.name || 'Fichier'}`;
+      if (parsed.type === 'image') return t('conversationList.preview.photo');
+      if (parsed.type === 'file') {
+        return parsed.metadata?.name
+          ? t('conversationList.preview.file', { name: parsed.metadata.name })
+          : t('conversationList.preview.fileGeneric');
+      }
     } catch {}
     return replyTo.content.length > 50 
       ? replyTo.content.substring(0, 50) + '...' 
@@ -940,6 +789,8 @@ const ReactionsDisplay: React.FC<ReactionsDisplayProps> = ({
   onPress, 
   isMine 
 }) => {
+  // Component-local themed styles — flip with theme without a JS reload.
+  const styles = useThemedStyles(makeStyles);
   if (reactions.length === 0) return null;
   
   // Calculer le nombre total de réactions
@@ -980,261 +831,22 @@ const ReactionsDisplay: React.FC<ReactionsDisplayProps> = ({
 };
 
 // ============================================
-// SWIPEABLE MESSAGE WRAPPER - Ultra Fluid
+// SWIPEABLE MESSAGE & ANIMATED MESSAGE
 // ============================================
+// PERF FIX (4) : ces deux wrappers ont été extraits dans
+// ./conversation/MessageWrappers.tsx — voir l'import en haut de ce fichier.
+// L'extraction permet de réduire la taille monolithique de ce screen et
+// d'isoler les tests/benchmarks de ces composants.
 
-interface SwipeableMessageProps {
-  children: React.ReactNode;
-  onSwipeRight: () => void;
-  isMine: boolean;
-  enabled?: boolean;
-}
-
-const SwipeableMessage: React.FC<SwipeableMessageProps> = ({ 
-  children, 
-  onSwipeRight, 
-  isMine,
-  enabled = true,
-}) => {
-  const translateX = useRef(new Animated.Value(0)).current;
-  const replyIconScale = useRef(new Animated.Value(0)).current;
-  const replyIconRotate = useRef(new Animated.Value(0)).current;
-  const hasTriggeredRef = useRef(false);
-  
-  // Reset trigger state when enabled changes
-  useEffect(() => {
-    hasTriggeredRef.current = false;
-  }, [enabled]);
-  
-  const panResponder = useMemo(() => PanResponder.create({
-    onMoveShouldSetPanResponder: (_, gestureState) => {
-      // Only capture horizontal swipes to the right
-      return enabled && 
-             gestureState.dx > 8 && 
-             Math.abs(gestureState.dy) < 15 &&
-             Math.abs(gestureState.dx) > Math.abs(gestureState.dy);
-    },
-    onPanResponderGrant: () => {
-      hasTriggeredRef.current = false;
-    },
-    onPanResponderMove: (_, gestureState) => {
-      // Smooth resistance effect - gets harder to pull as you go further
-      const resistance = 0.6;
-      const rawX = Math.max(0, gestureState.dx);
-      const resistedX = rawX < SWIPE_THRESHOLD 
-        ? rawX 
-        : SWIPE_THRESHOLD + (rawX - SWIPE_THRESHOLD) * resistance;
-      
-      const clampedX = Math.min(resistedX, SWIPE_THRESHOLD + 30);
-      translateX.setValue(clampedX);
-      
-      // Progress from 0 to 1
-      const progress = Math.min(clampedX / SWIPE_THRESHOLD, 1);
-      
-      // Scale with slight overshoot at threshold
-      const scaleValue = progress < 1 
-        ? progress 
-        : 1 + (progress - 1) * 0.3;
-      replyIconScale.setValue(scaleValue);
-      
-      // Subtle rotation as you swipe
-      replyIconRotate.setValue(progress * 0.15);
-      
-      // Trigger feedback when threshold is reached (once per swipe)
-      if (progress >= 1 && !hasTriggeredRef.current) {
-        hasTriggeredRef.current = true;
-        // Bounce animation when threshold reached
-        Animated.sequence([
-          Animated.spring(replyIconScale, {
-            toValue: 1.3,
-            tension: 400,
-            friction: 10,
-            useNativeDriver: true,
-          }),
-          Animated.spring(replyIconScale, {
-            toValue: 1,
-            tension: 300,
-            friction: 10,
-            useNativeDriver: true,
-          }),
-        ]).start();
-      }
-    },
-    onPanResponderRelease: (_, gestureState) => {
-      const shouldTrigger = gestureState.dx >= SWIPE_THRESHOLD;
-      
-      if (shouldTrigger) {
-        // Quick snap back with callback
-        Animated.parallel([
-          Animated.spring(translateX, {
-            toValue: 0,
-            tension: 200,
-            friction: 20,
-            useNativeDriver: true,
-          }),
-          Animated.timing(replyIconScale, {
-            toValue: 0,
-            duration: 150,
-            easing: Easing.out(Easing.ease),
-            useNativeDriver: true,
-          }),
-          Animated.timing(replyIconRotate, {
-            toValue: 0,
-            duration: 150,
-            useNativeDriver: true,
-          }),
-        ]).start(() => {
-          onSwipeRight();
-        });
-      } else {
-        // Smooth return to origin
-        Animated.parallel([
-          Animated.spring(translateX, {
-            toValue: 0,
-            tension: 180,
-            friction: 15,
-            useNativeDriver: true,
-          }),
-          Animated.timing(replyIconScale, {
-            toValue: 0,
-            duration: 200,
-            easing: Easing.out(Easing.ease),
-            useNativeDriver: true,
-          }),
-          Animated.timing(replyIconRotate, {
-            toValue: 0,
-            duration: 200,
-            useNativeDriver: true,
-          }),
-        ]).start();
-      }
-      
-      hasTriggeredRef.current = false;
-    },
-    onPanResponderTerminate: () => {
-      // If gesture is interrupted, reset smoothly
-      Animated.parallel([
-        Animated.spring(translateX, {
-          toValue: 0,
-          tension: 180,
-          friction: 15,
-          useNativeDriver: true,
-        }),
-        Animated.timing(replyIconScale, {
-          toValue: 0,
-          duration: 200,
-          useNativeDriver: true,
-        }),
-      ]).start();
-      hasTriggeredRef.current = false;
-    },
-  }), [enabled, onSwipeRight]);
-  
-  // Interpolated values for smooth animations
-  const iconOpacity = replyIconScale.interpolate({
-    inputRange: [0, 0.3, 1],
-    outputRange: [0, 0.7, 1],
-  });
-  
-  const iconTranslateX = replyIconScale.interpolate({
-    inputRange: [0, 1],
-    outputRange: [-10, 0],
-  });
-  
-  const rotateZ = replyIconRotate.interpolate({
-    inputRange: [0, 1],
-    outputRange: ['0deg', '-15deg'],
-  });
-  
-  return (
-    <View style={styles.swipeableContainer}>
-      {/* Reply icon with smooth animations */}
-      <Animated.View
-        style={[
-          styles.swipeReplyIcon,
-          {
-            opacity: iconOpacity,
-            transform: [
-              { scale: replyIconScale },
-              { translateX: iconTranslateX },
-              { rotate: rotateZ },
-            ],
-          },
-        ]}
-      >
-        <Icons.Reply size={18} color="#FFFFFF" />
-      </Animated.View>
-      
-      {/* Message content with swipe transform */}
-      <Animated.View
-        {...panResponder.panHandlers}
-        style={{ transform: [{ translateX }] }}
-      >
-        {children}
-      </Animated.View>
-    </View>
-  );
-};
-
-// ============================================
-// ANIMATED MESSAGE WRAPPER
-// ============================================
-
-interface AnimatedMessageProps {
-  children: React.ReactNode;
-  index: number;
-  isMine: boolean;
-  isNew?: boolean;
-}
-
-const AnimatedMessage: React.FC<AnimatedMessageProps> = ({ children, index, isMine, isNew = false }) => {
-  const animValue = useRef(new Animated.Value(isNew ? 0 : 1)).current;
-  
-  useEffect(() => {
-    if (isNew) {
-      Animated.spring(animValue, {
-        toValue: 1,
-        tension: 100,
-        friction: 12,
-        useNativeDriver: true,
-      }).start();
-    }
-  }, [isNew]);
-  
-  if (!isNew) {
-    return <View>{children}</View>;
-  }
-  
-  return (
-    <Animated.View
-      style={{
-        opacity: animValue,
-        transform: [
-          {
-            translateY: animValue.interpolate({
-              inputRange: [0, 1],
-              outputRange: [30, 0],
-            }),
-          },
-          {
-            scale: animValue.interpolate({
-              inputRange: [0, 0.5, 1],
-              outputRange: [0.9, 1.02, 1],
-            }),
-          },
-        ],
-      }}
-    >
-      {children}
-    </Animated.View>
-  );
-};
 
 // ============================================
 // EMPTY STATE COMPONENT
 // ============================================
 
 const EmptyState: React.FC<{ onInvite: () => void }> = ({ onInvite }) => {
+  // Component-local themed styles — flip with theme without a JS reload.
+  const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
   const iconAnim = useRef(new Animated.Value(0)).current;
   const fadeAnim = useRef(new Animated.Value(0)).current;
   
@@ -1288,10 +900,9 @@ const EmptyState: React.FC<{ onInvite: () => void }> = ({ onInvite }) => {
       </Animated.View>
       
       <Animated.View style={{ opacity: fadeAnim }}>
-        <Text style={styles.emptyTitle}>Commencez à discuter</Text>
+        <Text style={styles.emptyTitle}>{t('conversation.emptyTitle')}</Text>
         <Text style={styles.emptySubtitle}>
-          Vos messages sont chiffrés sur votre appareil.{'\n'}
-          Personne ne peut les lire, pas même le serveur.
+          {t('conversation.emptyDescription')}
         </Text>
         
         <TouchableOpacity 
@@ -1300,7 +911,7 @@ const EmptyState: React.FC<{ onInvite: () => void }> = ({ onInvite }) => {
           activeOpacity={0.8}
         >
           <View style={styles.emptyBtnGlow} />
-          <Text style={styles.emptyBtnText}>Inviter quelqu'un</Text>
+          <Text style={styles.emptyBtnText}>{t('conversation.inviteSomeone')}</Text>
         </TouchableOpacity>
       </Animated.View>
     </View>
@@ -1316,7 +927,27 @@ export function ConversationScreen() {
   const route = useRoute<ConversationRouteProp>();
   const { conversationId, conversationName, searchMode: initialSearchMode } = route.params;
   const insets = useSafeAreaInsets();
-  
+  const { t } = useTranslation();
+
+  // Live theme — for inline JSX colour reads (control button icons, etc.)
+  // and for the three themed StyleSheets below. The module-level `Colors`
+  // const still exists for legacy uses, but the StyleSheets we render with
+  // are recomputed when the palette changes.
+  const liveTheme = useTheme();
+  // Shadow the module-level `Colors` with a component-scoped one that
+  // tracks the live palette. Every `Colors.X` reference inside this
+  // function now reads from the live theme. eslint-disable-next-line
+  // because we genuinely want to shadow.
+  // eslint-disable-next-line @typescript-eslint/no-shadow
+  const Colors = useMemo(
+    () => makeColorsFromPalette(liveTheme.colors),
+    [liveTheme.colors],
+  );
+  const styles = useThemedStyles(makeStyles);
+  const voiceStyles = useThemedStyles(makeVoiceStyles);
+  // callStyles is built later (uses local component state), but still goes
+  // through useThemedStyles — see the callStyles assignment further down.
+
   // Responsive dimensions
   const { width: screenWidth } = useWindowDimensions();
   const maxBubbleWidth = screenWidth * 0.78;
@@ -1324,7 +955,6 @@ export function ConversationScreen() {
   const maxImageHeight = 280;
   
   // State
-  const [conversation, setConversation] = useState<StoredConversation | null>(null);
   const [inputText, setInputText] = useState('');
   const [showMenu, setShowMenu] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
@@ -1344,7 +974,6 @@ export function ConversationScreen() {
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [recordingWaveform, setRecordingWaveform] = useState<number[]>([]);
   const [sendingVoice, setSendingVoice] = useState(false);
-  const [voiceProgress, setVoiceProgress] = useState('');
   const [recordingLocked, setRecordingLocked] = useState(false);
   
   // Voice playback state (for tracking which voice message is playing)
@@ -1360,11 +989,7 @@ export function ConversationScreen() {
   const [showReactionPicker, setShowReactionPicker] = useState(false);
   const [reactionPosition, setReactionPosition] = useState({ x: 0, y: 0 });
   const [reactionMessageId, setReactionMessageId] = useState<string | null>(null);
-  
-  // Typing indicator state (would be connected to real-time in production)
-  const [isTyping, setIsTyping] = useState(false);
-  const [typingUser, setTypingUser] = useState<string | null>(null);
-  
+
   // Selection mode
   const [isSelectionMode, setIsSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -1422,7 +1047,6 @@ export function ConversationScreen() {
   // Voice recording animations
   const recordingAnim = useRef(new Animated.Value(0)).current;
   const recordingPulse = useRef(new Animated.Value(1)).current;
-  const recordingSlideX = useRef(new Animated.Value(0)).current;
   
   // FIX: Détection de fin d'appel pour Android.
   // Sur Android, quand le <Modal> d'appel se ferme, le TextInput natif
@@ -1482,7 +1106,31 @@ export function ConversationScreen() {
   }, [isInCall]);
 
   // Keyboard handling
+  // In Expo SDK 54 / RN 0.81 with edge-to-edge enabled by default,
+  // softwareKeyboardLayoutMode: 'resize' no longer auto-lifts the layout
+  // on Android. This JS-side animation IS what actually lifts the input
+  // bar — both on iOS and Android. Do NOT gate it by Platform.
   const keyboardHeight = useRef(new Animated.Value(0)).current;
+
+  // Bug #1 fix: react-native-safe-area-context can return insets.bottom=0
+  // on Android 15 edge-to-edge even when a real system nav bar is present
+  // (https://github.com/react-native-community/discussions-and-proposals/discussions/827).
+  // The previous `insets.bottom || Space.sm` collapsed to 8 px in that
+  // case, leaving the input partly behind the nav bar. We compute a
+  // robust fallback from Dimensions and take the largest of the three.
+  const reliableInsetBottom = useMemo(() => {
+    if (Platform.OS !== 'android') {
+      // iOS reports insets.bottom reliably; just floor at Space.sm
+      // so padding never goes below the visual minimum.
+      return Math.max(insets.bottom, Space.sm);
+    }
+    const screenH = Dimensions.get('screen').height;
+    const windowH = Dimensions.get('window').height;
+    const statusH = StatusBar.currentHeight || 0;
+    // screen − window − status ≈ system nav bar height (0 on gesture nav)
+    const computedNavBar = Math.max(0, screenH - windowH - statusH);
+    return Math.max(insets.bottom, computedNavBar, Space.sm);
+  }, [insets.bottom]);
 
   useEffect(() => {
     const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
@@ -1490,8 +1138,12 @@ export function ConversationScreen() {
 
     const onKeyboardShow = (event: any) => {
       const height = event.endCoordinates.height;
-      const adjustedHeight = Platform.OS === 'ios' 
-        ? height - insets.bottom 
+      // iOS: event.height includes the home-indicator area; subtract
+      //   insets.bottom because we add it back via paddingBottom.
+      // Android: event.height is just the IME body — the nav bar still
+      //   sits below it, so DON'T subtract; the inset gets added on top.
+      const adjustedHeight = Platform.OS === 'ios'
+        ? height - insets.bottom
         : height;
 
       Animated.timing(keyboardHeight, {
@@ -1527,7 +1179,6 @@ export function ConversationScreen() {
     sendImage: sendImageHook,
     sendFile: sendFileHook,
     sendVoice: sendVoiceHook,
-    addMessage,
     updateMessage,
     deleteMessages,
     deleteAllMessages,
@@ -1539,7 +1190,7 @@ export function ConversationScreen() {
   } = useUnifiedMessages(conversationId);
   
   // v25.0: Progression du media chunking (envoi/réception)
-  const { getSendProgress, receiveEntries, hasActiveTransfers } = useChunkingProgress(conversationId);
+  const { getSendProgress, receiveEntries } = useChunkingProgress(conversationId);
   
   
   // Track new messages for animation
@@ -1685,12 +1336,129 @@ export function ConversationScreen() {
     return latestAvatarByUser.get(msg.senderToken) || msg.avatarBase64 || conversationInfo?.avatarBase64;
   }, [latestAvatarByUser, myCurrentAvatar, conversationInfo]);
 
+  // ════════════════════════════════════════════════════════════════════════
+  // PERF FIX (3) : pré-calcul O(n) du groupement des messages.
+  // ════════════════════════════════════════════════════════════════════════
+  // AVANT : renderMessage appelait findPrevNonCallMessage / findNextNonCallMessage
+  //   (chacune O(n)) pour CHAQUE message → total O(n²) par render. À 100 messages
+  //   ça faisait 10 000 itérations à chaque keystroke dans l'input.
+  // APRÈS : un seul passage O(n) par changement de `messages`, mémoïsé. Indexable
+  //   par position. La FlatList se contente d'un .get(index) instantané.
+  //
+  // Aussi pré-calculé ici : showDate / dateLabel pour éviter le double scan
+  // que faisait shouldShowDateSeparator(index) à l'intérieur de renderMessage.
+  // ════════════════════════════════════════════════════════════════════════
+  const messageGroupingInfo = useMemo(() => {
+    const info: Array<{
+      prevMsg: LocalMessage | null;
+      nextMsg: LocalMessage | null;
+      showDate: boolean;
+      dateLabel: string;
+      isFirstOfGroup: boolean;
+      isLastOfGroup: boolean;
+    }> = [];
+
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return info;
+    }
+
+    // Helper local — duplique formatDateSeparator pour éviter une dépendance
+    // sur t() ailleurs (qui changerait la mémo à chaque language switch sinon).
+    const formatDate = (ts: number): string => {
+      const d = new Date(ts);
+      const now = new Date();
+      const y = new Date(now);
+      y.setDate(y.getDate() - 1);
+      if (d.toDateString() === now.toDateString()) return t('conversation.today');
+      if (d.toDateString() === y.toDateString()) return t('conversation.yesterday');
+      return d.toLocaleDateString(getActiveLanguage(), {
+        weekday: 'long', day: 'numeric', month: 'long',
+      });
+    };
+
+    const isCall = (m: LocalMessage) => isCallMessage(m.content);
+
+    // Premier passage : prev/next non-call (O(n) en cumulant les last-seen)
+    const prevNonCall: (LocalMessage | null)[] = new Array(messages.length).fill(null);
+    let lastNonCall: LocalMessage | null = null;
+    for (let i = 0; i < messages.length; i++) {
+      prevNonCall[i] = lastNonCall;
+      if (!isCall(messages[i])) lastNonCall = messages[i];
+    }
+    const nextNonCall: (LocalMessage | null)[] = new Array(messages.length).fill(null);
+    lastNonCall = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      nextNonCall[i] = lastNonCall;
+      if (!isCall(messages[i])) lastNonCall = messages[i];
+    }
+
+    // Deuxième passage : showDate, isFirstOfGroup, isLastOfGroup (O(n))
+    for (let i = 0; i < messages.length; i++) {
+      const item = messages[i];
+      const prev = i > 0 ? messages[i - 1] : null;
+      const next = i < messages.length - 1 ? messages[i + 1] : null;
+
+      // showDate : changement de jour entre i-1 et i (ou premier message)
+      const showDate = i === 0 || (prev
+        ? new Date(item.timestamp).toDateString() !== new Date(prev.timestamp).toDateString()
+        : false);
+
+      const dateLabel = showDate ? formatDate(item.timestamp) : '';
+
+      // Groupement (utilise prev/next non-call)
+      const pMsg = prevNonCall[i];
+      const nMsg = nextNonCall[i];
+
+      const nextShowDate = next
+        ? new Date(next.timestamp).toDateString() !== new Date(item.timestamp).toDateString()
+        : false;
+
+      const isFirstOfGroup = !pMsg
+        || pMsg.isMine !== item.isMine
+        || pMsg.senderToken !== item.senderToken
+        || showDate
+        || (item.timestamp - pMsg.timestamp > 60000);
+
+      const isLastOfGroup = !nMsg
+        || nMsg.isMine !== item.isMine
+        || nMsg.senderToken !== item.senderToken
+        || nextShowDate
+        || (nMsg.timestamp - item.timestamp > 60000);
+
+      info.push({
+        prevMsg: pMsg,
+        nextMsg: nMsg,
+        showDate,
+        dateLabel,
+        isFirstOfGroup,
+        isLastOfGroup,
+      });
+    }
+
+    return info;
+  }, [messages, t]);
+
+  // PERF FIX (3) : extraData stable pour FlatList.
+  // Sans ça, `extraData={[a, b, c]}` créait un nouveau tableau à chaque render
+  // → la sCU interne de FlatList échouait → toutes les cellules re-rendaient.
+  // Avec ce useMemo, la référence ne change que si une des valeurs sous-jacentes
+  // change RÉELLEMENT. Quand l'utilisateur tape dans l'input (40+ états dans ce
+  // screen, donc renders fréquents), aucune de ces valeurs ne change → cellules
+  // figées = scroll fluide, frappe fluide.
+  //
+  // v3 — Includes `liveTheme.scheme` so that when the user toggles theme,
+  // FlatList re-renders all visible cells with the new palette. Without
+  // this, already-mounted cells keep their captured styles and render in
+  // the previous theme until the user scrolls them out and back in.
+  const messageListExtraData = useMemo(() => ({
+    selectedIds,
+    newMessageIds,
+    searchResults,
+    currentSearchIndex,
+    themeScheme: liveTheme.scheme,
+  }), [selectedIds, newMessageIds, searchResults, currentSearchIndex, liveTheme.scheme]);
+
   // Effects
-  useEffect(() => {
-    getConversation(conversationId).then(setConversation);
-  }, [conversationId]);
-
-
   useEffect(() => {
     // v21.0: Ne pas scrollToEnd automatiquement en mode recherche
     if (messages && Array.isArray(messages) && messages.length > 0 && !isSelectionMode && !isSearchMode) {
@@ -1760,7 +1528,13 @@ export function ConversationScreen() {
     }).start();
   }, [showEmojiPicker]);
 
-  // Initialize voice service
+  // Initialize voice service (playback mode only — no microphone prompt)
+  // PERM FIX : depuis le refactor permissions, initializeVoiceService() ne
+  // prompt PLUS la permission micro. Il configure simplement le mode audio
+  // en lecture seule (allowsRecordingIOS: false) pour pouvoir jouer les
+  // vocaux reçus dans la conversation. La permission micro est demandée
+  // à la demande dans startRecording(), quand l'utilisateur appuie sur le
+  // bouton micro.
   useEffect(() => {
     initializeVoiceService();
     return () => {
@@ -1812,7 +1586,7 @@ export function ConversationScreen() {
 
   // Helpers
   const formatTime = (timestamp: number): string => {
-    return new Date(timestamp).toLocaleTimeString('fr-FR', { 
+    return new Date(timestamp).toLocaleTimeString(getActiveLanguage(), { 
       hour: '2-digit', 
       minute: '2-digit',
       hour12: false 
@@ -1825,10 +1599,10 @@ export function ConversationScreen() {
     const yesterday = new Date(now);
     yesterday.setDate(yesterday.getDate() - 1);
     
-    if (date.toDateString() === now.toDateString()) return "Aujourd'hui";
-    if (date.toDateString() === yesterday.toDateString()) return 'Hier';
+    if (date.toDateString() === now.toDateString()) return t('conversation.today');
+    if (date.toDateString() === yesterday.toDateString()) return t('conversation.yesterday');
     
-    return date.toLocaleDateString('fr-FR', {
+    return date.toLocaleDateString(getActiveLanguage(), {
       weekday: 'long',
       day: 'numeric',
       month: 'long',
@@ -1969,7 +1743,7 @@ export function ConversationScreen() {
     
     const success = await sendMessageHook(textToSend, replyData);
     if (!success) {
-      Alert.alert('Erreur', 'Impossible d\'envoyer le message');
+      Alert.alert(t('common.error'), t('conversation.errSendMessage'));
     }
   };
 
@@ -2036,36 +1810,14 @@ export function ConversationScreen() {
     setInputText(prev => prev + emoji);
   };
 
-  const handleCameraPress = async () => {
-    setShowEmojiPicker(false);
-    setShowAttachMenu(false);
-    suppressLock();
-    try {
-      const { status } = await ImagePicker.requestCameraPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission requise', 'Ghostr a besoin d\'accéder à votre caméra.');
-        return;
-      }
-      const result = await ImagePicker.launchCameraAsync({ quality: 0.8 });
-      if (!result.canceled && result.assets[0]) {
-        setSelectedImage(result.assets[0].uri);
-      }
-    } catch (error) {
-      Alert.alert('Erreur', 'Impossible de prendre la photo.');
-    } finally {
-      releaseLock();
-    }
-  };
-
   const handlePickGallery = async () => {
     setShowAttachMenu(false);
+    // PERM FIX : voir handleCameraPress.
+    const perm = await ensureMediaLibraryPermission();
+    if (perm.status !== 'granted') return;
+
     suppressLock();
     try {
-      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission requise', 'Ghostr a besoin d\'accéder à votre galerie.');
-        return;
-      }
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ["images"],
         quality: 0.8,
@@ -2074,7 +1826,7 @@ export function ConversationScreen() {
         setSelectedImage(result.assets[0].uri);
       }
     } catch (error) {
-      Alert.alert('Erreur', 'Impossible de sélectionner l\'image.');
+      Alert.alert(t('common.error'), t('conversation.errPickImage'));
     } finally {
       releaseLock();
     }
@@ -2082,19 +1834,18 @@ export function ConversationScreen() {
 
   const handlePickCamera = async () => {
     setShowAttachMenu(false);
+    // PERM FIX : voir handleCameraPress.
+    const perm = await ensureCameraPermission();
+    if (perm.status !== 'granted') return;
+
     suppressLock();
     try {
-      const { status } = await ImagePicker.requestCameraPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission requise', 'Ghostr a besoin d\'accéder à votre caméra.');
-        return;
-      }
       const result = await ImagePicker.launchCameraAsync({ quality: 0.8 });
       if (!result.canceled && result.assets[0]) {
         setSelectedImage(result.assets[0].uri);
       }
     } catch (error) {
-      Alert.alert('Erreur', 'Impossible de prendre la photo.');
+      Alert.alert(t('common.error'), t('conversation.errTakePhoto'));
     } finally {
       releaseLock();
     }
@@ -2109,13 +1860,16 @@ export function ConversationScreen() {
         // validateFileSize est async - il faut await!
         const validation = await validateFileSize(file.size);
         if (!validation.valid) {
-          Alert.alert('Fichier trop volumineux', validation.error || 'Le fichier dépasse la limite autorisée.');
+          Alert.alert(
+            t('conversation.fileTooLargeTitle'),
+            validation.error || t('conversation.fileTooLargeMessage'),
+          );
           return;
         }
         setSelectedFile(file);
       }
     } catch (error) {
-      Alert.alert('Erreur', 'Impossible de sélectionner le fichier.');
+      Alert.alert(t('conversation.filePickErrorTitle'), t('conversation.filePickError'));
     } finally {
       releaseLock();
     }
@@ -2190,7 +1944,7 @@ export function ConversationScreen() {
       setRecordingLocked(false);
       return true;
     } else {
-      Alert.alert('Erreur', 'Impossible de démarrer l\'enregistrement. Vérifiez les permissions du microphone.');
+      Alert.alert(t('common.error'), t('conversation.errStartRecording'));
       return false;
     }
   };
@@ -2211,7 +1965,7 @@ export function ConversationScreen() {
 
     // Envoyer le vocal si durée > 1 seconde
     if (result.duration < 1000) {
-      Alert.alert('Message trop court', 'L\'enregistrement doit durer au moins 1 seconde.');
+      Alert.alert(t('conversation.titleVoiceTooShort'), t('conversation.errVoiceTooShort'));
       setRecordingDuration(0);
       setRecordingWaveform([]);
       return;
@@ -2239,12 +1993,11 @@ export function ConversationScreen() {
     if (sendingVoice) return;
     
     setSendingVoice(true);
-    setVoiceProgress('Envoi...');
-    
+
     try {
       const success = await sendVoiceHook(uri, duration, waveform);
 
-      if (!success) throw new Error('Échec de l\'envoi du message vocal');
+      if (!success) throw new Error(i18n.t('errors.voiceSendFailed'));
 
       // Scroll vers le bas
       setTimeout(() => {
@@ -2252,10 +2005,9 @@ export function ConversationScreen() {
       }, 150);
 
     } catch (error: any) {
-      Alert.alert('Erreur', error.message || 'Impossible d\'envoyer le message vocal.');
+      Alert.alert(t('common.error'), error.message || t('conversation.errSendVoice'));
     } finally {
       setSendingVoice(false);
-      setVoiceProgress('');
     }
   };
 
@@ -2340,7 +2092,7 @@ export function ConversationScreen() {
       });
     } catch (error) {
       console.error('Error playing voice:', error);
-      Alert.alert('Erreur', 'Impossible de lire le message vocal.');
+      Alert.alert(t('common.error'), t('conversation.errPlayVoice'));
       setPlayingVoiceId(null);
       setIsVoicePlaying(false);
     }
@@ -2376,7 +2128,7 @@ export function ConversationScreen() {
       if (success) {
         exitSelectionMode();
       } else {
-        Alert.alert('Erreur', 'Échec de la suppression');
+        Alert.alert(t('common.error'), t('conversation.errDelete'));
       }
     } finally {
       setDeleteLoading(false);
@@ -2389,7 +2141,7 @@ export function ConversationScreen() {
     try {
       const success = await deleteAllMessages();
       if (!success) {
-        Alert.alert('Erreur', 'Échec de la suppression');
+        Alert.alert(t('common.error'), t('conversation.errDelete'));
       }
     } finally {
       setDeleteLoading(false);
@@ -2404,10 +2156,10 @@ export function ConversationScreen() {
         setShareMasterKey(masterKey);
         setShowShareModal(true);
       } else {
-        Alert.alert('Erreur', 'Impossible de récupérer la clé.');
+        Alert.alert(t('common.error'), t('conversation.errFetchKey'));
       }
     } catch (error) {
-      Alert.alert('Erreur', 'Impossible de récupérer la clé.');
+      Alert.alert(t('common.error'), t('conversation.errFetchKey'));
     }
   };
 
@@ -2432,7 +2184,7 @@ export function ConversationScreen() {
     const loadThumbnail = async () => {
       try {
         const keys = await getConversationKeys(conversationId);
-        if (!keys) throw new Error('Clés non trouvées');
+        if (!keys) throw new Error(i18n.t('errors.keysNotFound'));
         const storagePath = payload.storagePath || conversationId;
         // Construire l'URL publique pour la miniature
         const thumbUrl = getMediaPublicUrl(storagePath, payload.fileId, '_thumb');
@@ -2470,7 +2222,7 @@ export function ConversationScreen() {
         if (fullImage) setViewerImage(fullImage);
       } catch (e) {
         console.error('❌ handlePress (image) error:', e);
-        Alert.alert('Erreur', 'Impossible de charger l\'image.');
+        Alert.alert(t('common.error'), t('conversation.errLoadImage'));
       }
     };
     
@@ -2516,7 +2268,7 @@ export function ConversationScreen() {
             <View style={styles.imageError}>
               <Text style={styles.imageErrorIcon}>🖼️</Text>
               <TouchableOpacity style={styles.retryBtn} onPress={loadThumbnail}>
-                <Text style={styles.retryText}>Réessayer</Text>
+                <Text style={styles.retryText}>{t('common.retry')}</Text>
               </TouchableOpacity>
             </View>
           ) : (
@@ -2558,45 +2310,27 @@ export function ConversationScreen() {
   }> = ({ message, isMine, isFirstOfGroup, isLastOfGroup, timestamp, status }) => {
     const [downloading, setDownloading] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    
-    // v26.0: Résolution async du thumbnail mfs:// (doit être au top level — règles des hooks)
-    const [thumbUri, setThumbUri] = useState<string>(() => {
-      if (message.thumbnailData && !isMediaRef(message.thumbnailData)) {
-        return resolveImageUri(message.thumbnailData) || '';
-      }
-      return '';
-    });
-    React.useEffect(() => {
-      if (!message.thumbnailData) return;
-      if (isMediaRef(message.thumbnailData)) {
-        let m = true;
-        resolveMediaToBase64(message.thumbnailData).then(b64 => {
-          if (m && b64) setThumbUri(`data:image/jpeg;base64,${b64}`);
-        }).catch(() => {});
-        return () => { m = false; };
-      } else {
-        setThumbUri(resolveImageUri(message.thumbnailData) || '');
-      }
-    }, [message.thumbnailData]);
-    
-    // v26.0: AUTO-DOWNLOAD — télécharger le blob automatiquement à l'affichage
-    // Plus besoin de tap : le thumbnail s'affiche immédiatement pendant le download
+
+    // v28.0: AUTO-DOWNLOAD — on lance le téléchargement automatiquement
+    // 300 ms après l'apparition du placeholder. L'utilisateur voit le
+    // skeleton animé (forme native par type) pendant le déchiffrement,
+    // plutôt qu'une ligne fichier disgracieuse (cas des images/vocaux qui
+    // n'ont plus de thumbnail E2E depuis v27.1).
     const autoDownloadTriggered = React.useRef(false);
     React.useEffect(() => {
       if (!autoDownloadTriggered.current && message.blobId && message.blobKey && !downloading) {
         autoDownloadTriggered.current = true;
-        // Petit délai pour laisser le thumbnail s'afficher d'abord
         const timer = setTimeout(() => handleDownload(), 300);
         return () => clearTimeout(timer);
       }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [message.blobId, message.blobKey]);
-    
+
     const handleDownload = async () => {
       if (downloading) return;
       setDownloading(true);
       setError(null);
       try {
-        // Reconstruire un objet minimal pour downloadMediaBlob
         const sessionId = message.sessionId || message.conversationId;
         const msg1to1 = {
           id: message.id,
@@ -2611,7 +2345,6 @@ export function ConversationScreen() {
           blobNonce: message.blobNonce,
           blobSize: message.blobSize,
           blobMediaType: message.blobMediaType,
-          thumbnailData: message.thumbnailData,
           imageWidth: message.imageWidth,
           imageHeight: message.imageHeight,
           fileName: message.fileName,
@@ -2621,7 +2354,7 @@ export function ConversationScreen() {
         } as any;
         const result = await downloadMediaBlob(sessionId, msg1to1);
         if (!result.success) {
-          setError(result.error || 'Échec du téléchargement');
+          setError(result.error || t('conversation.downloadFailed'));
         } else if (result.base64Data) {
           // v26.0: Mettre à jour le state React pour trigger un re-render
           // Le message passera de BlobMediaPlaceholder à InlineImageBubble/etc.
@@ -2639,142 +2372,32 @@ export function ConversationScreen() {
           updateMessage(message.id, mediaUpdates);
         }
       } catch (e: any) {
-        setError(e.message || 'Erreur réseau');
+        setError(e.message || t('conversation.networkError'));
       } finally {
         setDownloading(false);
       }
     };
-    
-    const mediaType = message.blobMediaType || 'file';
-    
-    const getBorderRadius = () => {
-      const r = Radius.bubble.default;
-      const g = Radius.bubble.grouped;
-      if (isMine) {
-        return {
-          borderTopLeftRadius: r, borderTopRightRadius: isFirstOfGroup ? r : g,
-          borderBottomLeftRadius: r, borderBottomRightRadius: isLastOfGroup ? r : g,
-        };
-      }
-      return {
-        borderTopLeftRadius: isFirstOfGroup ? r : g, borderTopRightRadius: r,
-        borderBottomLeftRadius: isLastOfGroup ? r : g, borderBottomRightRadius: r,
-      };
-    };
-    
-    // IMAGE: thumbnail avec overlay de téléchargement
-    if (mediaType === 'image' && message.thumbnailData) {
-      const aspectRatio = (message.imageWidth || 200) / (message.imageHeight || 200);
-      let displayWidth = Math.min(maxImageWidth, message.imageWidth || 200);
-      let displayHeight = displayWidth / aspectRatio;
-      if (displayHeight > maxImageHeight) {
-        displayHeight = maxImageHeight;
-        displayWidth = displayHeight * aspectRatio;
-      }
-      
-      return (
-        <TouchableOpacity onPress={handleDownload} activeOpacity={0.7}>
-          <View style={[
-            styles.imageBubble,
-            { width: displayWidth, height: displayHeight },
-            getBorderRadius(),
-            { overflow: 'hidden' },
-          ]}>
-            {thumbUri ? (
-              <Image 
-                source={{ uri: thumbUri }} 
-                style={{ width: '100%', height: '100%', opacity: 0.6 }} 
-                resizeMode="cover"
-                blurRadius={2}
-              />
-            ) : (
-              <View style={{ width: '100%', height: '100%', backgroundColor: isMine ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)' }} />
-            )}
-            <View style={{
-              ...StyleSheet.absoluteFillObject,
-              justifyContent: 'center', alignItems: 'center',
-              backgroundColor: 'rgba(0,0,0,0.3)',
-            }}>
-              {downloading ? (
-                <ActivityIndicator size="large" color="#fff" />
-              ) : (
-                <View style={{ alignItems: 'center' }}>
-                  <Ionicons name="cloud-download-outline" size={36} color="#fff" />
-                  {error && <Text style={{ color: '#ff6b6b', fontSize: 11, marginTop: 4 }}>{error}</Text>}
-                </View>
-              )}
-            </View>
-            <View style={styles.imageMetaGradient}>
-              <View style={styles.imageMetaRow}>
-                <Text style={styles.imageMetaText}>{formatTime(timestamp)}</Text>
-                {isMine && status && (
-                  <View style={styles.imageMetaCheck}>
-                    {status === 'sending' && <Icons.StatusClock size={14} color="rgba(255,255,255,0.7)" />}
-                    {status === 'sent' && <Icons.SingleCheck size={14} color="rgba(255,255,255,0.7)" />}
-                    {(status === 'delivered' || status === 'read' || !status) && <Icons.DoubleCheck size={14} color="#53BDEB" />}
-                  </View>
-                )}
-              </View>
-            </View>
-          </View>
-        </TouchableOpacity>
-      );
-    }
-    
-    // FILE / VOICE / IMAGE sans thumbnail: bulle avec metadata + download
-    const fileSize = message.fileSize ? 
-      (message.fileSize > 1024 * 1024 
-        ? `${(message.fileSize / 1024 / 1024).toFixed(1)} MB`
-        : `${Math.round(message.fileSize / 1024)} KB`)
-      : '';
-    
-    const label = mediaType === 'voice'
-      ? `Message vocal ${message.voiceDuration ? Math.round(message.voiceDuration) + 's' : ''}`
-      : mediaType === 'file'
-        ? (message.fileName || 'Fichier')
-        : 'Image';
-    
-    const icon = mediaType === 'voice' ? 'mic-outline' : mediaType === 'file' ? 'document-outline' : 'image-outline';
-    
+
+    // v28.0: Délégation au nouveau composant qui choisit la forme native
+    // (image-shaped / voice-shaped / file-row) selon blobMediaType.
+    // Plus de fallback "ligne fichier" pour tous les types.
     return (
-      <TouchableOpacity onPress={handleDownload} activeOpacity={0.7}>
-        <View style={[
-          styles.bubble,
-          isMine ? styles.bubbleMine : styles.bubbleTheirs,
-          getBorderRadius(),
-          { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 14, gap: 10 },
-        ]}>
-          <View style={{
-            width: 42, height: 42, borderRadius: 21,
-            backgroundColor: isMine ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.08)',
-            justifyContent: 'center', alignItems: 'center',
-          }}>
-            {downloading ? (
-              <ActivityIndicator size="small" color={isMine ? '#fff' : '#007AFF'} />
-            ) : (
-              <Ionicons name={icon as any} size={20} color={isMine ? '#fff' : '#007AFF'} />
-            )}
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text style={[
-              { fontSize: 14, fontWeight: '500' },
-              isMine ? styles.messageTextMine : styles.messageTextTheirs,
-            ]} numberOfLines={1}>
-              {label}
-            </Text>
-            <Text style={{
-              fontSize: 11,
-              color: isMine ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.4)',
-              marginTop: 2,
-            }}>
-              {downloading ? 'Téléchargement...' : error || (fileSize ? `${fileSize} — Tap pour télécharger` : 'Tap pour télécharger')}
-            </Text>
-          </View>
-          {!downloading && (
-            <Ionicons name="cloud-download-outline" size={18} color={isMine ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.3)'} />
-          )}
-        </View>
-      </TouchableOpacity>
+      <NewBlobMediaPlaceholder
+        message={message as any}
+        isMine={isMine}
+        isFirstOfGroup={isFirstOfGroup}
+        isLastOfGroup={isLastOfGroup}
+        timestamp={timestamp}
+        status={status as any}
+        maxImageWidth={maxImageWidth}
+        maxImageHeight={maxImageHeight}
+        downloading={downloading}
+        error={error}
+        onPress={handleDownload}
+        formatTime={formatTime}
+        formatFileSize={formatFileSize}
+        getFileIcon={getFileIcon}
+      />
     );
   };
 
@@ -2793,8 +2416,6 @@ export function ConversationScreen() {
     timestamp: number;
     status?: MessageStatus;
   }> = ({ imageData, thumbnailData, width, height, isMine, isFirstOfGroup, isLastOfGroup, timestamp, status }) => {
-    const [showFull, setShowFull] = useState(false);
-    
     // Calculer les dimensions d'affichage
     const aspectRatio = width / height;
     let displayWidth = Math.min(maxImageWidth, width);
@@ -2889,7 +2510,7 @@ export function ConversationScreen() {
               backgroundColor: 'rgba(0,0,0,0.35)',
             }}>
               <ActivityIndicator size="large" color="#fff" />
-              <Text style={{ color: '#fff', fontSize: 11, marginTop: 6, fontWeight: '500' }}>Envoi chiffré...</Text>
+              <Text style={{ color: '#fff', fontSize: 11, marginTop: 6, fontWeight: '500' }}>{t('conversation.encryptedSending')}</Text>
             </View>
           )}
           <View style={styles.imageMetaGradient}>
@@ -2946,7 +2567,7 @@ export function ConversationScreen() {
         }
       } catch (e) {
         console.error('❌ InlineFileBubble error:', e);
-        Alert.alert('Erreur', 'Impossible d\'ouvrir le fichier.');
+        Alert.alert(t('common.error'), t('conversation.errOpenFile'));
       } finally {
         setDownloading(false);
       }
@@ -3006,17 +2627,24 @@ export function ConversationScreen() {
             </Text>
             <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 3 }}>
               <Text style={{ fontSize: 12, color: isMine ? 'rgba(255,255,255,0.6)' : Colors.text.secondary }}>
-                {status === 'sending' ? 'Envoi chiffré...' : formatFileSize(fileSize)}
+                {status === 'sending' ? t('conversation.encryptedSending') : formatFileSize(fileSize)}
               </Text>
               <View style={{ flex: 1 }} />
-              <Text style={{ fontSize: 11, color: isMine ? 'rgba(255,255,255,0.55)' : 'rgba(0,0,0,0.4)', marginRight: 4 }}>
+              {/* Theirs : utiliser une couleur de palette pour rester visible
+                  en dark ET light. Mine : la bulle est teal sur les deux thèmes
+                  → blanc translucide est correct. */}
+              <Text style={{ fontSize: 11, color: isMine ? 'rgba(255,255,255,0.55)' : Colors.text.tertiary, marginRight: 4 }}>
                 {formatTime(timestamp)}
               </Text>
               {isMine && (
                 <View>
-                  {status === 'sending' && <Icons.StatusClock size={14} color={isMine ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.4)'} />}
-                  {status === 'sent' && <Icons.SingleCheck size={14} color={isMine ? 'rgba(255,255,255,0.7)' : 'rgba(0,0,0,0.5)'} />}
-                  {status === 'delivered' && <Icons.DoubleCheck size={14} color={isMine ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.6)'} />}
+                  {/* Bulle "mine" = teal sur les deux thèmes : on garde les
+                      check-marks en blanc translucide, comme dans les autres
+                      bulles (image/voice/file). Le branch `:` n'est jamais
+                      atteint puisqu'on est dans `isMine && (...)`. */}
+                  {status === 'sending' && <Icons.StatusClock size={14} color="rgba(255,255,255,0.6)" />}
+                  {status === 'sent' && <Icons.SingleCheck size={14} color="rgba(255,255,255,0.7)" />}
+                  {status === 'delivered' && <Icons.DoubleCheck size={14} color="rgba(255,255,255,0.85)" />}
                   {(status === 'read' || !status) && <Icons.DoubleCheck size={14} color="#53BDEB" />}
                 </View>
               )}
@@ -3077,7 +2705,7 @@ export function ConversationScreen() {
         setIsPlaying(true);
       } catch (e) {
         console.error('❌ InlineVoiceBubble play error:', e);
-        Alert.alert('Erreur', 'Impossible de lire le message vocal.');
+        Alert.alert(t('common.error'), t('conversation.errPlayVoice'));
       } finally {
         setLoading(false);
       }
@@ -3182,7 +2810,7 @@ export function ConversationScreen() {
       setDownloading(true);
       try {
         const keys = await getConversationKeys(conversationId);
-        if (!keys) throw new Error('Clés non trouvées');
+        if (!keys) throw new Error(i18n.t('errors.keysNotFound'));
         const storagePath = payload.storagePath || conversationId;
         // Construire l'URL publique pour le fichier
         const fileUrl = getMediaPublicUrl(storagePath, payload.fileId, '');
@@ -3200,7 +2828,7 @@ export function ConversationScreen() {
         }
       } catch (e) {
         console.error('❌ handlePress (file) error:', e);
-        Alert.alert('Erreur', 'Impossible d\'ouvrir le fichier.');
+        Alert.alert(t('common.error'), t('conversation.errOpenFile'));
       } finally {
         setDownloading(false);
       }
@@ -3368,9 +2996,7 @@ export function ConversationScreen() {
     
     // Affichage de la durée :
     // - Si en cours de lecture : afficher la position actuelle
-    // - Si la lecture est terminée (position >= duration) : afficher la durée totale
     // - Sinon : afficher la durée totale du message
-    const isFinished = isThisPlaying && !isPlaying && voicePlaybackPosition >= voicePlaybackDuration - 100;
     const displayDuration = isThisPlaying && isPlaying && voicePlaybackDuration > 0
       ? formatVoiceDuration(voicePlaybackPosition)
       : formatVoiceDuration(payload.metadata?.duration || 0);
@@ -3531,22 +3157,34 @@ export function ConversationScreen() {
   // ============================================
   // RENDER MESSAGE
   // ============================================
-  
+  // PERF FIX (3) : pas de useCallback ici — la liste des dépendances de closure
+  // serait > 30 éléments (états, handlers, helpers tous définis dans le scope
+  // parent). Maintenir cette liste à jour serait une source de bugs (stale
+  // closures). À la place, on stabilise `extraData` côté FlatList plus bas :
+  // les cellules déjà rendues ne sont pas re-rendues quand renderItem change
+  // de référence ; FlatList ne ré-exécute renderItem que pour les nouvelles
+  // cellules (scroll), qui capturent alors les handlers à jour. Bénéfice
+  // identique à useCallback, sans le risque de dépendances oubliées.
   const renderMessage = ({ item, index }: { item: MessageWithStatus; index: number }) => {
     if (!messages || !Array.isArray(messages)) return null;
-    
+
     const isSelected = selectedIds.has(item.id);
-    const showDate = shouldShowDateSeparator(index);
-    const isImage = isImageMessage(item);  // v16.0: Passer l'item complet
-    const isFile = isFileMessage(item);    // v16.0: Passer l'item complet
-    const isVoice = isVoiceMessage(item);  // v16.0: Passer l'item complet
-    const isCall = isCallMessage(item.content);  // v15.2: Détecter les messages d'appel
-    const imagePayload = isImage && !item.imageData ? getImagePayload(item) : null;  // Ancien système uniquement
+
+    // PERF FIX (3) : on lit le pré-calcul mémoïsé au lieu de scanner.
+    // Fallback inline pour le cas (théorique) où l'index dépasse — sécurité.
+    const groupInfo = messageGroupingInfo[index];
+    const showDate = groupInfo ? groupInfo.showDate : shouldShowDateSeparator(index);
+
+    const isImage = isImageMessage(item);
+    const isFile = isFileMessage(item);
+    const isVoice = isVoiceMessage(item);
+    const isCall = isCallMessage(item.content);
+    const imagePayload = isImage && !item.imageData ? getImagePayload(item) : null;
     const filePayload = isFile && !item.fileData ? getFilePayload(item) : null;
     const voicePayload = isVoice && !item.voiceData ? getVoicePayload(item) : null;
-    const callPayload = isCall ? getCallPayload(item.content) : null;  // v15.2
+    const callPayload = isCall ? getCallPayload(item.content) : null;
     const isNew = newMessageIds.has(item.id);
-    
+
     // v15.2: Les messages d'appel sont centrés et n'ont pas de groupement
     if (isCall && callPayload) {
       return (
@@ -3554,12 +3192,14 @@ export function ConversationScreen() {
           {showDate && (
             <View style={styles.dateSeparator}>
               <View style={styles.dateLine} />
-              <Text style={styles.dateText}>{formatDateSeparator(item.timestamp)}</Text>
+              <Text style={styles.dateText}>
+                {groupInfo ? groupInfo.dateLabel : formatDateSeparator(item.timestamp)}
+              </Text>
               <View style={styles.dateLine} />
             </View>
           )}
-          <CallMessageBubble 
-            payload={callPayload} 
+          <CallMessageBubble
+            payload={callPayload}
             timestamp={item.timestamp}
             isMine={item.isMine}
             callerName={item.displayName}
@@ -3567,43 +3207,10 @@ export function ConversationScreen() {
         </View>
       );
     }
-    
-    // v15.2: Helper pour trouver le message précédent/suivant en ignorant les messages d'appel
-    // Les messages d'appel ne doivent pas affecter le groupement des autres messages
-    const findPrevNonCallMessage = (idx: number): LocalMessage | null => {
-      for (let i = idx - 1; i >= 0; i--) {
-        if (!isCallMessage(messages[i].content)) {
-          return messages[i];
-        }
-      }
-      return null;
-    };
-    
-    const findNextNonCallMessage = (idx: number): LocalMessage | null => {
-      for (let i = idx + 1; i < messages.length; i++) {
-        if (!isCallMessage(messages[i].content)) {
-          return messages[i];
-        }
-      }
-      return null;
-    };
-    
-    // Grouping logic - with safety checks
-    // v15.2: Ignorer les messages d'appel dans le groupement
-    const prevMsg = findPrevNonCallMessage(index);
-    const nextMsg = findNextNonCallMessage(index);
-    
-    const isFirstOfGroup = !prevMsg || 
-      prevMsg.isMine !== item.isMine || 
-      prevMsg.senderToken !== item.senderToken || 
-      shouldShowDateSeparator(index) ||
-      (item.timestamp - prevMsg.timestamp > 60000);
-    
-    const isLastOfGroup = !nextMsg || 
-      nextMsg.isMine !== item.isMine || 
-      nextMsg.senderToken !== item.senderToken || 
-      (index < messages.length - 1 && shouldShowDateSeparator(index + 1)) ||
-      (nextMsg && nextMsg.timestamp - item.timestamp > 60000);
+
+    // PERF FIX (3) : groupement via pré-calcul O(n) (avant: O(n²) par render).
+    const isFirstOfGroup = groupInfo ? groupInfo.isFirstOfGroup : true;
+    const isLastOfGroup = groupInfo ? groupInfo.isLastOfGroup : true;
     
     const showAvatar = isLastOfGroup;
     const senderColor = generateColorFromToken(item.senderToken);
@@ -3901,9 +3508,6 @@ export function ConversationScreen() {
                 isCurrentSearchResult(item.id) && styles.bubbleSearchActive,
                 isSearchResult(item.id) && !isCurrentSearchResult(item.id) && styles.bubbleSearchMatch,
               ]}>
-                {/* Quoted message if replying */}
-                {/* In production, check if item has replyToId and render QuotedMessage */}
-                
                 <Text style={[
                   styles.messageText,
                   item.isMine ? styles.messageTextMine : styles.messageTextTheirs,
@@ -3951,7 +3555,7 @@ export function ConversationScreen() {
               activeOpacity={0.7}
             >
               <Ionicons name="refresh" size={13} color="#E74C3C" />
-              <Text style={styles.failedActionText}>Réessayer</Text>
+              <Text style={styles.failedActionText}>{t('common.retry')}</Text>
             </TouchableOpacity>
             <View style={styles.failedActionSep} />
             <TouchableOpacity 
@@ -3959,8 +3563,12 @@ export function ConversationScreen() {
               onPress={() => deleteFailedMessage(item.id)}
               activeOpacity={0.7}
             >
-              <Ionicons name="trash-outline" size={13} color="rgba(255,255,255,0.4)" />
-              <Text style={[styles.failedActionText, { color: 'rgba(255,255,255,0.4)' }]}>Supprimer</Text>
+              {/* Le bouton "supprimer" est volontairement plus discret que
+                  "Réessayer" (qui reste rouge). `text.tertiary` (textMuted)
+                  est lisible sur les deux thèmes — la version précédente
+                  utilisait rgba(255,255,255,0.4) qui disparaissait en light. */}
+              <Ionicons name="trash-outline" size={13} color={Colors.text.tertiary} />
+              <Text style={[styles.failedActionText, { color: Colors.text.tertiary }]}>{t('common.delete')}</Text>
             </TouchableOpacity>
           </View>
         )}
@@ -4027,7 +3635,7 @@ export function ConversationScreen() {
                 <TextInput
                   ref={searchInputRef}
                   style={styles.searchInput}
-                  placeholder="Rechercher dans la conversation..."
+                  placeholder={t('conversation.searchPlaceholder')}
                   placeholderTextColor={Colors.text.tertiary}
                   value={searchQuery}
                   onChangeText={setSearchQuery}
@@ -4047,10 +3655,10 @@ export function ConversationScreen() {
               <View style={styles.searchResultsBar}>
                 <Text style={styles.searchResultsText}>
                   {searchResults.length === 0 
-                    ? 'Aucun résultat' 
+                    ? t('conversation.searchNoResults') 
                     : searchResults.length === 1
-                      ? '1 résultat'
-                      : `${currentSearchIndex + 1} sur ${searchResults.length}`
+                      ? t('conversation.searchOneResult')
+                      : t('conversation.searchPosition', { current: currentSearchIndex + 1, total: searchResults.length })
                   }
                 </Text>
                 
@@ -4124,7 +3732,14 @@ export function ConversationScreen() {
           <FlatList
             ref={flatListRef}
             data={messages || []}
-            extraData={[messages, selectedIds, newMessageIds, searchResults, currentSearchIndex]}
+            // PERF FIX (3) : extraData mémoïsé. Avant, c'était `[messages, ...]`
+            // recréé à chaque render → FlatList voyait une nouvelle référence et
+            // re-rendait TOUTES les cellules à chaque keystroke (40 useState dans
+            // cet écran, beaucoup d'événements asynchrones → renders fréquents).
+            // Maintenant, la référence ne change que quand un de ces états change
+            // VRAIMENT → cellules stables = pas de re-render gratuit.
+            // C'est LA seule optimisation qui change la sensation de fluidité.
+            extraData={messageListExtraData}
             keyExtractor={(item) => item.id}
             renderItem={renderMessage}
             removeClippedSubviews={false}
@@ -4167,7 +3782,6 @@ export function ConversationScreen() {
                     />
                   </View>
                 ))}
-                {isTyping && <TypingIndicator senderName={typingUser || undefined} />}
                 {/* Spacer pour éviter que le dernier message soit collé à l'input */}
                 <View style={styles.listFooterSpacer} />
               </>
@@ -4176,7 +3790,7 @@ export function ConversationScreen() {
               loading ? (
                 <View style={styles.loadingWrap}>
                   <ActivityIndicator size="large" color={Colors.accent.primary} />
-                  <Text style={styles.loadingText}>Chargement des messages...</Text>
+                  <Text style={styles.loadingText}>{t('conversation.loadingMessages')}</Text>
                 </View>
               ) : (
                 <EmptyState onInvite={handleOpenShare} />
@@ -4213,21 +3827,21 @@ export function ConversationScreen() {
                   <View style={[styles.attachIconCircle, { backgroundColor: '#BF59CF' }]}>
                     <Icons.Image size={24} color="#FFF" />
                   </View>
-                  <Text style={styles.attachLabel}>Galerie</Text>
+                  <Text style={styles.attachLabel}>{t('conversation.attachmentGallery')}</Text>
                 </TouchableOpacity>
                 
                 <TouchableOpacity style={styles.attachItem} onPress={handlePickCamera} activeOpacity={0.7}>
                   <View style={[styles.attachIconCircle, { backgroundColor: '#D3455B' }]}>
                     <Icons.Camera size={24} color="#FFF" />
                   </View>
-                  <Text style={styles.attachLabel}>Caméra</Text>
+                  <Text style={styles.attachLabel}>{t('conversation.attachmentCamera')}</Text>
                 </TouchableOpacity>
                 
                 <TouchableOpacity style={styles.attachItem} onPress={handlePickFile} activeOpacity={0.7}>
                   <View style={[styles.attachIconCircle, { backgroundColor: '#0795DC' }]}>
                     <Icons.File size={24} color="#FFF" />
                   </View>
-                  <Text style={styles.attachLabel}>Document</Text>
+                  <Text style={styles.attachLabel}>{t('conversation.attachmentDocument')}</Text>
                 </TouchableOpacity>
               </View>
             </Animated.View>
@@ -4253,7 +3867,7 @@ export function ConversationScreen() {
                 contentContainerStyle={styles.emojiGrid}
               >
                 <View style={styles.emojiSection}>
-                  <Text style={styles.emojiSectionTitle}>Smileys</Text>
+                  <Text style={styles.emojiSectionTitle}>{t('conversation.emojiSmileys')}</Text>
                   <View style={styles.emojiRow}>
                     {['😀', '😃', '😄', '😁', '😅', '😂', '🤣', '😊', '😇', '🙂', '😉', '😍', '🥰', '😘', '😋', '😜', '🤪', '😎', '🤩', '🥳', '😏', '😒', '🙄', '😬', '😌', '😔', '😢', '😭', '😱', '😡', '🥺', '😴'].map((emoji, i) => (
                       <TouchableOpacity 
@@ -4268,7 +3882,7 @@ export function ConversationScreen() {
                   </View>
                 </View>
                 <View style={styles.emojiSection}>
-                  <Text style={styles.emojiSectionTitle}>Gestes</Text>
+                  <Text style={styles.emojiSectionTitle}>{t('conversation.emojiGestures')}</Text>
                   <View style={styles.emojiRow}>
                     {['👍', '👎', '👌', '✌️', '🤞', '🤟', '🤘', '🤙', '👋', '🙌', '👏', '🙏', '💪', '🖐️', '✋', '🤚'].map((emoji, i) => (
                       <TouchableOpacity 
@@ -4283,7 +3897,7 @@ export function ConversationScreen() {
                   </View>
                 </View>
                 <View style={styles.emojiSection}>
-                  <Text style={styles.emojiSectionTitle}>Objets</Text>
+                  <Text style={styles.emojiSectionTitle}>{t('conversation.emojiObjects')}</Text>
                   <View style={styles.emojiRow}>
                     {['❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '💔', '❤️‍🔥', '💯', '💥', '✨', '🔥', '⭐', '🌟', '💫'].map((emoji, i) => (
                       <TouchableOpacity 
@@ -4309,6 +3923,11 @@ export function ConversationScreen() {
             <Animated.View 
               style={[
                 styles.lockedRecordingBar,
+                // Bug #2 fix: keep the trash/waveform/send row above the
+                // home indicator and out of the rounded-corner clip area.
+                // reliableInsetBottom handles the Android 15 edge-to-edge
+                // case where insets.bottom=0 incorrectly.
+                { paddingBottom: reliableInsetBottom + Space.md },
                 {
                   opacity: recordingAnim,
                   transform: [{
@@ -4376,7 +3995,12 @@ export function ConversationScreen() {
           {!recordingLocked && (
             <Animated.View style={[
               styles.inputBar,
-              { paddingBottom: Animated.add(keyboardHeight, insets.bottom || Space.sm) }
+              // Bug #1 fix: keyboardHeight is what actually lifts the
+              // input above the IME on BOTH platforms in Expo SDK 54
+              // (the OS no longer auto-resizes in edge-to-edge mode).
+              // reliableInsetBottom clears the system nav bar and works
+              // around the Android 15 insets.bottom=0 regression.
+              { paddingBottom: Animated.add(keyboardHeight, reliableInsetBottom) }
             ]}>
               <View style={styles.inputRow}>
                 {/* Emoji button - caché pendant l'enregistrement */}
@@ -4410,7 +4034,7 @@ export function ConversationScreen() {
                     {/* Texte "Glisser pour annuler" avec animation */}
                     <View style={styles.recordingSlideHint}>
                       <Ionicons name="chevron-back" size={14} color={Colors.text.tertiary} />
-                      <Text style={styles.recordingSlideText}>Glisser pour annuler</Text>
+                      <Text style={styles.recordingSlideText}>{t('conversation.swipeToCancel')}</Text>
                     </View>
                     
                     {/* Indicateur rouge + Durée */}
@@ -4434,7 +4058,7 @@ export function ConversationScreen() {
                       style={styles.textInput}
                       value={inputText}
                       onChangeText={setInputText}
-                      placeholder="Message"
+                      placeholder={t('conversation.messageInputPlaceholder')}
                       placeholderTextColor={Colors.text.tertiary}
                       multiline
                       onFocus={handleInputFocus}
@@ -4505,7 +4129,7 @@ export function ConversationScreen() {
               <TouchableOpacity style={styles.previewClose} onPress={() => setSelectedImage(null)}>
                 <Icons.Close size={24} color="#FFF" />
               </TouchableOpacity>
-              <Text style={styles.previewTitle}>Aperçu</Text>
+              <Text style={styles.previewTitle}>{t('conversation.previewTitle')}</Text>
               <View style={{ width: 48 }} />
             </View>
             
@@ -4518,15 +4142,21 @@ export function ConversationScreen() {
               </View>
             )}
             
-            <View style={styles.previewFooter}>
-              <Text style={styles.previewHint}>🔐 Chiffré avant l'envoi</Text>
+            <View style={[
+              styles.previewFooter,
+              // Bug #4 fix: lift Cancel/Send above the home indicator and
+              // edge-to-edge Android nav bar. reliableInsetBottom covers
+              // the Android 15 insets.bottom=0 regression too.
+              { paddingBottom: reliableInsetBottom + Space.xl },
+            ]}>
+              <Text style={styles.previewHint}>{t('conversation.encryptedBeforeSending')}</Text>
               <View style={styles.previewActions}>
                 <TouchableOpacity 
                   style={styles.previewCancelBtn} 
                   onPress={() => setSelectedImage(null)}
                   disabled={sendingImage}
                 >
-                  <Text style={styles.previewCancelText}>Annuler</Text>
+                  <Text style={styles.previewCancelText}>{t('common.cancel')}</Text>
                 </TouchableOpacity>
                 <TouchableOpacity 
                   style={styles.previewSendBtn} 
@@ -4534,7 +4164,7 @@ export function ConversationScreen() {
                   disabled={sendingImage}
                 >
                   <Icons.Send size={18} color="#FFF" />
-                  <Text style={styles.previewSendText}>Envoyer</Text>
+                  <Text style={styles.previewSendText}>{t('common.send')}</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -4550,7 +4180,7 @@ export function ConversationScreen() {
               <TouchableOpacity style={styles.previewClose} onPress={() => setSelectedFile(null)}>
                 <Icons.Close size={24} color="#FFF" />
               </TouchableOpacity>
-              <Text style={styles.previewTitle}>Fichier</Text>
+              <Text style={styles.previewTitle}>{t('conversation.fileTitle')}</Text>
               <View style={{ width: 48 }} />
             </View>
             
@@ -4569,15 +4199,19 @@ export function ConversationScreen() {
               </View>
             )}
             
-            <View style={styles.previewFooter}>
-              <Text style={styles.previewHint}>🔐 Chiffré avant l'envoi</Text>
+            <View style={[
+              styles.previewFooter,
+              // Bug #4 fix: same safe-area lift as the image preview footer.
+              { paddingBottom: reliableInsetBottom + Space.xl },
+            ]}>
+              <Text style={styles.previewHint}>{t('conversation.encryptedBeforeSending')}</Text>
               <View style={styles.previewActions}>
                 <TouchableOpacity 
                   style={styles.previewCancelBtn} 
                   onPress={() => setSelectedFile(null)}
                   disabled={sendingFile}
                 >
-                  <Text style={styles.previewCancelText}>Annuler</Text>
+                  <Text style={styles.previewCancelText}>{t('common.cancel')}</Text>
                 </TouchableOpacity>
                 <TouchableOpacity 
                   style={styles.previewSendBtn} 
@@ -4585,7 +4219,7 @@ export function ConversationScreen() {
                   disabled={sendingFile}
                 >
                   <Icons.Send size={18} color="#FFF" />
-                  <Text style={styles.previewSendText}>Envoyer</Text>
+                  <Text style={styles.previewSendText}>{t('common.send')}</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -4605,12 +4239,15 @@ export function ConversationScreen() {
               <TouchableOpacity 
                 style={styles.viewerDownload}
                 onPress={async () => {
+                  // PERM FIX : ensureSaveToLibraryPermission gère :
+                  //   - suppressLock/releaseLock pendant le dialog
+                  //   - Android API 29+ → granted automatique (Scoped Storage)
+                  //   - iOS NSPhotoLibraryAdd avec distinction denied/blocked
+                  //   - Alert avec lien Settings si bloqué
+                  const perm = await ensureSaveToLibraryPermission();
+                  if (perm.status !== 'granted') return;
+
                   try {
-                    const { status } = await MediaLibrary.requestPermissionsAsync();
-                    if (status !== 'granted') {
-                      Alert.alert('Permission requise', 'Ghostr a besoin d\'accéder à votre galerie.');
-                      return;
-                    }
                     // v25.2: saveToLibraryAsync nécessite un file URI local
                     let saveUri = viewerImage;
                     if (viewerImage.startsWith('data:')) {
@@ -4620,9 +4257,9 @@ export function ConversationScreen() {
                       await FileSystem.writeAsStringAsync(saveUri, b64, { encoding: FileSystem.EncodingType.Base64 });
                     }
                     await MediaLibrary.saveToLibraryAsync(saveUri);
-                    Alert.alert('Succès', 'Image enregistrée dans la galerie');
+                    Alert.alert(t('conversation.imageSavedTitle'), t('conversation.imageSavedMessage'));
                   } catch (e) {
-                    Alert.alert('Erreur', 'Impossible de sauvegarder l\'image');
+                    Alert.alert(t('common.error'), t('conversation.errSaveImage'));
                   }
                 }}
               >
@@ -4662,7 +4299,7 @@ export function ConversationScreen() {
               style={styles.profileModalCloseButton}
               onPress={() => setProfileModalVisible(false)}
             >
-              <Text style={styles.profileModalCloseText}>Fermer</Text>
+              <Text style={styles.profileModalCloseText}>{t('common.close')}</Text>
             </TouchableOpacity>
           </View>
         </Pressable>
@@ -4673,8 +4310,8 @@ export function ConversationScreen() {
         visible={showMenu}
         onClose={() => setShowMenu(false)}
         items={[
-          { title: 'Inviter quelqu\'un', onPress: handleOpenShare },
-          { title: 'Supprimer tous les messages', onPress: () => setShowDeleteAllConfirm(true), destructive: true },
+          { title: t('conversation.inviteSomeone'), onPress: handleOpenShare },
+          { title: t('conversation.deleteAllTitle'), onPress: () => setShowDeleteAllConfirm(true), destructive: true },
         ]}
       />
 
@@ -4692,16 +4329,16 @@ export function ConversationScreen() {
       <AlertModal
         visible={showDeleteConfirm}
         onClose={() => setShowDeleteConfirm(false)}
-        title="Supprimer les messages"
-        message={`Voulez-vous vraiment supprimer ${selectedIds.size} message(s) ? Cette action est irréversible.`}
+        title={t('conversation.deleteMessagesTitle')}
+        message={t('conversation.deleteMessagesConfirm', { count: selectedIds.size })}
         primaryButton={{
-          title: 'Supprimer',
+          title: t('common.delete'),
           onPress: handleDeleteSelected,
           variant: 'danger',
           loading: deleteLoading,
         }}
         secondaryButton={{
-          title: 'Annuler',
+          title: t('common.cancel'),
           onPress: () => setShowDeleteConfirm(false),
         }}
       />
@@ -4710,16 +4347,16 @@ export function ConversationScreen() {
       <AlertModal
         visible={showDeleteAllConfirm}
         onClose={() => setShowDeleteAllConfirm(false)}
-        title="Supprimer tous les messages"
-        message="Voulez-vous vraiment supprimer tous les messages de cette conversation ? Cette action est irréversible."
+        title={t('conversation.deleteAllTitle')}
+        message={t('conversation.deleteAllConfirm')}
         primaryButton={{
-          title: 'Tout supprimer',
+          title: t('conversation.deleteAll'),
           onPress: handleDeleteAll,
           variant: 'danger',
           loading: deleteLoading,
         }}
         secondaryButton={{
-          title: 'Annuler',
+          title: t('common.cancel'),
           onPress: () => setShowDeleteAllConfirm(false),
         }}
       />
@@ -4728,11 +4365,17 @@ export function ConversationScreen() {
   );
 }
 
-// ============================================
-// STYLES
-// ============================================
+// ════════════════════════════════════════════════════════════════════════════
+// THEMED STYLESHEETS
+// ════════════════════════════════════════════════════════════════════════════
+// The `styles` and `voiceStyles` declarations below are now FACTORIES that
+// take a ColorPalette and return the same StyleSheet shape. The component
+// calls `useThemedStyles(makeStyles)` to get a live, palette-keyed instance.
+// On theme switch, the StyleSheet is rebuilt and every consumer re-renders.
 
-const styles = StyleSheet.create({
+const makeStyles = (c: ColorPalette) => {
+  const Colors = makeColorsFromPalette(c);
+  return StyleSheet.create({
   container: { 
     flex: 1, 
     backgroundColor: Colors.bg.primary,
@@ -5227,10 +4870,15 @@ const styles = StyleSheet.create({
     fontSize: 11,
   },
   timestampMine: { 
+    // Bulle "mine" = teal sur les deux thèmes → texte blanc translucide OK.
     color: 'rgba(255,255,255,0.6)',
   },
   timestampTheirs: { 
-    color: 'rgba(255,255,255,0.5)',
+    // Bulle "theirs" = surface sombre en dark / gris clair en light.
+    // `text.tertiary` (= `textMuted`) reste contrasté dans les deux cas :
+    //  - dark  : #5D7485 sur #1A252F  (~3.5:1)
+    //  - light : #7D8E9F sur #EEF2F6  (~3.2:1)
+    color: Colors.text.tertiary,
   },
   
   // P7 FIX: Failed message retry/delete actions
@@ -5257,7 +4905,10 @@ const styles = StyleSheet.create({
   failedActionSep: {
     width: 1,
     height: 12,
-    backgroundColor: 'rgba(255,255,255,0.15)',
+    // Séparateur entre "Réessayer" et "Supprimer" : ui.border est tuné par
+    // scheme (blanc-transparent en dark, noir-transparent en light) → reste
+    // visible mais discret sur les deux thèmes.
+    backgroundColor: Colors.ui.border,
     marginHorizontal: 2,
   },
   
@@ -5704,7 +5355,11 @@ const styles = StyleSheet.create({
     marginTop: Space.sm,
   },
   previewFooter: { 
-    padding: Space.xl, 
+    paddingHorizontal: Space.xl, 
+    paddingTop: Space.xl,
+    // paddingBottom is set inline at the call site so it can use
+    // insets.bottom — see bug #4 fix in the image/file preview modals.
+    paddingBottom: Space.xl,
     backgroundColor: Colors.bg.secondary, 
     borderTopWidth: 1, 
     borderTopColor: Colors.ui.borderLight,
@@ -6066,10 +5721,13 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 5,
   },
-});
+  });
+};
 
 // Voice message bubble styles
-const voiceStyles = StyleSheet.create({
+const makeVoiceStyles = (c: ColorPalette) => {
+  const Colors = makeColorsFromPalette(c);
+  return StyleSheet.create({
   voiceBubble: {
     minWidth: 200,
     maxWidth: 280,
@@ -6141,6 +5799,7 @@ const voiceStyles = StyleSheet.create({
   voiceStatus: {
     marginLeft: 2,
   },
-});
+  });
+};
 
 export default ConversationScreen;

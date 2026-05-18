@@ -29,71 +29,13 @@
 //
 // RÉFÉRENCE: Signal Protocol + PQXDH + Triple Ratchet (2024-2025)
 
-import {
-  SymmetricKey,
-  ChainKey,
-  RootKey,
-  MessageKey,
-  HeaderKey,
-  X25519KeyPair,
-  X25519PublicKey,
-  IdentityKeyPair,
-  DoubleRatchetState,
-  EncryptedMessage,
-  CRYPTO_CONSTANTS,
-} from './types';
+import { SymmetricKey, ChainKey, RootKey, MessageKey, HeaderKey, X25519KeyPair, X25519PublicKey } from './types';
 
-import {
-  generateX25519KeyPair,
-  x25519,
-  protocolHkdf,
-  zeroize,
-  zeroizeAll,
-  createSymmetricKey,
-  createChainKey,
-  createRootKey,
-  createHeaderKey,
-  createMessageKey,
-  secureClone,
-  getSecureRandomBytes,
-  bytesToHex,
-  serializePublicKey,
-  deserializeX25519PublicKey,
-  encryptAEAD,
-  decryptAEAD,
-  encrypt as symmetricEncrypt,
-  decrypt as symmetricDecrypt,
-} from './primitives';
+import { generateX25519KeyPair, x25519, protocolHkdf, zeroize, createChainKey, createRootKey, createHeaderKey, createMessageKey, bytesToHex, serializePublicKey, deserializeX25519PublicKey, encryptAEAD, decryptAEAD, encrypt as symmetricEncrypt, decrypt as symmetricDecrypt } from './primitives';
 
-import {
-  SPQRState,
-  SPQRConfig,
-  SPQRMessageMeta,
-  HybridRatchetState,
-  createInitialSPQRState,
-  initializeSPQR,
-  shouldRotateSPQR,
-  rotateSPQR,
-  createSPQRMessageMeta,
-  processSPQRMessageMeta,
-  applyPendingPQOperation,
-  applyPendingBraidSecret,
-  deriveHybridRootKey,
-  deriveHybridRootKeyWithHE,
-  serializeSPQRState,
-  deserializeSPQRState,
-  cleanupSPQRState,
-  DEFAULT_SPQR_CONFIG,
-  SerializedSPQRState,
-  prepareBraidChunks,
-} from './spqr';
+import { SPQRState, SPQRConfig, SPQRMessageMeta, initializeSPQR, shouldRotateSPQR, rotateSPQR, createSPQRMessageMeta, processSPQRMessageMeta, applyPendingPQOperation, applyPendingBraidSecret, deriveHybridRootKeyWithHE, serializeSPQRState, deserializeSPQRState, cleanupSPQRState, DEFAULT_SPQR_CONFIG, SerializedSPQRState } from './spqr';
 
-import {
-  padMessage,
-  unpadMessage,
-  PADDING_CONFIG,
-  PaddingSize,
-} from './messagePadding';
+import { padMessage, unpadMessage, PaddingSize } from './messagePadding';
 
 // encodeBase64/decodeBase64 re-exported from primitives.ts
 import { encodeBase64, decodeBase64 } from './primitives';
@@ -473,10 +415,10 @@ export async function tripleRatchetEncrypt(
     // + myKyberKeyPair mis à jour par rotateSPQR(). createSPQRMessageMeta()
     // les lira et les inclura dans les métadonnées du message.
     if (!publicKeyToSend) {
-      throw new Error('SPQR rotation: publicKeyToSend is null — rotation ML-KEM a échoué');
+      throw new Error('SPQR rotation: publicKeyToSend is null — ML-KEM rotation failed');
     }
     if (!currentState.spqr.pendingPQRotation) {
-      throw new Error('SPQR rotation: pendingPQRotation devrait être true après rotateSPQR()');
+      throw new Error('SPQR rotation: pendingPQRotation should be true after rotateSPQR()');
     }
   }
   
@@ -708,7 +650,7 @@ export async function tripleRatchetDecrypt(
 }> {
   // R-04: Deep copy — même raison que dans tripleRatchetEncrypt.
   let currentState = deepCopyTripleRatchetState(state);
-  const { header, usedHeaderKey, triggeredDHRatchet } = decryptHeaderWithFallback(
+  const { header, triggeredDHRatchet } = decryptHeaderWithFallback(
     message,
     currentState
   );
@@ -987,75 +929,6 @@ async function deriveMessageKey(
 }
 
 /**
- * Effectue une rotation DH et met à jour l'état
- * 
- * SÉCURITÉ POST-QUANTIQUE:
- * ========================
- * Contrairement au commentaire précédent, le pqSecret DOIT être mixé
- * dans chaque rotation DH pour garantir la sécurité hybride continue.
- * 
- * Justification (conforme Signal SPQR - Eurocrypt 2025):
- * - Sans mixage PQ: fenêtres temporelles vulnérables aux attaques quantiques
- * - Avec mixage PQ: attaquant doit casser X25519 ET ML-KEM pour chaque message
- * - Le pqSecret est déjà synchronisé entre les parties via SPQR
- * - La symétrie est maintenue car les deux parties ont le même pqSecret
- */
-async function performDHRatchet(
-  state: TripleRatchetState,
-  theirNewPublicKey: X25519PublicKey
-): Promise<TripleRatchetState> {
-  
-  // Calculer le nouveau secret DH pour réception
-  const dhSecretReceive = x25519(
-    state.sendingRatchetKey.privateKey,
-    theirNewPublicKey
-  );
-  
-  
-  // SÉCURITÉ CRITIQUE: Mixer le pqSecret pour protection post-quantique
-  // Ceci garantit que chaque rotation DH bénéficie de la sécurité hybride
-  const { newRootKey: rootKey1, newChainKey: receivingChainKey } = await deriveHybridRootKey(
-    dhSecretReceive,
-    state.spqr.pqSecret, // ✅ CORRECTION: Mixer le pqSecret
-    state.rootKey
-  );
-  
-  
-  // Générer nouvelle paire DH pour envoi
-  const newSendingRatchetKey = generateX25519KeyPair();
-  
-  // Calculer le secret DH pour envoi
-  const dhSecretSend = x25519(
-    newSendingRatchetKey.privateKey,
-    theirNewPublicKey
-  );
-  
-  // SÉCURITÉ CRITIQUE: Mixer également pour l'envoi
-  const { newRootKey: rootKey2, newChainKey: sendingChainKey } = await deriveHybridRootKey(
-    dhSecretSend,
-    state.spqr.pqSecret, // ✅ CORRECTION: Mixer le pqSecret
-    rootKey1
-  );
-  
-  
-  // Cleanup
-  zeroize(dhSecretReceive);
-  zeroize(dhSecretSend);
-  
-  return {
-    ...state,
-    rootKey: rootKey2,
-    sendingChainKey,
-    receivingChainKey,
-    sendingRatchetKey: newSendingRatchetKey,
-    receivingRatchetKey: theirNewPublicKey,
-    previousSendingChainLength: state.messageNumberSend,
-    messageNumberSend: 0,
-    messageNumberReceive: 0,
-  };
-}
-
-/**
  * Effectue une rotation DH avec mise à jour des header keys
  * 
  * Cette version met à jour également les header keys conformément
@@ -1125,53 +998,6 @@ async function performDHRatchetWithHE(
     nextSendingHeaderKey: sendingHeaderKey,
     nextReceivingHeaderKey: receivingHeaderKey,
   };
-}
-
-/**
- * Saute et sauvegarde les clés de messages manquants
- */
-async function skipMessageKeys(
-  state: TripleRatchetState,
-  until: number
-): Promise<TripleRatchetState> {
-  if (!state.receivingChainKey) {
-    return state;
-  }
-  
-  if (state.messageNumberReceive + state.config.maxSkip < until) {
-    throw new Error('Triple Ratchet: Too many skipped messages');
-  }
-  
-  // R-04: Deep copy — skipMessageKeys ajoute à skippedKeys
-  let currentState = deepCopyTripleRatchetState(state);
-  let chainKey = state.receivingChainKey;
-  
-  while (currentState.messageNumberReceive < until) {
-    // CRITIQUE: Le pqSecret est TOUJOURS mixé même pour les clés sautées
-    const { messageKey, nextChainKey } = await deriveMessageKey(
-      chainKey,
-      currentState.spqr.pqSecret  // Protection PQ systématique
-    );
-    
-    // Sauvegarder la clé
-    const skipKey = makeSkipKey(
-      currentState.receivingRatchetKey!,
-      currentState.messageNumberReceive
-    );
-    
-    currentState.skippedKeys.set(skipKey, {
-      key: messageKey,
-      headerKey: currentState.receivingHeaderKey || currentState.nextReceivingHeaderKey,
-      timestamp: Date.now(),
-    });
-    
-    chainKey = nextChainKey;
-    currentState.messageNumberReceive++;
-  }
-  
-  currentState.receivingChainKey = chainKey;
-  
-  return currentState;
 }
 
 /**

@@ -1,7 +1,55 @@
+# cloudflare-relay/wrangler.toml
+# Whisper Relay — OHTTP split-trust + Rate Limiting
+# Version 3.0 — P0-A7: Rate limiting IP via Durable Object
+
 name = "whisper-relay"
 main = "worker.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-10-01"
+
+# P0-A7: Workers Standard (anciennement Unbound) requis pour DO + payloads >10ms CPU
+# Sur Workers Bundled, les uploads média 16MB hit la limite CPU (1102).
+# Tu peux vérifier dans le dashboard CF : Workers & Pages → whisper-relay → Settings → Usage Model
+# Si tu vois "Bundled", upgrade vers "Standard" (Workers Paid).
 
 [vars]
 SUPABASE_URL = "https://enshmhxaqwxfehtccjlu.supabase.co"
 GATEWAY_URL = "https://ghostr-gateway-831985391959.europe-north1.run.app"
+GATEWAY_1_ID = "gw-primary"
+# P2-C2 (futur): activer le multi-gateway en décommentant + redéploiement
+# GATEWAY_2_URL = "https://gw2.theghostr.com"
+# GATEWAY_2_ID = "gw-secondary"
+
+# ============================================
+# OBSERVABILITÉ - DÉSACTIVÉ pour la vie privée
+# ============================================
+[observability]
+enabled = false
+
+# ============================================
+# P0-A7: DURABLE OBJECTS — Rate Limiter centralisé par hash d'IP
+# ============================================
+# Un DO par hash d'IP, maintient un compteur atomique sliding-window 60s.
+# Limite : 120 req/min/IP (couvre largement un user normal, bloque le spam).
+#
+# Le DO est partagé entre toutes les instances Workers d'un même client.
+# Cela coupe à la racine 99% des tentatives DDoS sur Cloud Run.
+[durable_objects]
+bindings = [
+  { name = "RATE_LIMITER", class_name = "RateLimiter" }
+]
+
+# ============================================
+# MIGRATIONS — création initiale du DO
+# ============================================
+# IMPORTANT: la première fois que tu déploies, wrangler créera la classe.
+# new_sqlite_classes utilise SQLite-backed DO (gratuit, recommandé pour rate limit).
+[[migrations]]
+tag = "v1-rate-limiter"
+new_sqlite_classes = ["RateLimiter"]
+
+# ============================================
+# DÉVELOPPEMENT LOCAL
+# ============================================
+[dev]
+port = 8789
+local_protocol = "http"

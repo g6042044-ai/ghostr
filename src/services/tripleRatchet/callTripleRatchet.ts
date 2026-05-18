@@ -38,56 +38,14 @@ import { sha256 } from '@noble/hashes/sha256';
 import { hkdf } from '@noble/hashes/hkdf';
 import { hmac } from '@noble/hashes/hmac';
 
-import {
-  TripleRatchetState,
-  serializeTripleRatchetState,
-  deserializeTripleRatchetState,
-} from './tripleRatchet';
+import { TripleRatchetState } from './tripleRatchet';
 
-import {
-  RootKey,
-  ChainKey,
-  MessageKey,
-  HeaderKey,
-  X25519KeyPair,
-  X25519PublicKey,
-} from './types';
+import { X25519KeyPair, X25519PublicKey } from './types';
 
-import {
-  generateX25519KeyPair,
-  x25519,
-  zeroize,
-  zeroizeAll,
-  createChainKey,
-  createRootKey,
-  createMessageKey,
-  createHeaderKey,
-  serializePublicKey,
-  deserializeX25519PublicKey,
-  getSecureRandomBytes,
-  bytesToHex,
-  constantTimeEqual,
-} from './primitives';
+import { generateX25519KeyPair, x25519, zeroize, deserializeX25519PublicKey, constantTimeEqual } from './primitives';
 
 // v5.0: Import ML-KEM primitives
-import {
-  KyberKeyPair,
-  KyberPublicKey,
-  KyberSecretKey,
-  KyberCiphertext,
-  KyberSharedSecret,
-  kyberKeyGen,
-  kyberEncapsulate,
-  kyberDecapsulate,
-  serializeKyberPublicKey,
-  deserializeKyberPublicKey,
-  serializeKyberSecretKey,
-  deserializeKyberSecretKey,
-  serializeKyberCiphertext,
-  deserializeKyberCiphertext,
-  zeroizeKyberSecretKey,
-  zeroizeKyberSharedSecret,
-} from './pqPrimitives';
+import { KyberKeyPair, kyberKeyGen, kyberEncapsulate, kyberDecapsulate, serializeKyberPublicKey, deserializeKyberPublicKey, serializeKyberSecretKey, deserializeKyberSecretKey, serializeKyberCiphertext, deserializeKyberCiphertext, zeroizeKyberSecretKey, zeroizeKyberSharedSecret } from './pqPrimitives';
 
 // ============================================
 // CONSTANTES

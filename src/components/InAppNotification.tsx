@@ -25,25 +25,13 @@
 //   ✅ Label "Ghostr" discret dans le coin
 //   ✅ Accessibilité : labels pour screen readers
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  Animated,
-  TouchableOpacity,
-  PanResponder,
-  Platform,
-  Dimensions,
-  Image,
-} from 'react-native';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { View, Text, Animated, TouchableOpacity, PanResponder, Platform, Image } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BlurView } from 'expo-blur';
 import { Ionicons } from '@expo/vector-icons';
-import { theme } from './ui';
+import { useTheme, useThemedStyles, type ColorPalette } from './ui';
 import { playMessageNotification } from '../services/callTones';
-
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 // ═══════════════════════════════════════
 // EVENT SYSTEM (API inchangée)
@@ -96,6 +84,11 @@ const SWIPE_THRESHOLD = -30;
 
 export function InAppNotificationHost() {
   const insets = useSafeAreaInsets();
+  // `scheme` est lu car le `BlurView` d'expo-blur attend un `tint` littéral
+  // ('light' | 'dark' | 'default'), pas une couleur — on ne peut pas le
+  // déduire depuis la palette seule.
+  const { scheme } = useTheme();
+  const styles = useThemedStyles(makeStyles);
   const [notification, setNotification] = useState<NotificationData | null>(null);
   const notificationIdRef = useRef<string | null>(null);
   const translateY = useRef(new Animated.Value(-160)).current;
@@ -274,7 +267,7 @@ export function InAppNotificationHost() {
       >
         <BlurView
           intensity={Platform.OS === 'ios' ? 80 : 0}
-          tint="dark"
+          tint={scheme === 'dark' ? 'dark' : 'light'}
           style={styles.blurWrap}
         >
           <View style={styles.banner}>
@@ -334,7 +327,22 @@ export function InAppNotificationHost() {
 // STYLES
 // ═══════════════════════════════════════
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => {
+  // Plate-forme: sur Android le BlurView ne floute pas (intensity=0), il
+  // faut donc un fond opaque ; sur iOS on s'appuie sur le blur natif et on
+  // pose un fond semi-transparent par-dessus. Dans les deux cas on lit la
+  // surface depuis la palette pour suivre le scheme (light/dark).
+  //
+  // `colors.glass` est tuné par scheme :
+  //   - dark  : rgba(26, 37, 47, 0.85)        ≈ ancien rgba(16,26,34,0.75)
+  //   - light : rgba(247, 249, 251, 0.85)     ≈ surface near-white
+  //
+  // Pour Android (pas de blur), on remonte l'alpha pour rester opaque.
+  const glassiOS = colors.glass;
+  const glassAndroid =
+    colors.glass.replace(/,\s*0?\.\d+\)$/, ', 0.97)');
+
+  return ({
   container: {
     position: 'absolute',
     left: 8,
@@ -355,11 +363,11 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     overflow: 'hidden',
     backgroundColor:
-      Platform.OS === 'android'
-        ? 'rgba(16, 26, 34, 0.97)'
-        : 'rgba(16, 26, 34, 0.75)',
+      Platform.OS === 'android' ? glassAndroid : glassiOS,
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.07)',
+    // Bordure issue de la palette → blanche-transparente en dark,
+    // noire-transparente très douce en light.
+    borderColor: colors.border,
   },
   banner: {
     flexDirection: 'row',
@@ -398,7 +406,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 2,
-    borderColor: 'rgba(16, 26, 34, 0.9)',
+    // La bordure du badge doit "découper" l'avatar par rapport au fond du
+    // toast → on prend la surface du toast pour que ça reste cohérent quel
+    // que soit le thème.
+    borderColor: colors.surface,
   },
   // Content
   content: {
@@ -414,31 +425,36 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#F0F4F8',
+    color: colors.text,
     letterSpacing: -0.2,
     flex: 1,
   },
   appLabel: {
     fontSize: 10,
     fontWeight: '500',
-    color: 'rgba(139, 164, 184, 0.5)',
+    // Texte "Ghostr" discret → textMuted suffit, présent dans les deux
+    // palettes avec un contraste ≈ 3:1 (acceptable pour un label décoratif).
+    color: colors.textMuted,
     letterSpacing: 0.2,
     textTransform: 'uppercase',
   },
   body: {
     fontSize: 13,
-    color: 'rgba(139, 164, 184, 0.85)',
+    color: colors.textSecondary,
     letterSpacing: -0.1,
     lineHeight: 17,
   },
   // Progress
   progressTrack: {
     height: 2,
-    backgroundColor: 'rgba(255, 255, 255, 0.03)',
+    // Track presque invisible — on prend `divider` qui est à la fois
+    // perceptible et discret sur les deux thèmes.
+    backgroundColor: colors.divider,
   },
   progressFill: {
     height: '100%',
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
     opacity: 0.4,
   },
-});
+  }) as const;
+};

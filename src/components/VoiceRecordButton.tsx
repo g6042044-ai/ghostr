@@ -8,17 +8,9 @@
 // - Glisser haut → verrouille (mains libres)
 
 import React, { useRef, useCallback, useEffect } from 'react';
-import {
-  View,
-  StyleSheet,
-  Animated,
-  PanResponder,
-  PanResponderGestureState,
-  Vibration,
-  ActivityIndicator,
-  Dimensions,
-} from 'react-native';
+import { View, StyleSheet, Animated, PanResponder, PanResponderGestureState, Vibration, ActivityIndicator } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useTheme, useThemedStyles, type ColorPalette } from './ui';
 
 // ============================================
 // CONFIGURATION
@@ -43,21 +35,25 @@ interface VoiceRecordButtonProps {
 }
 
 // ============================================
-// COLORS
+// COLORS — derived from the active palette at render time. The old v1
+// module-level `Colors` constant was dark-only; this factory mirrors the
+// same shape so existing call sites need no changes.
 // ============================================
 
-const Colors = {
-  primary: '#00D9A6',
-  error: '#EA4335',
-  bg: {
-    elevated: '#243240',
-    tertiary: '#1A252F',
-  },
-  text: {
-    secondary: '#8BA4B8',
-    tertiary: '#5D7485',
-  },
-};
+function makeColors(c: ColorPalette) {
+  return {
+    primary: c.primary,
+    error: c.error,
+    bg: {
+      elevated: c.surfaceElevated,
+      tertiary: c.surfaceLight,
+    },
+    text: {
+      secondary: c.textSecondary,
+      tertiary: c.textMuted,
+    },
+  };
+}
 
 // ============================================
 // COMPOSANT
@@ -73,6 +69,10 @@ export const VoiceRecordButton: React.FC<VoiceRecordButtonProps> = ({
   isSending,
   disabled = false,
 }) => {
+  const styles = useThemedStyles(makeStyles);
+  const { colors: _liveColors } = useTheme();
+  // eslint-disable-next-line @typescript-eslint/no-shadow
+  const Colors = makeColors(_liveColors);
   // Refs pour les callbacks
   const callbacksRef = useRef({ onRecordStart, onRecordEnd, onRecordCancel, onRecordLock });
   callbacksRef.current = { onRecordStart, onRecordEnd, onRecordCancel, onRecordLock };
@@ -272,7 +272,15 @@ export const VoiceRecordButton: React.FC<VoiceRecordButtonProps> = ({
           />
         </View>
         
-        {/* Icône cadenas */}
+        {/* Icône cadenas — crossfade entre deux états :
+            - état initial (progress ≤ 0.7) : fond = bg.elevated (gris clair
+              en light, gris foncé en dark). On utilise `text.primary` pour
+              avoir le bon contraste dans les deux thèmes ;
+            - état verrouillé (progress = 1) : fond = primary (teal). Là
+              c'est l'icône blanche qui prend le relais (lisible sur teal
+              dans les deux thèmes).
+            Sans ce crossfade, l'icône restait blanche tout le temps et
+            disparaissait sur le bg.elevated en light mode. */}
         <Animated.View
           style={[
             styles.lockIconContainer,
@@ -285,7 +293,27 @@ export const VoiceRecordButton: React.FC<VoiceRecordButtonProps> = ({
             },
           ]}
         >
-          <Ionicons name="lock-closed" size={18} color="#FFF" />
+          <Animated.View
+            style={{
+              position: 'absolute',
+              opacity: lockProgress.interpolate({
+                inputRange: [0, 0.7, 1],
+                outputRange: [1, 1, 0],
+              }),
+            }}
+          >
+            <Ionicons name="lock-closed" size={18} color={Colors.text.primary} />
+          </Animated.View>
+          <Animated.View
+            style={{
+              opacity: lockProgress.interpolate({
+                inputRange: [0, 0.7, 1],
+                outputRange: [0, 0, 1],
+              }),
+            }}
+          >
+            <Ionicons name="lock-closed" size={18} color="#FFF" />
+          </Animated.View>
         </Animated.View>
         
         {/* Flèche vers le haut */}
@@ -341,7 +369,9 @@ export const VoiceRecordButton: React.FC<VoiceRecordButtonProps> = ({
 // STYLES
 // ============================================
 
-const styles = StyleSheet.create({
+const makeStyles = (c: ColorPalette) => {
+  const Colors = makeColors(c);
+  return StyleSheet.create({
   wrapper: {
     alignItems: 'center',
   },
@@ -410,6 +440,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
     opacity: 0.6,
   },
-});
+  });
+};
 
 export default VoiceRecordButton;

@@ -1,9 +1,14 @@
 // src/components/ui/Icons.tsx
 // Icônes personnalisées pour l'application - Style moderne
+// v2.0 — Theme-reactive defaults via useTheme(). The previous version used
+// `theme.colors.X` as default parameter values, which evaluated at module-
+// import time and froze the icon colours to the boot palette. Now each
+// icon calls useTheme() and resolves any unspecified colour from the live
+// palette.
 
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
-import { theme } from './theme';
+import { useTheme } from './ThemeContext';
 
 interface IconProps {
   size?: number;
@@ -11,84 +16,149 @@ interface IconProps {
 }
 
 // Wrapper pour les icônes emoji avec style cohérent
-const IconWrapper: React.FC<IconProps & { children: string }> = ({ 
-  size = 24, 
-  color, 
-  children 
+const IconWrapper: React.FC<IconProps & { children: string }> = ({
+  size = 24,
+  color,
+  children,
 }) => (
   <Text style={{ fontSize: size, color }}>{children}</Text>
 );
 
-// Icônes principales de l'application
-export const Icons = {
-  // Navigation
-  Back: ({ size = 24, color = theme.colors.text }: IconProps) => (
+// Each "shape" icon below is a function component that lets the caller
+// override `color`, but falls back to the appropriate palette key when
+// nothing is passed in. The fall-back resolution happens at render time so
+// theme changes propagate live.
+
+const BackIcon: React.FC<IconProps> = ({ size = 24, color }) => {
+  const { colors } = useTheme();
+  const c = color ?? colors.text;
+  return (
     <View style={[styles.iconContainer, { width: size, height: size }]}>
-      <Text style={[styles.iconText, { fontSize: size * 0.8, color }]}>‹</Text>
+      <Text style={[styles.iconText, { fontSize: size * 0.8, color: c }]}>‹</Text>
     </View>
-  ),
-  
-  Close: ({ size = 24, color = theme.colors.text }: IconProps) => (
+  );
+};
+
+const CloseIcon: React.FC<IconProps> = ({ size = 24, color }) => {
+  const { colors } = useTheme();
+  const c = color ?? colors.text;
+  return (
     <View style={[styles.iconContainer, { width: size, height: size }]}>
-      <Text style={[styles.iconText, { fontSize: size * 0.7, color }]}>✕</Text>
+      <Text style={[styles.iconText, { fontSize: size * 0.7, color: c }]}>✕</Text>
     </View>
-  ),
-  
-  Menu: ({ size = 24, color = theme.colors.text }: IconProps) => (
+  );
+};
+
+const MenuIcon: React.FC<IconProps> = ({ size = 24, color }) => {
+  const { colors } = useTheme();
+  const c = color ?? colors.text;
+  return (
     <View style={[styles.iconContainer, { width: size, height: size }]}>
-      <Text style={[styles.iconText, { fontSize: size * 0.8, color }]}>⋮</Text>
+      <Text style={[styles.iconText, { fontSize: size * 0.8, color: c }]}>⋮</Text>
     </View>
-  ),
-  
-  // Actions
-  Send: ({ size = 24, color = theme.colors.textOnPrimary }: IconProps) => (
+  );
+};
+
+const SendIcon: React.FC<IconProps> = ({ size = 24, color }) => {
+  const { colors } = useTheme();
+  const c = color ?? colors.textOnPrimary;
+  return (
     <View style={[styles.iconContainer, { width: size, height: size }]}>
-      <View style={[styles.sendIcon, { 
-        borderLeftWidth: size * 0.45, 
-        borderTopWidth: size * 0.25, 
+      <View style={[styles.sendIcon, {
+        borderLeftWidth: size * 0.45,
+        borderTopWidth: size * 0.25,
         borderBottomWidth: size * 0.25,
-        borderLeftColor: color,
+        borderLeftColor: c,
       }]} />
     </View>
-  ),
-  
-  Add: ({ size = 24, color = theme.colors.text }: IconProps) => (
+  );
+};
+
+const AddIcon: React.FC<IconProps> = ({ size = 24, color }) => {
+  const { colors } = useTheme();
+  const c = color ?? colors.text;
+  return (
     <View style={[styles.iconContainer, { width: size, height: size }]}>
-      <Text style={[styles.iconText, { fontSize: size, color, fontWeight: '300' }]}>+</Text>
+      <Text style={[styles.iconText, { fontSize: size, color: c, fontWeight: '300' }]}>+</Text>
     </View>
-  ),
-  
-  Check: ({ size = 24, color = theme.colors.primary }: IconProps) => (
+  );
+};
+
+const CheckIcon: React.FC<IconProps> = ({ size = 24, color }) => {
+  const { colors } = useTheme();
+  const c = color ?? colors.primary;
+  return (
     <View style={[styles.iconContainer, { width: size, height: size }]}>
-      <Text style={[styles.iconText, { fontSize: size * 0.7, color }]}>✓</Text>
+      <Text style={[styles.iconText, { fontSize: size * 0.7, color: c }]}>✓</Text>
     </View>
-  ),
-  
-  DoubleCheck: ({ size = 24, color = theme.colors.info }: IconProps) => (
+  );
+};
+
+const DoubleCheckIcon: React.FC<IconProps> = ({ size = 24, color }) => {
+  const { colors } = useTheme();
+  const c = color ?? colors.info;
+  return (
     <View style={[styles.iconContainer, { width: size, height: size }]}>
-      <Text style={[styles.iconText, { fontSize: size * 0.6, color }]}>✓✓</Text>
+      <Text style={[styles.iconText, { fontSize: size * 0.6, color: c }]}>✓✓</Text>
     </View>
-  ),
-  
-  // Communication
+  );
+};
+
+const CheckboxEmptyIcon: React.FC<IconProps> = ({ size = 24, color }) => {
+  const { colors } = useTheme();
+  const c = color ?? colors.border;
+  return (
+    <View style={[styles.checkbox, {
+      width: size,
+      height: size,
+      borderRadius: size / 2,
+      borderColor: c,
+    }]} />
+  );
+};
+
+const CheckboxFilledIcon: React.FC<IconProps> = ({ size = 24, color }) => {
+  const { colors } = useTheme();
+  const c = color ?? colors.primary;
+  return (
+    <View style={[styles.checkbox, styles.checkboxFilled, {
+      width: size,
+      height: size,
+      borderRadius: size / 2,
+      backgroundColor: c,
+      borderColor: c,
+    }]}>
+      <Text style={[styles.checkboxCheck, { fontSize: size * 0.6 }]}>✓</Text>
+    </View>
+  );
+};
+
+// Public API — same shape as v1 so call sites need no changes.
+export const Icons = {
+  Back: BackIcon,
+  Close: CloseIcon,
+  Menu: MenuIcon,
+  Send: SendIcon,
+  Add: AddIcon,
+  Check: CheckIcon,
+  DoubleCheck: DoubleCheckIcon,
+
+  // Emoji icons — palette-independent
   Chat: ({ size = 24 }: IconProps) => <IconWrapper size={size}>💬</IconWrapper>,
   Phone: ({ size = 24 }: IconProps) => <IconWrapper size={size}>📞</IconWrapper>,
   Video: ({ size = 24 }: IconProps) => <IconWrapper size={size}>📹</IconWrapper>,
-  
-  // Sécurité
+
   Lock: ({ size = 24 }: IconProps) => <IconWrapper size={size}>🔒</IconWrapper>,
   LockOpen: ({ size = 24 }: IconProps) => <IconWrapper size={size}>🔓</IconWrapper>,
   Shield: ({ size = 24 }: IconProps) => <IconWrapper size={size}>🛡️</IconWrapper>,
   Key: ({ size = 24 }: IconProps) => <IconWrapper size={size}>🔐</IconWrapper>,
   Verified: ({ size = 24 }: IconProps) => <IconWrapper size={size}>✅</IconWrapper>,
-  
-  // Médias
+
   Camera: ({ size = 24 }: IconProps) => <IconWrapper size={size}>📷</IconWrapper>,
   QRCode: ({ size = 24 }: IconProps) => <IconWrapper size={size}>📱</IconWrapper>,
   Link: ({ size = 24 }: IconProps) => <IconWrapper size={size}>🔗</IconWrapper>,
   Copy: ({ size = 24 }: IconProps) => <IconWrapper size={size}>📋</IconWrapper>,
-  
-  // Interface
+
   Settings: ({ size = 24 }: IconProps) => <IconWrapper size={size}>⚙️</IconWrapper>,
   Refresh: ({ size = 24 }: IconProps) => <IconWrapper size={size}>🔄</IconWrapper>,
   Search: ({ size = 24 }: IconProps) => <IconWrapper size={size}>🔍</IconWrapper>,
@@ -96,32 +166,12 @@ export const Icons = {
   Warning: ({ size = 24 }: IconProps) => <IconWrapper size={size}>⚠️</IconWrapper>,
   Error: ({ size = 24 }: IconProps) => <IconWrapper size={size}>❌</IconWrapper>,
   Success: ({ size = 24 }: IconProps) => <IconWrapper size={size}>✅</IconWrapper>,
-  
-  // Actions destructives
+
   Delete: ({ size = 24 }: IconProps) => <IconWrapper size={size}>🗑️</IconWrapper>,
   Trash: ({ size = 24 }: IconProps) => <IconWrapper size={size}>🗑️</IconWrapper>,
-  
-  // Checkbox
-  CheckboxEmpty: ({ size = 24, color = theme.colors.border }: IconProps) => (
-    <View style={[styles.checkbox, { 
-      width: size, 
-      height: size, 
-      borderRadius: size / 2,
-      borderColor: color 
-    }]} />
-  ),
-  
-  CheckboxFilled: ({ size = 24, color = theme.colors.primary }: IconProps) => (
-    <View style={[styles.checkbox, styles.checkboxFilled, { 
-      width: size, 
-      height: size, 
-      borderRadius: size / 2,
-      backgroundColor: color,
-      borderColor: color,
-    }]}>
-      <Text style={[styles.checkboxCheck, { fontSize: size * 0.6 }]}>✓</Text>
-    </View>
-  ),
+
+  CheckboxEmpty: CheckboxEmptyIcon,
+  CheckboxFilled: CheckboxFilledIcon,
 };
 
 const styles = StyleSheet.create({

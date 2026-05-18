@@ -13,6 +13,7 @@ import { pbkdf2Async } from '@noble/hashes/pbkdf2';
 import { sha256 as nobleSha256 } from '@noble/hashes/sha256';
 import { hmac as nobleHmac } from '@noble/hashes/hmac';
 import { hkdf as nobleHkdf } from '@noble/hashes/hkdf';
+import i18n from '../i18n';
 
 // ============================================
 // CONFIGURATION PRNG - Module unique (P10 fix)
@@ -92,45 +93,6 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
 // ============================================
 // CONSTANT-TIME COMPARISON (Security Critical!)
 // ============================================
-
-/**
- * Constant-time comparison of two Uint8Arrays
- * CRITICAL SECURITY: This function prevents timing attacks when comparing
- * sensitive data like MACs, hashes, or keys.
- * 
- * Unlike regular comparison which returns early on first mismatch,
- * this always compares all bytes in constant time.
- * 
- * @param a - First array to compare
- * @param b - Second array to compare
- * @returns true if arrays are equal, false otherwise
- */
-/**
- * Constant-time comparison of two Uint8Arrays
- * GH-06 fix: Always iterates over max(a.length, b.length) to prevent
- * timing side-channel on relative lengths. Returns false if lengths differ,
- * but the execution time is independent of where/whether bytes differ.
- */
-function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
-  const maxLen = Math.max(a.length, b.length);
-  let result = a.length ^ b.length; // Non-zero if lengths differ
-  for (let i = 0; i < maxLen; i++) {
-    result |= (a[i] || 0) ^ (b[i] || 0);
-  }
-  return result === 0;
-}
-
-/**
- * Constant-time comparison for strings (converted to UTF-8 bytes)
- * @param a - First string
- * @param b - Second string
- * @returns true if strings are equal, false otherwise
- */
-function constantTimeEqualStrings(a: string, b: string): boolean {
-  const bytesA = decodeUTF8(a);
-  const bytesB = decodeUTF8(b);
-  return constantTimeEqual(bytesA, bytesB);
-}
 
 // ============================================
 // HKDF RFC 5869 / HMAC RFC 2104 — @noble/hashes
@@ -480,8 +442,8 @@ export function codeToMasterKey(code: string): Uint8Array {
       // Maintenant on refuse explicitement le code invalide pour forcer
       // l'utilisateur à re-saisir correctement.
       throw new Error(
-        'Code invalide : checksum incorrect. ' +
-        'Vérifiez que le code a été saisi correctement (pas de caractère manquant ou inversé).'
+        i18n.t('errors.invalidCode') +
+        i18n.t('errors.qrCodeError')
       );
     }
   }

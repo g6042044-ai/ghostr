@@ -77,11 +77,96 @@ interface SealedSenderInner {
 let _currentCertificate: SenderCertificate | null = null;
 let _serverSealedSenderPubKey: Uint8Array | null = null;
 
+// ════════════════════════════════════════════════════════════════════════════
+// OBSERVABLE STATE — pour que les composants React puissent réagir
+// ════════════════════════════════════════════════════════════════════════════
+// Pattern observer/subscriber léger (pas de dépendance externe). Permet à
+// l'UI de désactiver/griser visuellement les boutons "Créer"/"Rejoindre"
+// pendant que le SS bootstrap, et de réafficher dès qu'il est prêt — sans
+// que chaque écran ait à re-call `ensureSealedSenderBootstrap()`.
+//
+// États possibles :
+//   'idle'         — bootstrap pas encore tenté (cold start, post-unlock pré-boot)
+//   'bootstrapping'— en cours (PoW + RPC certificat)
+//   'ready'        — opérationnel, on peut envoyer
+//   'failed'       — bootstrap a échoué, sera retenté au prochain envoi
+//
+// Note : 'ready' n'est PAS strictement équivalent à `isSealedSenderReady()`
+// car le certificat peut expirer entre temps (24h de durée de vie). Pour
+// décider d'envoyer, on utilise `isSealedSenderReady()` ; pour décider
+// d'afficher un loader UI, on utilise cet état observable.
+// ════════════════════════════════════════════════════════════════════════════
+
+export type SealedSenderState = 'idle' | 'bootstrapping' | 'ready' | 'failed';
+
+let _ssState: SealedSenderState = 'idle';
+const _ssStateListeners = new Set<(s: SealedSenderState) => void>();
+
+/**
+ * Retourne l'état observable courant du sealed sender.
+ * NB : pour décider d'envoyer un message, utiliser `isSealedSenderReady()`
+ * (qui vérifie aussi l'expiration du certificat) — cet état est pour l'UI.
+ */
+export function getSealedSenderObservableState(): SealedSenderState {
+  return _ssState;
+}
+
+/**
+ * S'abonne aux changements d'état du sealed sender.
+ * Le callback est appelé immédiatement avec l'état courant, puis à chaque
+ * transition. Retourne une fonction de désabonnement.
+ *
+ * Usage React :
+ * ```tsx
+ * const [s, setS] = useState(getSealedSenderObservableState());
+ * useEffect(() => subscribeSealedSenderState(setS), []);
+ * ```
+ */
+export function subscribeSealedSenderState(
+  cb: (state: SealedSenderState) => void
+): () => void {
+  _ssStateListeners.add(cb);
+  // Émettre l'état courant immédiatement pour faciliter l'utilisation dans
+  // useEffect (pas besoin de getState() séparé).
+  try {
+    cb(_ssState);
+  } catch (e) {
+    __DEV__ && console.warn('[SealedSender] subscriber threw on initial emit:', e);
+  }
+  return () => {
+    _ssStateListeners.delete(cb);
+  };
+}
+
+/**
+ * Transitionne vers un nouvel état et notifie les abonnés.
+ * Idempotent : ne notifie pas si l'état n'a pas changé.
+ */
+export function setSealedSenderObservableState(next: SealedSenderState): void {
+  if (_ssState === next) return;
+  __DEV__ && console.log(`[SealedSender] state: ${_ssState} → ${next}`);
+  _ssState = next;
+  // Itérer sur une copie pour permettre aux abonnés de se désabonner
+  // pendant la notification sans corrompre l'itération.
+  for (const cb of Array.from(_ssStateListeners)) {
+    try {
+      cb(next);
+    } catch (e) {
+      __DEV__ && console.warn('[SealedSender] listener threw:', e);
+    }
+  }
+}
+
 /**
  * Stocke le certificat anonyme reçu du serveur après authentification.
  */
 export function setSenderCertificate(cert: SenderCertificate): void {
   _currentCertificate = cert;
+  // Si on stocke un certificat valide et qu'on a aussi la clé serveur,
+  // on est officiellement "ready" pour l'observateur.
+  if (_serverSealedSenderPubKey !== null) {
+    setSealedSenderObservableState('ready');
+  }
 }
 
 /**
@@ -91,6 +176,9 @@ export function getSenderCertificate(): SenderCertificate | null {
   if (!_currentCertificate) return null;
   if (Date.now() > _currentCertificate.expiry) {
     _currentCertificate = null;
+    // L'expiration silencieuse fait basculer vers 'idle' :
+    // un nouveau bootstrap sera nécessaire au prochain envoi.
+    if (_ssState === 'ready') setSealedSenderObservableState('idle');
     return null;
   }
   return _currentCertificate;
@@ -103,6 +191,7 @@ export function getSenderCertificate(): SenderCertificate | null {
  */
 export function invalidateSenderCertificate(): void {
   _currentCertificate = null;
+  if (_ssState === 'ready') setSealedSenderObservableState('idle');
 }
 
 /**
@@ -121,9 +210,30 @@ export function invalidateSenderCertificate(): void {
  *   → Sa conservation en mémoire après lock expose l'identité de session.
  *
  * Après clearSealedSenderState(), les deux doivent être refetchés au déverrouillage.
+ *
+ * FIX BUG #4: clearSealedSenderState abort aussi le bootstrap en cours.
+ * Sans ça, un bootstrap démarré juste avant le lock pouvait repeupler
+ * _serverSealedSenderPubKey + _currentCertificate APRÈS le clear, recréant
+ * une identité de session fantôme post-lock. L'incrément de génération
+ * garantit en plus que tout setSenderCertificate tardif d'un bootstrap
+ * "obsolète" sera ignoré au moment de l'application (voir _runBootstrapAttempt).
  */
 export function clearSealedSenderState(): void {
-  // Zeroizer les bytes si possible (clé publique dans un Uint8Array)
+  // 1. Invalider la génération pour que tout bootstrap en flight termine en no-op
+  _bootstrapGeneration++;
+  // 2. Abort le controller (réveille les awaits dans le fetcher + retry loop)
+  if (_bootstrapAbortController) {
+    try { _bootstrapAbortController.abort(); } catch { /* noop */ }
+    _bootstrapAbortController = null;
+  }
+  // 3. Casser la promesse partagée : le prochain ensureBootstrap démarrera un cycle propre
+  _bootstrapPromise = null;
+  // 4. Stopper le refresh timer (sinon il pourrait re-fetcher post-lock)
+  if (_certificateRefreshTimer) {
+    clearTimeout(_certificateRefreshTimer);
+    _certificateRefreshTimer = null;
+  }
+  // 5. Zeroizer les bytes si possible (clé publique dans un Uint8Array)
   if (_serverSealedSenderPubKey) {
     try {
       _serverSealedSenderPubKey.fill(0);
@@ -132,8 +242,10 @@ export function clearSealedSenderState(): void {
     }
     _serverSealedSenderPubKey = null;
   }
-  // Le certificat ne contient pas de Uint8Array — null suffit
+  // 6. Le certificat ne contient pas de Uint8Array — null suffit
   _currentCertificate = null;
+  // 7. Repasser à 'idle' pour que les écrans réinitialisent leur UI au prochain unlock.
+  setSealedSenderObservableState('idle');
 }
 
 /**
@@ -152,99 +264,327 @@ export function isSealedSenderReady(): boolean {
 }
 
 // ============================================
-// BOOTSTRAP (Audit Fix C-01 — MISSING PIECE)
+// BOOTSTRAP ORCHESTRATOR — Single source of truth
 // ============================================
-// Le sealed sender nécessite deux éléments qui doivent être fetch au démarrage:
-//   1. La clé publique NaCl du serveur sealed sender (GET /sealed-sender-key)
-//   2. Un certificat anonyme prouvant la légitimité (POST /certificate via relay)
-// ACTION 01: Sans ces deux éléments, isSealedSenderReady() retourne false et l'envoi
-// est BLOQUÉ (plus de fallback legacy). L'utilisateur voit un message d'erreur.
+//
+// HISTORIQUE :
+//   Avant cette refonte, le bootstrap était piloté par 4 boucles de retry
+//   indépendantes (App.tsx waitForSealedSender, écrans Create/Join,
+//   ConversationList modal, send paths). Le singleton de promesse était dans
+//   api1to1.ts. Les boucles foreground faisaient `resetSealedSenderBootstrap`
+//   entre tentatives, ce qui pouvait :
+//     • Casser la promesse partagée avec le bootstrap background en cours
+//     • Créer deux bootstraps concurrents qui consommaient le MÊME PoW
+//       (race sur l'invalidation post-await) → gateway 403 replay_detected
+//     • Laisser `_ssState` désynchronisé avec la réalité (failed alors que
+//       ready, ou ready alors qu'un clear a eu lieu pendant le bootstrap)
+//
+// NOUVELLE ARCHITECTURE :
+//   Tout est ici. Le service expose UNE primitive idempotente :
+//     ensureSealedSenderBootstrap() → Promise<boolean>
+//   Avec :
+//     • Singleton de promesse partagée
+//     • Retry exponentiel borné (3 tentatives, ~15s max)
+//     • AbortController pour annulation propre (lock, refresh, clear)
+//     • Génération pour ignorer les résultats de bootstraps "périmés" qui
+//       résoudraient APRÈS un clearSealedSenderState
+//     • Application atomique clé+certificat (aucun await entre les deux)
+//
+//   Le fetcher PoW + RPC est injecté depuis api1to1.ts via
+//   setSealedSenderCertificateFetcher (configuration unique au module load).
+// ============================================
 
-// PAS de GATEWAY_BASE_URL — la clé sealed sender est obtenue via le relay
-// (incluse dans /gateway-manifests). Aucun contact direct avec le gateway.
 /** Durée avant renouvellement du certificat (marge de 10min avant expiry) */
-const CERTIFICATE_REFRESH_MARGIN_MS = 10 * 60 * 1000; // P5 fix: 10min (was 1h for 24h certs)
+const CERTIFICATE_REFRESH_MARGIN_MS = 10 * 60 * 1000;
 
+/**
+ * Délais exponentiels entre tentatives (ms).
+ *   tentative 1 → 0ms     (immédiat)
+ *   tentative 2 → 1.5s    (glitch réseau)
+ *   tentative 3 → 4s      (gateway warming up)
+ * Budget total ~15s en intégrant le temps d'attente effectif (PoW + RPC).
+ * Si tout échoue, l'état passe à 'failed' et un futur appel reprendra
+ * un cycle propre depuis 'idle' (transition synchrone à l'entrée).
+ */
+const BOOTSTRAP_RETRY_DELAYS_MS = [0, 1500, 4000] as const;
+
+/**
+ * Signature du fetcher injecté par api1to1.ts.
+ * Doit renvoyer un certificat valide ou null en cas d'échec.
+ * Doit honorer signal.aborted (court-circuiter PoW/RPC dès que possible).
+ */
+export type FetchCertificateFn =
+  (signal: AbortSignal) => Promise<SenderCertificate | null>;
+
+let _fetchCertificate: FetchCertificateFn | null = null;
+let _bootstrapPromise: Promise<boolean> | null = null;
+let _bootstrapAbortController: AbortController | null = null;
+let _bootstrapGeneration = 0;
 let _certificateRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
- * Bootstrap du sealed sender. À appeler une fois au démarrage de l'app.
- * 
- * 1. Fetch la clé publique sealed sender depuis le gateway
- * 2. Obtient un certificat anonyme (via relay OHTTP pour protéger l'IP)
- * 3. Programme le renouvellement automatique du certificat
- * 
- * @param fetchCertificateViaRelay - Fonction qui obtient le certificat via le relay OHTTP.
- *   Passe par le relay pour que le gateway ne voie pas l'IP du client.
- * @returns true si le bootstrap a réussi
+ * Configure le fetcher de certificat. À appeler UNE FOIS au démarrage,
+ * typiquement depuis api1to1.ts (qui possède la logique PoW + secureRpc).
+ * Idempotent : appeler à nouveau remplace simplement la fonction.
  */
-export async function bootstrapSealedSender(
-  fetchCertificateViaRelay: () => Promise<SenderCertificate | null>
-): Promise<boolean> {
-  try {
-    // 1. Récupérer la clé sealed sender depuis le relay (PAS de contact direct gateway)
-    const { getSealedSenderKeyFromRelay, initRelay } = await import('./relayTransport');
-    
-    // S'assurer que le relay est initialisé (il fetch les manifests incluant la SS key)
-    await initRelay();
-    
-    const ssKeyB64 = getSealedSenderKeyFromRelay();
-    if (!ssKeyB64) {
-      __DEV__ && console.warn('[SealedSender] ❌ Sealed sender key not available from relay');
-      return false;
-    }
-    
-    setSealedSenderServerKey(ssKeyB64);
-    __DEV__ && console.log('[SealedSender] ✅ Server public key loaded via relay:', ssKeyB64.slice(0, 16) + '...');
-    
-    // 2. Obtenir un certificat anonyme via le relay
-    const cert = await fetchCertificateViaRelay();
-    if (!cert) {
-      __DEV__ && console.warn('[SealedSender] ❌ Failed to obtain anonymous certificate');
-      return false;
-    }
-    
-    setSenderCertificate(cert);
-    __DEV__ && console.log('[SealedSender] ✅ Anonymous certificate obtained, expires:', new Date(cert.expiry).toISOString());
-    
-    // 3. Programmer le renouvellement avant expiration
-    scheduleCertificateRefresh(cert.expiry, fetchCertificateViaRelay);
-    
-    __DEV__ && console.log('[SealedSender] ✅ Bootstrap complete — sealed sender ACTIVE');
-    return true;
-  } catch (error) {
-    __DEV__ && console.warn('[SealedSender] ❌ Bootstrap failed:', error);
-    return false;
-  }
+export function setSealedSenderCertificateFetcher(fn: FetchCertificateFn): void {
+  _fetchCertificate = fn;
 }
 
 /**
- * Programme le renouvellement automatique du certificat.
+ * Délai await-able qui se réveille à l'abort.
+ * Ne throw jamais — retourne simplement plus tôt si signal aborted.
  */
-function scheduleCertificateRefresh(
-  expiry: number,
-  fetchFn: () => Promise<SenderCertificate | null>
-): void {
+async function delayWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  return new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Exécute UNE tentative de bootstrap.
+ *
+ * @returns true si la tentative a réussi à appliquer une clé + un certificat valides.
+ *          false si la tentative a échoué (network, PoW rejected, etc.) — l'appelant
+ *          peut décider de retry.
+ *
+ * INVARIANT D'ATOMICITÉ :
+ *   La clé serveur (`setSealedSenderServerKey`) et le certificat
+ *   (`setSenderCertificate`) sont appliqués sans aucun `await` entre les
+ *   deux. JS étant single-threaded, aucun `clearSealedSenderState` ne peut
+ *   s'intercaler. La transition observable vers 'ready' se fait dans le
+ *   même tour synchrone que `setSenderCertificate`.
+ *
+ * INVARIANT DE GÉNÉRATION :
+ *   Avant d'appliquer le résultat, on vérifie que la génération n'a pas
+ *   bougé. Si elle a bougé (clear pendant le bootstrap), on jette le
+ *   résultat. Ceinture + bretelles vis-à-vis de l'AbortSignal.
+ */
+async function _runBootstrapAttempt(
+  signal: AbortSignal,
+  generation: number
+): Promise<boolean> {
+  // 1. Init relay (récupère manifests + SS key). Singleton dans relayTransport,
+  //    donc gratuit si déjà initialisé.
+  const { getSealedSenderKeyFromRelay, initRelay } = await import('./relayTransport');
+  await initRelay();
+  if (signal.aborted || generation !== _bootstrapGeneration) return false;
+
+  const ssKeyB64 = getSealedSenderKeyFromRelay();
+  if (!ssKeyB64) {
+    __DEV__ && console.warn('[SealedSender] ❌ Sealed sender key not available from relay');
+    return false;
+  }
+
+  // 2. Fetch certificat (PoW + secureRpc, injecté par api1to1)
+  if (!_fetchCertificate) {
+    __DEV__ && console.error(
+      '[SealedSender] ❌ No certificate fetcher configured. ' +
+      'Call setSealedSenderCertificateFetcher() at module init.'
+    );
+    return false;
+  }
+  const cert = await _fetchCertificate(signal);
+  if (signal.aborted || generation !== _bootstrapGeneration) return false;
+  if (!cert) {
+    __DEV__ && console.warn('[SealedSender] ❌ Failed to obtain anonymous certificate');
+    return false;
+  }
+
+  // 3. Application atomique (PAS d'await entre ces deux lignes) — voir invariant
+  setSealedSenderServerKey(ssKeyB64);
+  setSenderCertificate(cert); // transitionne 'bootstrapping' → 'ready' via l'observable
+
+  // 4. Programme le renouvellement
+  scheduleCertificateRefresh(cert.expiry);
+
+  __DEV__ && console.log(
+    '[SealedSender] ✅ Bootstrap complete — sealed sender ACTIVE, cert expires:',
+    new Date(cert.expiry).toISOString()
+  );
+  return true;
+}
+
+/**
+ * Démarre (ou rejoint) un cycle de bootstrap.
+ *
+ * Comportement :
+ *   • Si déjà prêt → Promise.resolve(true) immédiatement, aucun side-effect
+ *   • Si un bootstrap est en cours → renvoie la MÊME promesse partagée
+ *   • Sinon → démarre un nouveau cycle avec retry exponentiel interne
+ *
+ * La promesse est nullifiée à la fin (succès ou échec), permettant à un
+ * appel ultérieur de relancer un cycle frais sans avoir à `reset` quoi
+ * que ce soit.
+ */
+export function ensureSealedSenderBootstrap(): Promise<boolean> {
+  // Fast path : déjà prêt
+  if (isSealedSenderReady()) return Promise.resolve(true);
+
+  // Bootstrap en cours : partage la promesse
+  if (_bootstrapPromise) return _bootstrapPromise;
+
+  // Garde de configuration
+  if (!_fetchCertificate) {
+    __DEV__ && console.error(
+      '[SealedSender] ensureSealedSenderBootstrap called before setSealedSenderCertificateFetcher'
+    );
+    return Promise.resolve(false);
+  }
+
+  // Nouveau cycle : créer l'abort controller et capturer la génération
+  _bootstrapAbortController = new AbortController();
+  const signal = _bootstrapAbortController.signal;
+  const generation = ++_bootstrapGeneration;
+
+  // Transition synchrone vers 'bootstrapping'. Idempotent si déjà bootstrapping.
+  // Note : on ne re-transitionne PAS depuis 'ready' (cas pathologique : si
+  // isSealedSenderReady() était true on aurait fast-paté ; donc on est forcément
+  // dans 'idle' ou 'failed' à ce point).
+  setSealedSenderObservableState('bootstrapping');
+
+  const promise = (async (): Promise<boolean> => {
+    for (let attempt = 0; attempt < BOOTSTRAP_RETRY_DELAYS_MS.length; attempt++) {
+      // Abort/clear pendant le précédent attempt → sortir immédiatement
+      if (signal.aborted || generation !== _bootstrapGeneration) {
+        return false;
+      }
+
+      // Backoff (sauf à la 1re tentative où delay=0)
+      if (BOOTSTRAP_RETRY_DELAYS_MS[attempt] > 0) {
+        __DEV__ && console.log(
+          `[SealedSender] ⏳ Backoff ${BOOTSTRAP_RETRY_DELAYS_MS[attempt]}ms before attempt ${attempt + 1}`
+        );
+        await delayWithAbort(BOOTSTRAP_RETRY_DELAYS_MS[attempt], signal);
+        if (signal.aborted || generation !== _bootstrapGeneration) return false;
+      }
+
+      try {
+        __DEV__ && console.log(`[SealedSender] 🛡️ Bootstrap attempt ${attempt + 1}/${BOOTSTRAP_RETRY_DELAYS_MS.length}`);
+        const ok = await _runBootstrapAttempt(signal, generation);
+        if (ok) return true;
+        // Tentative échouée mais pas d'exception → on continue la boucle
+      } catch (e) {
+        if (signal.aborted) return false;
+        __DEV__ && console.warn(
+          `[SealedSender] ⚠️ Bootstrap attempt ${attempt + 1} threw:`,
+          e
+        );
+        // Continue avec la prochaine tentative
+      }
+    }
+    // Tous les retries épuisés
+    __DEV__ && console.error(
+      `[SealedSender] ❌ Bootstrap FAILED after ${BOOTSTRAP_RETRY_DELAYS_MS.length} attempts`
+    );
+    return false;
+  })();
+
+  _bootstrapPromise = promise;
+
+  // À la résolution (succès, échec, abort) : libérer le singleton et
+  // ajuster l'état observable si on est encore "la génération active".
+  promise.finally(() => {
+    // Ne casser le singleton QUE s'il pointe encore vers cette promesse
+    // (sinon on écrase un cycle plus récent — non, le test ===-promise
+    // garantit qu'on ne casse pas un cycle nouveau).
+    if (_bootstrapPromise === promise) {
+      _bootstrapPromise = null;
+      _bootstrapAbortController = null;
+    }
+    // Ajuster l'état observable seulement si on est encore le cycle "courant"
+    // (i.e. la génération n'a pas bougé). Sinon, clearSealedSenderState ou un
+    // nouveau bootstrap pilote déjà l'état.
+    if (generation === _bootstrapGeneration) {
+      if (isSealedSenderReady()) {
+        // setSenderCertificate l'a déjà mis à 'ready' — idempotent
+        if (_ssState !== 'ready') setSealedSenderObservableState('ready');
+      } else if (!signal.aborted) {
+        // Aucun cert posé ET pas annulé → vraie défaillance
+        setSealedSenderObservableState('failed');
+      } else {
+        // Annulé proprement (clear) : 'idle' est déjà posé par clearSealedSenderState,
+        // mais au cas où on annule via un autre chemin, on retombe sur 'idle'.
+        if (_ssState === 'bootstrapping') setSealedSenderObservableState('idle');
+      }
+    }
+  });
+
+  return promise;
+}
+
+/**
+ * Reset l'état du bootstrap sealed sender pour forcer un nouveau cycle.
+ *
+ * USAGE : escape hatch défensif. Avec la nouvelle architecture, le bootstrap
+ * se reset automatiquement à la fin de chaque cycle (succès ou échec). Cette
+ * fonction reste exposée pour le cas où un appelant veut explicitement
+ * casser un cycle en cours (ex : avant un clear manuel).
+ *
+ * Préfère `ensureSealedSenderBootstrap()` ou `clearSealedSenderState()`
+ * selon l'intention. Cette fonction est conservée pour la compatibilité
+ * avec App.tsx.
+ */
+export function resetSealedSenderBootstrap(): void {
+  if (_bootstrapAbortController) {
+    try { _bootstrapAbortController.abort(); } catch { /* noop */ }
+    _bootstrapAbortController = null;
+  }
+  _bootstrapPromise = null;
+  // On NE touche PAS à la génération ici (clearSealedSenderState le fait)
+  // ni aux clés en mémoire. C'est juste un reset du cycle d'orchestration.
+}
+
+/**
+ * Programme le rafraîchissement du certificat.
+ *
+ * Stratégie : à T-10min de l'expiration, lance un fetch en arrière-plan.
+ * Si le fetch réussit, le nouveau cert remplace l'ancien (sans rupture
+ * de service). Sinon, on invalide et le prochain consommateur déclenchera
+ * un bootstrap complet.
+ */
+function scheduleCertificateRefresh(expiry: number): void {
   if (_certificateRefreshTimer) clearTimeout(_certificateRefreshTimer);
-  
+
   const refreshAt = expiry - CERTIFICATE_REFRESH_MARGIN_MS;
   const delayMs = Math.max(refreshAt - Date.now(), 60_000); // min 1 minute
-  
+
   _certificateRefreshTimer = setTimeout(async () => {
+    _certificateRefreshTimer = null;
     __DEV__ && console.log('[SealedSender] 🔄 Refreshing anonymous certificate...');
+
+    // Si l'état a été clearé entre-temps, ne rien faire (sécurité)
+    if (!_serverSealedSenderPubKey || !_fetchCertificate) {
+      __DEV__ && console.log('[SealedSender] 🔄 Refresh skipped (state cleared)');
+      return;
+    }
+
+    // Refresh indépendant du bootstrap principal : son propre AbortController
+    // pour pouvoir l'annuler depuis clearSealedSenderState SANS interférer
+    // avec un éventuel bootstrap principal concurrent. NB : le bootstrap
+    // principal et le refresh ne sont normalement JAMAIS concurrents
+    // (refresh n'est planifié qu'après un cert établi).
+    const refreshCtrl = new AbortController();
     try {
-      const cert = await fetchFn();
-      if (cert) {
+      const cert = await _fetchCertificate(refreshCtrl.signal);
+      if (cert && _serverSealedSenderPubKey) {
         setSenderCertificate(cert);
-        scheduleCertificateRefresh(cert.expiry, fetchFn);
+        scheduleCertificateRefresh(cert.expiry);
         __DEV__ && console.log('[SealedSender] ✅ Certificate refreshed');
+      } else {
+        // Refresh failed → invalider. Le prochain envoi déclenchera un bootstrap.
+        invalidateSenderCertificate();
+        __DEV__ && console.warn('[SealedSender] ⚠️ Refresh failed, cert invalidated');
       }
-    } catch {
-      // Retry in 5 minutes
-      _certificateRefreshTimer = setTimeout(
-        () => scheduleCertificateRefresh(Date.now() + 10 * 60_000, fetchFn),
-        5 * 60_000
-      );
+    } catch (e) {
+      invalidateSenderCertificate();
+      __DEV__ && console.warn('[SealedSender] ⚠️ Refresh threw, cert invalidated:', e);
     }
   }, delayMs);
 }

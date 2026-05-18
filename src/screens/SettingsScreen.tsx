@@ -2,69 +2,108 @@
 // Paramètres de l'application
 // v5.0 - Design compact et moderne pour le profil
 
-import React, { useState, useEffect } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  ScrollView,
-  TouchableOpacity,
-  Image,
-  Alert,
-  Platform,
-  Switch,
-} from 'react-native';
+import { useState, useEffect } from 'react';
+import { View, Text, ScrollView, TouchableOpacity, Image, Platform, Switch } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useTranslation } from 'react-i18next';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { 
-  getOrCreateDeviceState, 
-  clearAllData, 
-  getGlobalDisplayName, 
-  getGlobalAvatar,
-} from '../services/storage';
+import { clearAllData } from '../services/storage';
 import { isLockEnabled } from '../services/appLock';
 import { getPrivacyStatus } from '../services/privacySettings';
-import { theme, Header, AlertModal } from '../components/ui';
+import { theme, Header, AlertModal, useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 import { Avatar } from '../components/Avatar';
 import { Ionicons } from '@expo/vector-icons';
-import { isSilentMode, setSilentMode, loadSilentMode } from '../services/callTones';
 import { isPushEnabled, setPushEnabled } from '../services/pushNotificationService';
 import { SplashScreen } from './SplashScreen';
+import { getLanguageInfo } from '../i18n';
+// PERF — Lecture du profil depuis la RAM de sessionService au lieu d'AsyncStorage.
+// La donnée est garantie chargée car App.tsx await sessionService.initialize()
+// avant setIsInitializing(false). Cf. Phase 2 / Action 2.x du plan d'action.
+import { sessionService } from '../services/tripleRatchet';
 
 type RootStackParamList = {
   ConversationList: undefined;
   Settings: undefined;
   Security: undefined;
   EditProfile: undefined;
+  Language: undefined;
+  Theme: undefined;
+  MigrationExport: undefined;
 };
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Settings'>;
 
 interface Props {
   onSecurityChange?: () => void;
+  /** Called when the user confirms they want to restore from backup, OVER
+   *  their existing account. App.tsx will then mount MigrationImportScreen.
+   *  The double-confirmation (with typed phrase) is handled in this screen. */
+  onRequestRestore?: () => void;
 }
 
-export function SettingsScreen({ onSecurityChange }: Props) {
+export function SettingsScreen({ onSecurityChange, onRequestRestore }: Props) {
   const navigation = useNavigation<NavigationProp>();
   const insets = useSafeAreaInsets();
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  const { t, i18n } = useTranslation();
+  const { preference: appearancePref } = useTheme();
   
-  const [deviceId, setDeviceId] = useState<string>('');
   const [lockEnabled, setLockEnabled] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [showRestoreConfirm, setShowRestoreConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [relayEnabled, setRelayEnabled] = useState(false);
-  const [silentModeEnabled, setSilentModeEnabled] = useState(false);
   const [pushNotifEnabled, setPushNotifEnabled] = useState(false);
   
-  // Profil
-  const [displayName, setDisplayName] = useState<string>('');
-  const [avatarUri, setAvatarUri] = useState<string | null>(null);
+  // ──────────────────────────────────────────────────────────────────────────
+  // PROFIL — INIT SYNCHRONE DEPUIS LA RAM DE sessionService
+  // ──────────────────────────────────────────────────────────────────────────
+  // Avant : useState('') puis loadInfo() asynchrone (await getGlobalDisplayName
+  //   + await getGlobalAvatar — 2 lectures AsyncStorage + 2 décryptions AES-GCM).
+  //   Le premier paint affichait t('settings.profileSetName') ("Définir le nom")
+  //   et un avatar par défaut, puis se remplissait après ~50-300 ms (avatar
+  //   base64 = grosse string à décrypter). Flash visible à chaque ouverture.
+  //
+  // Après : initialiseur lazy useState(() => sessionService.getMyProfile()).
+  //   sessionService.initialize() (awaité au boot dans App.tsx avant
+  //   setIsInitializing(false)) charge déjà myProfile en RAM via loadProfile().
+  //   getMyProfile() est synchrone, retourne un clone immédiat → premier paint
+  //   avec les bonnes valeurs, zéro flash.
+  //
+  // Subscription onProfileChange : quand EditProfileScreen sauve via
+  //   updateMyProfileDirect(), tous les listeners sont notifiés synchrone-
+  //   ment (cf. sessionService.notifyProfileChange ligne 1318). Plus besoin
+  //   de re-fetch AsyncStorage au focus pour le profil — l'autre useEffect
+  //   navigation.addListener('focus', loadInfo) reste pour les champs non
+  //   profil (lock, push, silent, etc.).
+  //
+  // SÉCURITÉ : aucun changement. Même donnée, même source de vérité, juste
+  //   accédée depuis la RAM au lieu d'un round-trip AsyncStorage + AEAD inutile.
+  // ──────────────────────────────────────────────────────────────────────────
+  const [displayName, setDisplayName] = useState<string>(() => {
+    const p = sessionService.getMyProfile();
+    return p.displayName === 'Anonymous' ? '' : p.displayName;
+  });
+  const [avatarUri, setAvatarUri] = useState<string | null>(() => {
+    return sessionService.getMyProfile().avatarBase64 ?? null;
+  });
   
   // (No profile-edit animations needed — now a dedicated screen)
 
   useEffect(() => {
     loadInfo();
+  }, []);
+
+  // Subscription réactive au profil — pas de re-fetch nécessaire.
+  // updateMyProfileDirect (depuis EditProfileScreen) notifie tous les listeners.
+  useEffect(() => {
+    const unsubscribe = sessionService.onProfileChange((profile) => {
+      setDisplayName(profile.displayName === 'Anonymous' ? '' : profile.displayName);
+      setAvatarUri(profile.avatarBase64 ?? null);
+    });
+    return unsubscribe;
   }, []);
 
   useEffect(() => {
@@ -74,33 +113,20 @@ export function SettingsScreen({ onSecurityChange }: Props) {
 
   const loadInfo = async () => {
     try {
-      const deviceState = await getOrCreateDeviceState();
-      setDeviceId(deviceState.deviceId.substring(0, 16) + '...');
-      
       const locked = await isLockEnabled();
       setLockEnabled(locked);
-      
+
       const privacyStatus = getPrivacyStatus();
       setRelayEnabled(privacyStatus.relayEnabled);
-      
-      const name = await getGlobalDisplayName();
-      setDisplayName(name || '');
-      
-      const avatar = await getGlobalAvatar();
-      setAvatarUri(avatar);
-      
-      const silent = await loadSilentMode();
-      setSilentModeEnabled(silent);
-      
+
+      // Profil : intentionnellement RIEN ici. La source de vérité est
+      // sessionService (init sync au mount + onProfileChange listener).
+      // Cf. bloc commentaire au-dessus du useState displayName.
+
       setPushNotifEnabled(isPushEnabled());
     } catch (e) {
       console.error('Failed to load settings info:', e);
     }
-  };
-
-  const handleToggleSilentMode = async (enabled: boolean) => {
-    setSilentModeEnabled(enabled);
-    await setSilentMode(enabled);
   };
 
   const handleTogglePush = async (enabled: boolean) => {
@@ -138,13 +164,21 @@ export function SettingsScreen({ onSecurityChange }: Props) {
     navigation.navigate('EditProfile');
   };
 
+  const handleLanguagePress = () => {
+    navigation.navigate('Language');
+  };
+
+  const handleAppearancePress = () => {
+    navigation.navigate('Theme');
+  };
+
   // Full-screen loading when clearing data
-  if (clearing) return <SplashScreen statusMessage="Effacement des données…" />;
+  if (clearing) return <SplashScreen statusMessage={t('settings.clearingData')} />;
 
   return (
     <View style={[styles.container, { paddingBottom: insets.bottom }]}>
       <Header
-        title="Paramètres"
+        title={t('settings.title')}
         onBackPress={() => navigation.goBack()}
       />
 
@@ -155,7 +189,7 @@ export function SettingsScreen({ onSecurityChange }: Props) {
       >
         {/* ========== PROFIL ========== */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>PROFIL</Text>
+          <Text style={styles.sectionTitle}>{t('settings.profileSection')}</Text>
           
           <TouchableOpacity
             style={styles.profileRow}
@@ -175,31 +209,31 @@ export function SettingsScreen({ onSecurityChange }: Props) {
             
             <View style={styles.profileContent}>
               <Text style={styles.profileName} numberOfLines={1}>
-                {displayName || 'Définir un pseudo'}
+                {displayName || t('settings.profileSetName')}
               </Text>
-              <Text style={styles.profileHint}>Appuyez pour modifier</Text>
+              <Text style={styles.profileHint} numberOfLines={1}>{t('settings.profileTapToEdit')}</Text>
             </View>
             
-            <Ionicons name="chevron-forward" size={18} color={theme.colors.textMuted} />
+            <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
           </TouchableOpacity>
         </View>
 
         {/* Sécurité */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>SÉCURITÉ</Text>
+          <Text style={styles.sectionTitle}>{t('settings.securitySection')}</Text>
           
           <TouchableOpacity
             style={styles.settingRow}
             onPress={() => navigation.navigate('Security')}
             activeOpacity={0.7}
           >
-            <View style={[styles.settingIcon, { backgroundColor: theme.colors.primary + '15' }]}>
-              <Ionicons name="lock-closed" size={20} color={theme.colors.primary} />
+            <View style={[styles.settingIcon, { backgroundColor: colors.primary + '15' }]}>
+              <Ionicons name="lock-closed" size={20} color={colors.primary} />
             </View>
             <View style={styles.settingContent}>
-              <Text style={styles.settingLabel}>Verrouillage de l'app</Text>
-              <Text style={styles.settingValue}>
-                {lockEnabled ? 'Activé' : 'Désactivé'}
+              <Text style={styles.settingLabel} numberOfLines={1}>{t('settings.appLock')}</Text>
+              <Text style={styles.settingValue} numberOfLines={1}>
+                {lockEnabled ? t('settings.appLockEnabled') : t('settings.appLockDisabled')}
               </Text>
             </View>
             <View style={[
@@ -209,68 +243,121 @@ export function SettingsScreen({ onSecurityChange }: Props) {
               <Ionicons 
                 name={lockEnabled ? 'shield-checkmark' : 'shield-outline'} 
                 size={14} 
-                color={lockEnabled ? theme.colors.success : theme.colors.textMuted} 
+                color={lockEnabled ? colors.success : colors.textMuted} 
               />
             </View>
-            <Ionicons name="chevron-forward" size={18} color={theme.colors.textMuted} />
+            <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
           </TouchableOpacity>
         </View>
 
-        {/* Confidentialité */}
+        {/* Notifications */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>NOTIFICATIONS</Text>
+          <Text style={styles.sectionTitle}>{t('settings.notificationsSection')}</Text>
           
           <View style={styles.settingRow}>
-            <View style={[styles.settingIcon, { backgroundColor: theme.colors.primary + '15' }]}>
-              <Ionicons name="notifications" size={20} color={theme.colors.primary} />
+            <View style={[styles.settingIcon, { backgroundColor: colors.primary + '15' }]}>
+              <Ionicons name="notifications" size={20} color={colors.primary} />
             </View>
             <View style={[styles.settingContent, { flex: 1 }]}>
-              <Text style={styles.settingLabel}>Notifications push</Text>
-              <Text style={[styles.settingValue, { fontSize: 12, marginTop: 2, lineHeight: 16 }]}>
-                Un signal vide transite par Google/Apple — aucun contenu n'est exposé.
+              <Text style={styles.settingLabel} numberOfLines={1}>{t('settings.pushNotifications')}</Text>
+              <Text style={[styles.settingValue, { fontSize: 12, marginTop: 2, lineHeight: 16 }]} numberOfLines={2}>
+                {t('settings.pushNotificationsHint')}
               </Text>
             </View>
             <Switch
               value={pushNotifEnabled}
               onValueChange={handleTogglePush}
-              trackColor={{ false: '#333', true: theme.colors.primary + '60' }}
-              thumbColor={pushNotifEnabled ? theme.colors.primary : '#888'}
+              trackColor={{ false: '#333', true: colors.primary + '60' }}
+              thumbColor={pushNotifEnabled ? colors.primary : '#888'}
             />
           </View>
         </View>
 
+        {/* Général — Langue */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>{t('settings.generalSection')}</Text>
+
+          <TouchableOpacity
+            style={styles.settingRow}
+            onPress={handleLanguagePress}
+            activeOpacity={0.7}
+          >
+            <View style={[styles.settingIcon, { backgroundColor: colors.primary + '15' }]}>
+              <Ionicons name="language" size={20} color={colors.primary} />
+            </View>
+            <View style={styles.settingContent}>
+              <Text style={styles.settingLabel} numberOfLines={1}>{t('settings.language')}</Text>
+              <Text style={styles.settingValue} numberOfLines={1}>
+                {getLanguageInfo(i18n.language)?.name ?? i18n.language}
+              </Text>
+            </View>
+            <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.settingRow, { marginTop: 8 }]}
+            onPress={handleAppearancePress}
+            activeOpacity={0.7}
+          >
+            <View style={[styles.settingIcon, { backgroundColor: colors.primary + '15' }]}>
+              <Ionicons
+                name={
+                  appearancePref === 'light'
+                    ? 'sunny-outline'
+                    : appearancePref === 'dark'
+                    ? 'moon-outline'
+                    : 'phone-portrait-outline'
+                }
+                size={20}
+                color={colors.primary}
+              />
+            </View>
+            <View style={styles.settingContent}>
+              <Text style={styles.settingLabel} numberOfLines={1}>{t('settings.appearance')}</Text>
+              <Text style={styles.settingValue} numberOfLines={1}>
+                {appearancePref === 'light'
+                  ? t('settings.appearanceValueLight')
+                  : appearancePref === 'dark'
+                  ? t('settings.appearanceValueDark')
+                  : t('settings.appearanceValueSystem')}
+              </Text>
+            </View>
+            <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
+          </TouchableOpacity>
+        </View>
+
         {/* Confidentialité */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>CONFIDENTIALITÉ</Text>
+          <Text style={styles.sectionTitle}>{t('settings.privacySection')}</Text>
           
           <View style={styles.privacyCard}>
             <View style={styles.privacyRow}>
               <View style={[styles.checkIcon, styles.checkIconActive]}>
-                <Ionicons name="checkmark" size={16} color={theme.colors.success} />
+                <Ionicons name="checkmark" size={16} color={colors.success} />
               </View>
               <View style={styles.privacyContent}>
-                <Text style={styles.privacyLabel}>Chiffré sur votre appareil</Text>
-                <Text style={styles.privacyDesc}>Le serveur ne peut pas lire vos messages</Text>
+                <Text style={styles.privacyLabel} numberOfLines={1}>{t('settings.privacy.encryptedLocally')}</Text>
+                <Text style={styles.privacyDesc} numberOfLines={2}>{t('settings.privacy.encryptedLocallyDesc')}</Text>
               </View>
             </View>
             
             <View style={styles.privacyRow}>
               <View style={[styles.checkIcon, styles.checkIconActive]}>
-                <Ionicons name="checkmark" size={16} color={theme.colors.success} />
+                <Ionicons name="checkmark" size={16} color={colors.success} />
               </View>
               <View style={styles.privacyContent}>
-                <Text style={styles.privacyLabel}>Clés locales</Text>
-                <Text style={styles.privacyDesc}>Générées uniquement sur votre téléphone</Text>
+                <Text style={styles.privacyLabel} numberOfLines={1}>{t('settings.privacy.localKeys')}</Text>
+                <Text style={styles.privacyDesc} numberOfLines={2}>{t('settings.privacy.localKeysDesc')}</Text>
               </View>
             </View>
             
             <View style={styles.privacyRow}>
               <View style={[styles.checkIcon, styles.checkIconActive]}>
-                <Ionicons name="checkmark" size={16} color={theme.colors.success} />
+                <Ionicons name="checkmark" size={16} color={colors.success} />
               </View>
               <View style={styles.privacyContent}>
-                <Text style={styles.privacyLabel}>Protection renforcée</Text>
-                <Text style={styles.privacyDesc}>Résistant aux futurs ordinateurs quantiques</Text>
+                <Text style={styles.privacyLabel} numberOfLines={1}>{t('settings.privacy.quantumResistant')}</Text>
+                <Text style={styles.privacyDesc} numberOfLines={2}>{t('settings.privacy.quantumResistantDesc')}</Text>
               </View>
             </View>
             
@@ -279,14 +366,14 @@ export function SettingsScreen({ onSecurityChange }: Props) {
                 styles.checkIcon, 
                 relayEnabled ? styles.checkIconActive : styles.checkIconInactive
               ]}>
-                <Ionicons name={relayEnabled ? 'checkmark' : 'ellipse-outline'} size={16} color={relayEnabled ? theme.colors.success : theme.colors.textMuted} />
+                <Ionicons name={relayEnabled ? 'checkmark' : 'ellipse-outline'} size={16} color={relayEnabled ? colors.success : colors.textMuted} />
               </View>
               <View style={styles.privacyContent}>
-                <Text style={[styles.privacyLabel, !relayEnabled && styles.privacyLabelInactive]}>
-                  Relay anonyme
+                <Text style={[styles.privacyLabel, !relayEnabled && styles.privacyLabelInactive]} numberOfLines={1}>
+                  {t('settings.privacy.anonymousRelay')}
                 </Text>
-                <Text style={styles.privacyDesc}>
-                  {relayEnabled ? 'Votre IP est masquée' : 'Non configuré'}
+                <Text style={styles.privacyDesc} numberOfLines={2}>
+                  {relayEnabled ? t('settings.privacy.anonymousRelayActive') : t('settings.privacy.anonymousRelayInactive')}
                 </Text>
               </View>
             </View>
@@ -303,9 +390,51 @@ export function SettingsScreen({ onSecurityChange }: Props) {
 
 
 
+        {/* Sauvegarde et migration */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>{t('settings.migrationSection')}</Text>
+
+          <TouchableOpacity
+            style={styles.settingRow}
+            onPress={() => navigation.navigate('MigrationExport')}
+            activeOpacity={0.7}
+          >
+            <View style={[styles.settingIcon, { backgroundColor: colors.primary + '15' }]}>
+              <Ionicons name="phone-portrait-outline" size={20} color={colors.primary} />
+            </View>
+            <View style={styles.settingContent}>
+              <Text style={styles.settingLabel} numberOfLines={2}>{t('settings.migrateToNewDevice')}</Text>
+              <Text style={[styles.settingValue, { fontSize: 12, marginTop: 2, lineHeight: 16 }]} numberOfLines={2}>
+                {t('settings.migrateHint')}
+              </Text>
+            </View>
+            <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
+          </TouchableOpacity>
+
+          {onRequestRestore && (
+            <TouchableOpacity
+              style={[styles.settingRow, { marginTop: 8 }]}
+              onPress={() => setShowRestoreConfirm(true)}
+              activeOpacity={0.7}
+            >
+              <View style={[styles.settingIcon, { backgroundColor: colors.primary + '15' }]}>
+                <Ionicons name="cloud-download-outline" size={20} color={colors.primary} />
+              </View>
+              <View style={styles.settingContent}>
+                <Text style={styles.settingLabel} numberOfLines={2}>{t('settings.restoreFromBackup')}</Text>
+                <Text style={[styles.settingValue, { fontSize: 12, marginTop: 2, lineHeight: 16 }]} numberOfLines={2}>
+                  {t('settings.restoreFromBackupHint')}
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
+            </TouchableOpacity>
+          )}
+        </View>
+
+
         {/* Zone de danger */}
         <View style={styles.section}>
-          <Text style={[styles.sectionTitle, styles.dangerSectionTitle]}>ZONE DE DANGER</Text>
+          <Text style={[styles.sectionTitle, styles.dangerSectionTitle]}>{t('settings.dangerSection')}</Text>
           
           <TouchableOpacity
             style={styles.dangerRow}
@@ -313,15 +442,15 @@ export function SettingsScreen({ onSecurityChange }: Props) {
             activeOpacity={0.7}
           >
             <View style={[styles.settingIcon, styles.dangerIcon]}>
-              <Ionicons name="trash-outline" size={20} color={theme.colors.danger} />
+              <Ionicons name="trash-outline" size={20} color={colors.danger} />
             </View>
             <View style={styles.settingContent}>
-              <Text style={styles.dangerLabel}>Effacer toutes les données</Text>
-              <Text style={styles.dangerHint}>
-                Supprime définitivement conversations et messages
+              <Text style={styles.dangerLabel} numberOfLines={1}>{t('settings.clearAll')}</Text>
+              <Text style={styles.dangerHint} numberOfLines={2}>
+                {t('settings.clearAllHint')}
               </Text>
             </View>
-            <Ionicons name="chevron-forward" size={18} color={theme.colors.danger + '60'} />
+            <Ionicons name="chevron-forward" size={18} color={colors.danger + '60'} />
           </TouchableOpacity>
         </View>
 
@@ -349,28 +478,51 @@ export function SettingsScreen({ onSecurityChange }: Props) {
       <AlertModal
         visible={showClearConfirm}
         onClose={() => setShowClearConfirm(false)}
-        title="Effacer toutes les données"
-        message="Cette action supprimera définitivement toutes vos conversations et messages. Cette action est irréversible."
-        icon={<Ionicons name="warning" size={48} color={theme.colors.warning} />}
+        title={t('settings.clearAllConfirmTitle')}
+        message={t('settings.clearAllConfirmMessage')}
+        icon={<Ionicons name="warning" size={48} color={colors.warning} />}
         primaryButton={{
-          title: 'Effacer tout',
+          title: t('settings.clearAllConfirmAction'),
           onPress: handleClearData,
           variant: 'danger',
           loading: clearing,
         }}
         secondaryButton={{
-          title: 'Annuler',
+          title: t('common.cancel'),
           onPress: () => setShowClearConfirm(false),
+        }}
+      />
+
+      {/* Modal de confirmation restore (avertissement écrasement compte) */}
+      <AlertModal
+        visible={showRestoreConfirm}
+        onClose={() => setShowRestoreConfirm(false)}
+        title={t('settings.restoreConfirmTitle')}
+        message={t('settings.restoreConfirmMessage')}
+        icon={<Ionicons name="alert-circle" size={48} color={colors.danger} />}
+        primaryButton={{
+          title: t('settings.restoreConfirmAction'),
+          onPress: () => {
+            setShowRestoreConfirm(false);
+            // Defer slightly so the modal close animation completes before
+            // the import screen mounts (otherwise we get a weird stack jump).
+            setTimeout(() => onRequestRestore?.(), 150);
+          },
+          variant: 'danger',
+        }}
+        secondaryButton={{
+          title: t('common.cancel'),
+          onPress: () => setShowRestoreConfirm(false),
         }}
       />
     </View>
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   container: {
     flex: 1,
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
   },
   scrollView: {
     flex: 1,
@@ -386,11 +538,11 @@ const styles = StyleSheet.create({
   profileRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 16,
     padding: 14,
     borderWidth: 1,
-    borderColor: theme.colors.border,
+    borderColor: colors.border,
   },
   profileAvatarContainer: {
     position: 'relative',
@@ -403,11 +555,11 @@ const styles = StyleSheet.create({
     width: 24,
     height: 24,
     borderRadius: 12,
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 2.5,
-    borderColor: theme.colors.surface,
+    borderColor: colors.surface,
   },
   profileContent: {
     flex: 1,
@@ -415,12 +567,12 @@ const styles = StyleSheet.create({
   profileName: {
     fontSize: 17,
     fontWeight: '600',
-    color: theme.colors.text,
+    color: colors.text,
     marginBottom: 2,
   },
   profileHint: {
     fontSize: 14,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
   },
   
   // ============================================
@@ -432,13 +584,13 @@ const styles = StyleSheet.create({
   sectionTitle: {
     fontSize: 13,
     fontWeight: '600',
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     letterSpacing: 0.5,
     marginBottom: 12,
     marginLeft: 4,
   },
   dangerSectionTitle: {
-    color: theme.colors.danger,
+    color: colors.danger,
   },
   
   // Setting Row
@@ -446,7 +598,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 16,
     padding: 16,
   },
@@ -467,16 +619,16 @@ const styles = StyleSheet.create({
   settingLabel: {
     fontSize: 16,
     fontWeight: '500',
-    color: theme.colors.text,
+    color: colors.text,
     marginBottom: 2,
   },
   settingValue: {
     fontSize: 14,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
   },
   chevron: {
     fontSize: 24,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     marginLeft: 8,
   },
   // Notification settings extras
@@ -498,7 +650,7 @@ const styles = StyleSheet.create({
   },
   settingDesc: {
     fontSize: 12,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     marginTop: 2,
   },
   
@@ -510,25 +662,25 @@ const styles = StyleSheet.create({
     marginRight: 8,
   },
   statusActive: {
-    backgroundColor: theme.colors.success + '20',
+    backgroundColor: colors.success + '20',
   },
   statusInactive: {
-    backgroundColor: theme.colors.surfaceLight,
+    backgroundColor: colors.surfaceLight,
   },
   statusText: {
     fontSize: 12,
     fontWeight: '700',
   },
   statusTextActive: {
-    color: theme.colors.success,
+    color: colors.success,
   },
   statusTextInactive: {
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
   },
   
   // Privacy Card
   privacyCard: {
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 16,
     padding: 6,
   },
@@ -537,7 +689,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     padding: 12,
     borderBottomWidth: 1,
-    borderBottomColor: theme.colors.divider,
+    borderBottomColor: colors.divider,
   },
   privacyRowLast: {
     borderBottomWidth: 0,
@@ -551,18 +703,18 @@ const styles = StyleSheet.create({
     marginRight: 14,
   },
   checkIconActive: {
-    backgroundColor: theme.colors.success + '20',
+    backgroundColor: colors.success + '20',
   },
   checkIconInactive: {
-    backgroundColor: theme.colors.surfaceLight,
+    backgroundColor: colors.surfaceLight,
   },
   checkText: {
     fontSize: 14,
     fontWeight: '700',
-    color: theme.colors.success,
+    color: colors.success,
   },
   checkTextInactive: {
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
   },
   privacyContent: {
     flex: 1,
@@ -570,33 +722,33 @@ const styles = StyleSheet.create({
   privacyLabel: {
     fontSize: 15,
     fontWeight: '500',
-    color: theme.colors.text,
+    color: colors.text,
     marginBottom: 2,
   },
   privacyLabelInactive: {
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
   },
   privacyDesc: {
     fontSize: 13,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
   },
   privacyTechNote: {
     marginTop: 16,
     paddingTop: 12,
     borderTopWidth: 1,
-    borderTopColor: theme.colors.divider,
+    borderTopColor: colors.divider,
     alignItems: 'center',
   },
   privacyTechText: {
     fontSize: 11,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     letterSpacing: 0.3,
   },
   
   // Info Section
   infoSection: {
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 16,
     overflow: 'hidden',
   },
@@ -606,18 +758,18 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     padding: 16,
     borderBottomWidth: 1,
-    borderBottomColor: theme.colors.divider,
+    borderBottomColor: colors.divider,
   },
   infoRowLast: {
     borderBottomWidth: 0,
   },
   infoLabel: {
     fontSize: 15,
-    color: theme.colors.text,
+    color: colors.text,
   },
   infoValue: {
     fontSize: 14,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
     maxWidth: '50%',
     textAlign: 'right',
   },
@@ -626,24 +778,24 @@ const styles = StyleSheet.create({
   dangerRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: theme.colors.danger + '10',
+    backgroundColor: colors.danger + '10',
     borderRadius: 16,
     padding: 16,
     borderWidth: 1,
-    borderColor: theme.colors.danger + '30',
+    borderColor: colors.danger + '30',
   },
   dangerIcon: {
-    backgroundColor: theme.colors.danger + '20',
+    backgroundColor: colors.danger + '20',
   },
   dangerLabel: {
     fontSize: 16,
     fontWeight: '500',
-    color: theme.colors.danger,
+    color: colors.danger,
     marginBottom: 2,
   },
   dangerHint: {
     fontSize: 13,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
   },
   
   // About Section
@@ -655,7 +807,7 @@ const styles = StyleSheet.create({
   aboutCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 20,
     paddingVertical: 16,
     paddingHorizontal: 20,
@@ -675,17 +827,17 @@ const styles = StyleSheet.create({
   aboutTitle: {
     fontSize: 22,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
     letterSpacing: -0.3,
   },
   aboutTagline: {
     fontSize: 13,
-    color: theme.colors.primary,
+    color: colors.primary,
     fontWeight: '500',
     marginTop: 2,
   },
   versionBadge: {
-    backgroundColor: theme.colors.primary + '15',
+    backgroundColor: colors.primary + '15',
     paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 10,
@@ -693,16 +845,16 @@ const styles = StyleSheet.create({
   versionText: {
     fontSize: 13,
     fontWeight: '600',
-    color: theme.colors.primary,
+    color: colors.primary,
   },
   aboutCopyright: {
     fontSize: 11,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     textAlign: 'center',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     letterSpacing: 0.3,
   },
   
-});
+}) as const;
 
 export default SettingsScreen;

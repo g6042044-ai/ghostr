@@ -13,18 +13,10 @@
 // - S'abonne automatiquement au callHeartbeat pour les mises à jour en temps réel
 
 import React, { useEffect, useState, useRef, memo } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  Animated,
-} from 'react-native';
+import { View, Text, StyleSheet, Animated } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import {
-  getActiveCall,
-  addCallStateListener,
-  ActiveCallInfo,
-} from '../services/callHeartbeat';
+import { getActiveCall, addCallStateListener, ActiveCallInfo } from '../services/callHeartbeat';
+import { useThemedStyles, type ColorPalette } from './ui';
 
 // ============================================
 // TYPES
@@ -70,6 +62,7 @@ export const CallIndicator: React.FC<CallIndicatorProps> = memo(({
   size = 'medium',
   showParticipantCount = true,
 }) => {
+  const styles = useThemedStyles(makeStyles);
   const [activeCall, setActiveCall] = useState<ActiveCallInfo | null>(() => 
     getActiveCall(conversationId)
   );
@@ -179,6 +172,7 @@ interface CallDotIndicatorProps {
 export const CallDotIndicator: React.FC<CallDotIndicatorProps> = memo(({
   conversationId,
 }) => {
+  const styles = useThemedStyles(makeStyles);
   const [hasActiveCall, setHasActiveCall] = useState(false);
   const pulseAnim = useRef(new Animated.Value(1)).current;
   
@@ -242,7 +236,7 @@ export const CallDotIndicator: React.FC<CallDotIndicatorProps> = memo(({
 // STYLES
 // ============================================
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => StyleSheet.create({
   container: {
     position: 'absolute',
     bottom: -4,
@@ -252,12 +246,14 @@ const styles = StyleSheet.create({
     zIndex: 10,
   },
   iconCircle: {
-    backgroundColor: '#00A884',
+    backgroundColor: colors.online,
     justifyContent: 'center',
     alignItems: 'center',
     borderWidth: 2,
-    borderColor: '#0A0F14',
-    shadowColor: '#00A884',
+    // borderColor is the cutout against the page — must match the surface
+    // the avatar/icon sits on. Was hardcoded to dark bg in v1.
+    borderColor: colors.background,
+    shadowColor: colors.online,
     shadowOffset: { width: 0, height: 0 },
     shadowOpacity: 0.5,
     shadowRadius: 4,
@@ -267,11 +263,11 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: -4,
     right: -4,
-    backgroundColor: '#FF6B6B',
+    backgroundColor: colors.error,
     justifyContent: 'center',
     alignItems: 'center',
     borderWidth: 1.5,
-    borderColor: '#0A0F14',
+    borderColor: colors.background,
     paddingHorizontal: 3,
   },
   badgeText: {
@@ -290,17 +286,17 @@ const styles = StyleSheet.create({
     width: 14,
     height: 14,
     borderRadius: 7,
-    backgroundColor: 'rgba(0, 168, 132, 0.3)',
+    backgroundColor: colors.online + '4D', // ~30% alpha
     justifyContent: 'center',
     alignItems: 'center',
     borderWidth: 2,
-    borderColor: '#0A0F14',
+    borderColor: colors.background,
   },
   dotInner: {
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: '#00A884',
+    backgroundColor: colors.online,
   },
 });
 

@@ -22,7 +22,7 @@
 
 // @ts-ignore - Import avec extension pour compatibilité ESM
 import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
-import { zeroize, bytesToHex, hmacSha256 } from './primitives';
+import { zeroize, hmacSha256 } from './primitives';
 
 // ============================================
 // CONSTANTES ML-KEM-768
@@ -286,8 +286,7 @@ function berlekampMassey(synd: Uint8Array, nsym: number): Uint8Array {
  */
 function chienSearch(errLoc: Uint8Array, msgLen: number): number[] {
   const positions: number[] = [];
-  const degree = errLoc.findIndex((v, i) => i > 0 && v !== 0) || errLoc.length - 1;
-  
+
   for (let i = 0; i < msgLen; i++) {
     let sum = 0;
     for (let j = 0; j < errLoc.length; j++) {

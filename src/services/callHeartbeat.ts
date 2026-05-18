@@ -1,11 +1,9 @@
 // src/services/callHeartbeat.ts
-// État et listeners pour les appels actifs (affichage CallIndicator)
+// État et listeners pour les appels actifs (affichage CallIndicator).
 //
-// v13.0 - NETTOYAGE:
-//   - Suppression de l'envoi de heartbeat (callSignaling → ratchet legacy)
-//   - Suppression du tracking participants groupe (voiceCall.ts supprimé)
-//   - Le système actif (call1to1Service) gère ses propres appels
-//   - Ce fichier conserve uniquement l'état et les listeners pour le CallIndicator UI
+// Rôle : exposer l'info "il y a un appel en cours" au CallIndicator UI.
+// Le système actif (call1to1Service) gère ses propres appels et notifie ce
+// service via les listeners exportés ci-dessous.
 
 // ============================================
 // TYPES

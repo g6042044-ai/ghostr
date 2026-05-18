@@ -10,18 +10,15 @@
 // - Pas de hash stocké (vérification par déchiffrement)
 
 import * as SecureStore from 'expo-secure-store';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
-import { 
-  deriveKey, 
-  deriveKeyWithParams, 
-  generateSalt, 
-  deriveSubKey, 
-  deriveKeyLegacyV2,
-  needsMigration,
-  getAlgorithmInfo,
-  AlgorithmInfo,
-} from './kdf';
+import i18n from '../i18n';
+import { deriveKey, deriveKeyWithParams, deriveSubKey, deriveKeyLegacyV2, needsMigration, getAlgorithmInfo, ArgonUnavailableError } from './kdf';
+
+// Re-export pour que l'UI (SecurityScreen, LockScreen) puisse catcher cette
+// erreur spécifique sans importer directement depuis ./kdf.
+export { ArgonUnavailableError } from './kdf';
 import { securityLogger } from './securityLogger';
 
 // ============================================
@@ -98,6 +95,111 @@ const KEY_CONTEXTS = {
   CONVERSATIONS: 'whisper:conversations:v6', // Chiffrement conversations
   BIOMETRIC: 'whisper:biometric:v6',         // Stockage biométrique
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// OPTIONS SECURESTORE — DURCISSEMENT KEYCHAIN iOS
+// ════════════════════════════════════════════════════════════════════════════
+// `WHEN_UNLOCKED_THIS_DEVICE_ONLY` correspond à `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` :
+//
+//   • WHEN_UNLOCKED : l'item n'est lisible que lorsque l'appareil est
+//     déverrouillé. Empêche le déchiffrement quand le device est verrouillé
+//     (notamment si l'attaquant a un dump à froid de la mémoire flash).
+//
+//   • THIS_DEVICE_ONLY : l'item N'EST PAS sauvegardé dans iCloud Keychain et
+//     N'EST PAS migré lors d'un transfert iPhone → iPhone. Sans ce flag,
+//     `whisper_lock_data_v6` pourrait théoriquement se synchroniser sur un
+//     autre appareil de l'utilisateur via iCloud Keychain — exfiltration
+//     hors du device d'origine.
+//
+// IMPORTANT : changer ce flag pour un item EXISTANT requiert une suppression
+// + recréation. expo-secure-store fait cela automatiquement (en interne, un
+// `setItemAsync` sur iOS exécute SecItemDelete puis SecItemAdd avec les
+// nouvelles options). Donc les utilisateurs existants verront leurs données
+// migrées vers les nouvelles options dès le premier `setupLock`,
+// `changePassword` ou migration KDF (V4→V6, V5→V6, etc.) qui suivra cette
+// mise à jour.
+//
+// Pour les utilisateurs qui ne changent jamais leur mot de passe et n'ont
+// pas de migration KDF en attente, leurs anciennes entrées garderont l'ancien
+// flag `kSecAttrAccessibleWhenUnlocked` (sans `ThisDeviceOnly`). Pour forcer
+// une migration immédiate, il faudrait ajouter une routine au boot qui
+// re-écrit chaque entrée avec les nouvelles options — non implémenté ici
+// pour limiter le scope du fix. Le risque résiduel est faible : iCloud
+// Keychain n'est activé que si l'utilisateur l'a explicitement opté, et
+// les données restent chiffrées par le mot de passe.
+// ════════════════════════════════════════════════════════════════════════════
+const LOCK_STORE_OPTIONS: SecureStore.SecureStoreOptions = {
+  keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+  requireAuthentication: false,
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// HINT DE PRÉSENCE DU LOCK — STOCKAGE RAPIDE PARALLÈLE
+// ════════════════════════════════════════════════════════════════════════════
+// Problème résolu : `isLockEnabled()` fait JUSQU'À 5 appels SecureStore.getItem
+// séquentiels (vérification de toutes les versions v6/v5/v4/v3/legacy pour
+// migration). Au cold start, le service Android Keystore n'est pas pré-chauffé
+// (notamment après que le LMK ait tué le process en background) : chaque appel
+// peut prendre 50-300 ms, soit 250-1500 ms cumulés. Pendant ce temps, App.tsx
+// affiche son `<View>` initialCover (noir).
+//
+// Solution : dupliquer l'information « lock activé ou pas » dans AsyncStorage
+// (plaintext, pas sensible — on ne stocke que le booléen, pas le mot de passe
+// ni rien de cryptographique). AsyncStorage est ~5-10x plus rapide que
+// SecureStore au cold start (1 appel ~5-30 ms typique). Lecture au top-level
+// d'App.tsx avant le mount React → décision lock/no-lock prise dès le 1er
+// rendu → plus de phase « écran noir d'attente ».
+//
+// SÉCURITÉ : aucune. Le hint dit juste « il y a un lock à vérifier » ou non.
+//   - Si attaquant met le hint à `false` : on tente de booter normalement,
+//     mais `initializeApp` lit `isLockEnabled()` (SecureStore, source de vérité)
+//     et trouve les données chiffrées → bascule sur LockScreen quand même.
+//     Au pire, l'attaquant gagne quelques centaines de ms — sans aucune donnée.
+//   - Si attaquant met le hint à `true` alors qu'il n'y a pas de lock : on
+//     affiche le LockScreen, l'utilisateur tape n'importe quoi, le déchiffrement
+//     échoue → message « mot de passe incorrect » pour toujours. DoS local
+//     mineur (l'utilisateur peut effacer l'app), pas une fuite de données.
+//   - La SOURCE DE VÉRITÉ reste les données chiffrées dans SecureStore.
+//     Le hint n'est qu'une optimisation d'affichage.
+// ════════════════════════════════════════════════════════════════════════════
+export const LOCK_HINT_KEY = '@ghostr_lock_hint_v1';
+
+/**
+ * Écrit le hint indiquant la présence (ou l'absence) d'un verrouillage configuré.
+ * Appelé après setupLock (true), disableLock (false), nuclearReset (false).
+ * Non bloquant : si l'écriture échoue (peu probable), le boot suivant tombera
+ * en fallback sur isLockEnabled() — la sécurité n'est pas affectée.
+ */
+export async function setLockHint(enabled: boolean): Promise<void> {
+  try {
+    await AsyncStorage.setItem(LOCK_HINT_KEY, enabled ? 'true' : 'false');
+  } catch (e) {
+    __DEV__ && console.warn('[appLock] setLockHint write failed (non-fatal):', e);
+  }
+}
+
+/**
+ * Lecture rapide du hint. Renvoie :
+ *   - `true`  : un verrouillage est probablement configuré → afficher LockScreen
+ *   - `false` : pas de verrouillage → boot normal
+ *   - `null`  : aucun hint stocké (1ère exécution post-installation du fix, ou
+ *               après nuclearReset). L'appelant doit tomber sur isLockEnabled().
+ *
+ * Cette fonction est destinée à être appelée AU PLUS TÔT possible, idéalement
+ * au top-level d'App.tsx (avant que React mount) pour que le résultat soit
+ * disponible au 1er rendu.
+ */
+export async function getLockHint(): Promise<boolean | null> {
+  try {
+    const v = await AsyncStorage.getItem(LOCK_HINT_KEY);
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+// ════════════════════════════════════════════════════════════════════════════
 
 // Délais de lockout progressifs (en secondes)
 const LOCKOUT_SCHEDULE = [
@@ -192,9 +294,9 @@ export function estimatePasswordStrength(password: string): PasswordStrength {
     return {
       score: 0,
       entropy: 0,
-      crackTime: 'instantané',
+      crackTime: i18n.t('passwordStrength.crackTime.instant'),
       isAcceptable: false,
-      feedback: ['Minimum 8 caractères requis'],
+      feedback: [i18n.t('passwordStrength.feedback.minChars', { min: 8 })],
     };
   }
   
@@ -217,20 +319,20 @@ export function estimatePasswordStrength(password: string): PasswordStrength {
   const isPureNumeric = /^\d+$/.test(password);
   if (isPureNumeric) {
     entropy = Math.log2(10) * password.length;
-    feedback.push('Ajoutez des lettres pour augmenter la sécurité');
+    feedback.push(i18n.t('passwordStrength.feedback.addLetters'));
   }
   
   // Penalty for sequential/repeated patterns
   const hasSequential = /(?:012|123|234|345|456|567|678|789|890|abc|bcd|cde|def)/i.test(password);
   if (hasSequential) {
     entropy *= 0.7;
-    feedback.push('Évitez les séquences (123, abc...)');
+    feedback.push(i18n.t('passwordStrength.feedback.avoidSequences'));
   }
   
   const hasRepeated = /(.)\1{2,}/.test(password);
   if (hasRepeated) {
     entropy *= 0.7;
-    feedback.push('Évitez les caractères répétés');
+    feedback.push(i18n.t('passwordStrength.feedback.avoidRepeats'));
   }
   
   // Common passwords penalty
@@ -241,7 +343,7 @@ export function estimatePasswordStrength(password: string): PasswordStrength {
   const lowerPw = password.toLowerCase();
   if (commonPatterns.some(p => lowerPw.includes(p))) {
     entropy *= 0.3;
-    feedback.push('Ce mot de passe est trop commun');
+    feedback.push(i18n.t('passwordStrength.feedback.tooCommon'));
   }
   
   // Determine score
@@ -256,30 +358,30 @@ export function estimatePasswordStrength(password: string): PasswordStrength {
   
   if (secondsToCrack < 60) {
     score = 0;
-    crackTime = 'moins d\'une minute';
+    crackTime = i18n.t('passwordStrength.crackTime.lessThanMinute');
   } else if (secondsToCrack < 3600) {
     score = 1;
-    crackTime = `~${Math.round(secondsToCrack / 60)} minutes`;
+    crackTime = i18n.t('passwordStrength.crackTime.minutes', { count: Math.round(secondsToCrack / 60) });
   } else if (secondsToCrack < 86400 * 30) {
     score = 2;
-    crackTime = `~${Math.round(secondsToCrack / 86400)} jours`;
+    crackTime = i18n.t('passwordStrength.crackTime.days', { count: Math.round(secondsToCrack / 86400) });
   } else if (secondsToCrack < 86400 * 365 * 100) {
     score = 3;
-    crackTime = `~${Math.round(secondsToCrack / (86400 * 365))} ans`;
+    crackTime = i18n.t('passwordStrength.crackTime.years', { count: Math.round(secondsToCrack / (86400 * 365)) });
   } else {
     score = 4;
-    crackTime = 'des siècles';
+    crackTime = i18n.t('passwordStrength.crackTime.centuries');
   }
   
   // Suggestions
   if (password.length < 12) {
-    feedback.push('Un mot de passe de 12+ caractères est recommandé');
+    feedback.push(i18n.t('passwordStrength.feedback.recommend12'));
   }
   if (!hasLower || !hasUpper) {
-    feedback.push('Mélangez majuscules et minuscules');
+    feedback.push(i18n.t('passwordStrength.feedback.mixCase'));
   }
   if (!hasSpecial && !hasDigits) {
-    feedback.push('Ajoutez des chiffres ou caractères spéciaux');
+    feedback.push(i18n.t('passwordStrength.feedback.addNumbers'));
   }
   
   // Minimum acceptable: score >= 2 (at least days to crack with Argon2id)
@@ -298,7 +400,8 @@ export function estimatePasswordStrength(password: string): PasswordStrength {
 export async function setAutoWipeEnabled(enabled: boolean): Promise<void> {
   await SecureStore.setItemAsync(
     STORAGE_KEYS.AUTO_WIPE_ENABLED,
-    enabled ? 'true' : 'false'
+    enabled ? 'true' : 'false',
+    LOCK_STORE_OPTIONS
   );
   __DEV__ && console.log(`🔒 Auto-wipe ${enabled ? 'ENABLED' : 'DISABLED'}`);
 }
@@ -349,27 +452,82 @@ async function performSecurityWipe(): Promise<void> {
  */
 export async function isLockEnabled(): Promise<boolean> {
   try {
+    let result = false;
     // Vérifier v6
     const dataV6 = await SecureStore.getItemAsync(STORAGE_KEYS.LOCK_DATA);
-    if (dataV6) return true;
-    
-    // Vérifier v5
-    const dataV5 = await SecureStore.getItemAsync(STORAGE_KEYS.LOCK_DATA_V5);
-    if (dataV5) return true;
-    
-    // Vérifier v4
-    const dataV4 = await SecureStore.getItemAsync(STORAGE_KEYS.LOCK_DATA_V4);
-    if (dataV4) return true;
-    
-    // Vérifier v3
-    const dataV3 = await SecureStore.getItemAsync(STORAGE_KEYS.LEGACY_V3_DATA);
-    if (dataV3) return true;
-    
-    // Vérifier legacy
-    const legacyEnabled = await SecureStore.getItemAsync(STORAGE_KEYS.LEGACY_ENABLED);
-    return legacyEnabled === 'true';
+    if (dataV6) { result = true; }
+    else {
+      // Vérifier v5
+      const dataV5 = await SecureStore.getItemAsync(STORAGE_KEYS.LOCK_DATA_V5);
+      if (dataV5) { result = true; }
+      else {
+        // Vérifier v4
+        const dataV4 = await SecureStore.getItemAsync(STORAGE_KEYS.LOCK_DATA_V4);
+        if (dataV4) { result = true; }
+        else {
+          // Vérifier v3
+          const dataV3 = await SecureStore.getItemAsync(STORAGE_KEYS.LEGACY_V3_DATA);
+          if (dataV3) { result = true; }
+          else {
+            // Vérifier legacy
+            const legacyEnabled = await SecureStore.getItemAsync(STORAGE_KEYS.LEGACY_ENABLED);
+            if (legacyEnabled === 'true') { result = true; }
+          }
+        }
+      }
+    }
+
+    // AUTO-MIGRATION DU HINT
+    // ──────────────────────────────────────────────────────────────────────
+    // Met à jour le hint AsyncStorage en arrière-plan avec le résultat qu'on
+    // vient de calculer via SecureStore (source de vérité). Ainsi, après le
+    // 1er boot post-installation du fix, les boots suivants pourront utiliser
+    // getLockHint() rapide au lieu d'appeler à nouveau cette fonction lente.
+    // Fire-and-forget : on ne bloque PAS le retour de isLockEnabled().
+    setLockHint(result).catch(() => {});
+
+    return result;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Version "fast-path" de isLockEnabled, non bloquante en cas de gel du
+ * Keystore Android (rare mais observé au cold start juste après un reboot,
+ * le temps que le service Keystore soit prêt).
+ *
+ * Utilisée par App.tsx dans une micro-phase d'amorçage (avant toute autre I/O)
+ * pour décider au plus vite s'il faut afficher le LockScreen ou le SplashScreen :
+ *   - `true`  → verrouillage configuré, rendre le LockScreen IMMÉDIATEMENT.
+ *   - `false` → pas de verrouillage, continuer le boot normal.
+ *   - `null`  → timeout atteint (Keystore indisponible) : l'appelant doit
+ *              basculer sur le chemin lent (SplashScreen + isLockEnabled).
+ *
+ * Contrainte de sécurité : cette fonction n'expose AUCUNE donnée dérivée du
+ * lock. Elle ne fait que tester la présence d'une entrée SecureStore. Les
+ * clés de chiffrement restent en place (ou absentes) et ne sont jamais lues.
+ *
+ * La résolution `null` de la Promise `timeout` est explicite et libère
+ * l'await immédiatement ; la Promise `read` continue à s'exécuter en
+ * arrière-plan (on ne peut pas annuler une getItemAsync), mais son résultat
+ * est ignoré. Aucun handle fuit car setTimeout est nettoyé en finally.
+ *
+ * @param timeoutMs délai maximal avant fallback. 1500ms couvre 99.9% des
+ *                  cold starts Android (Keystore prêt en < 300ms typiquement).
+ */
+export async function isLockEnabledFast(timeoutMs = 1500): Promise<boolean | null> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<null>((resolve) => {
+    timeoutHandle = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      isLockEnabled().catch(() => false as boolean),
+      timeout,
+    ]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
   }
 }
 
@@ -567,7 +725,7 @@ export async function setupLock(
       conversationsKeyNonce,
     };
     
-    await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(lockData));
+    await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(lockData), LOCK_STORE_OPTIONS);
     
     // 6. Réinitialiser les compteurs
     await resetBruteForceCounters();
@@ -579,9 +737,37 @@ export async function setupLock(
     derivedKey.fill(0);
     masterKey.fill(0);
     
+    // 9. Écrire le hint AsyncStorage pour que le prochain cold start puisse
+    // afficher le LockScreen IMMÉDIATEMENT sans attendre les 5 reads SecureStore.
+    // Fait après le succès complet de l'écriture des données chiffrées —
+    // ainsi en cas de crash entre l'étape 5 et 9, le hint absent forcera
+    // un fallback sur isLockEnabled() au prochain boot, qui réécrira le hint.
+    await setLockHint(true);
+
+    // 10. Sceller le sentinel d'installation. Garantit que firstLaunchGuard ne
+    // purgera pas ce qu'on vient juste de configurer si le sentinel n'avait
+    // pas pu être posé pour une raison quelconque au boot précédent.
+    try {
+      const { sealInstallSentinel } = await import('./firstLaunchGuard');
+      await sealInstallSentinel();
+    } catch {
+      // Non-critique : le pire qui puisse arriver est qu'au prochain cold
+      // start le firstLaunchGuard repurge — mais comme l'utilisateur vient
+      // de configurer le mdp, l'app sera dans un état post-onboarding et
+      // donc reconnue comme "update" par le guard, pas comme "reinstall".
+    }
+
     __DEV__ && console.log('✅ Verrouillage v6 configuré');
     return true;
   } catch (e) {
+    // ArgonUnavailableError : erreur de configuration du build — doit remonter
+    // jusqu'à l'UI pour afficher un message actionnable au lieu d'un échec
+    // silencieux. Les autres erreurs (SecureStore plein, etc.) restent avalées
+    // pour ne pas casser l'UX sur des cas non-critiques.
+    if (e instanceof ArgonUnavailableError) {
+      console.error('[appLock] Argon2 unavailable during setupLock:', e.message);
+      throw e;
+    }
     __DEV__ && console.error('setupLock error:', e);
     return false;
   }
@@ -609,10 +795,18 @@ export async function disableLock(password: string): Promise<boolean> {
     
     // Nettoyer les anciennes versions
     await cleanupLegacyData();
-    
+
+    // Écrire le hint à false : prochain cold start ira directement en boot
+    // normal sans même afficher le LockScreen brièvement.
+    await setLockHint(false);
+
     __DEV__ && console.log('✅ Verrouillage désactivé');
     return true;
   } catch (e) {
+    if (e instanceof ArgonUnavailableError) {
+      console.error('[appLock] Argon2 unavailable during disableLock:', e.message);
+      throw e;
+    }
     __DEV__ && console.error('disableLock error:', e);
     return false;
   }
@@ -632,7 +826,7 @@ export async function updateLockSettings(
       const lockData: StoredLockData = JSON.parse(dataV5);
       lockData.useBiometrics = useBiometrics;
       lockData.timeoutMinutes = timeoutMinutes;
-      await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(lockData));
+      await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(lockData), LOCK_STORE_OPTIONS);
       return true;
     }
     
@@ -642,7 +836,7 @@ export async function updateLockSettings(
       const lockData: StoredLockDataV4 = JSON.parse(dataV4);
       lockData.useBiometrics = useBiometrics;
       lockData.timeoutMinutes = timeoutMinutes;
-      await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA_V4, JSON.stringify(lockData));
+      await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA_V4, JSON.stringify(lockData), LOCK_STORE_OPTIONS);
       return true;
     }
     
@@ -726,7 +920,7 @@ export async function changePassword(
       conversationsKeyNonce: lockData.conversationsKeyNonce,
     };
     
-    await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData));
+    await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData), LOCK_STORE_OPTIONS);
     
     // Supprimer les anciennes versions si elles existaient
     await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA_V5);
@@ -746,6 +940,10 @@ export async function changePassword(
     __DEV__ && console.log('✅ Mot de passe changé');
     return true;
   } catch (e) {
+    if (e instanceof ArgonUnavailableError) {
+      console.error('[appLock] Argon2 unavailable during changePassword:', e.message);
+      throw e;
+    }
     __DEV__ && console.error('changePassword error:', e);
     return false;
   }
@@ -804,9 +1002,32 @@ export async function getEncryptionKeysWithInfo(
         // Vérifier si migration interne nécessaire (anciens params KDF dans V6)
         const lockData: StoredLockData = JSON.parse(dataV6);
         if (needsMigration(lockData.kdfParams)) {
-          // Migration silencieuse en background
-          __DEV__ && console.log('🔄 Migration silencieuse des paramètres KDF...');
-          await migrateKdfParams(password, lockData, result.keys);
+          // ────────────────────────────────────────────────────────────────
+          // Migration KDF en VRAI arrière-plan — ne bloque PAS le return.
+          // ────────────────────────────────────────────────────────────────
+          // Avant : `await migrateKdfParams(...)` sur le chemin critique de
+          // l'unlock. Cela ajoutait 300ms-1.5s (une nouvelle dérivation
+          // Argon2id complète, voire deux si les anciens params sont PBKDF2)
+          // avant même que l'utilisateur ne voie l'app déverrouillée.
+          //
+          // Maintenant : la migration est schedulée via setTimeout(0), donc
+          // elle s'exécute APRÈS le retour de cette fonction, pendant que
+          // l'utilisateur voit déjà le SplashScreen post-unlock et que le
+          // reste de l'init (sessionService, sealed sender) se déroule.
+          // Si l'app est tuée avant la fin de la migration, c'est safe :
+          // les anciens params sont toujours valides, le prochain unlock
+          // retentera la migration.
+          //
+          // Les `password` et `lockData` sont capturés par la closure. Le
+          // password reste en mémoire le temps de la migration puis est
+          // naturellement garbage-collecté à la sortie de la closure.
+          // ────────────────────────────────────────────────────────────────
+          __DEV__ && console.log('🔄 Migration KDF schedulée en arrière-plan...');
+          setTimeout(() => {
+            migrateKdfParams(password, lockData, result.keys!).catch(e => {
+              __DEV__ && console.warn('Migration KDF background (non bloquant):', e);
+            });
+          }, 0);
         }
       }
       return result;
@@ -833,6 +1054,13 @@ export async function getEncryptionKeysWithInfo(
     // Essayer legacy
     return await unlockLegacyAndMigrate(password);
   } catch (e) {
+    // ArgonUnavailableError : erreur de configuration du build — remonter
+    // sans incrémenter le compteur de brute-force (ce n'est pas un mauvais
+    // mot de passe, c'est un build cassé).
+    if (e instanceof ArgonUnavailableError) {
+      console.error('[appLock] Argon2 unavailable during unlock:', e.message);
+      throw e;
+    }
     __DEV__ && console.error('getEncryptionKeys error:', e);
     await handleFailedAttempt();
     return { keys: null, securityInfo: null, migrated: false };
@@ -944,7 +1172,7 @@ async function unlockV4AndMigrate(
     conversationsKeyNonce: lockData.conversationsKeyNonce,
   };
   
-  await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData));
+  await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData), LOCK_STORE_OPTIONS);
   
   // Supprimer V4
   await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA_V4);
@@ -1022,7 +1250,7 @@ async function unlockV3AndMigrate(
     conversationsKeyNonce: encodeBase64(nacl.randomBytes(32)),
   };
   
-  await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData));
+  await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData), LOCK_STORE_OPTIONS);
   
   // Nettoyer V3
   await SecureStore.deleteItemAsync(STORAGE_KEYS.LEGACY_V3_DATA);
@@ -1152,7 +1380,7 @@ async function unlockV5AndMigrate(
     conversationsKeyNonce: lockData.conversationsKeyNonce,
   };
   
-  await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData));
+  await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData), LOCK_STORE_OPTIONS);
   
   // Supprimer V5
   await SecureStore.deleteItemAsync(STORAGE_KEYS.LOCK_DATA_V5);
@@ -1228,7 +1456,7 @@ async function migrateKdfParams(
       nonce: newNonce,
     };
     
-    await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData));
+    await SecureStore.setItemAsync(STORAGE_KEYS.LOCK_DATA, JSON.stringify(newLockData), LOCK_STORE_OPTIONS);
     
     // Cleanup
     oldDerivedKey.fill(0);
@@ -1251,7 +1479,7 @@ async function handleFailedAttempt(): Promise<void> {
     const attemptsStr = await SecureStore.getItemAsync(STORAGE_KEYS.FAILED_ATTEMPTS);
     const attempts = (attemptsStr ? parseInt(attemptsStr, 10) : 0) + 1;
     
-    await SecureStore.setItemAsync(STORAGE_KEYS.FAILED_ATTEMPTS, attempts.toString());
+    await SecureStore.setItemAsync(STORAGE_KEYS.FAILED_ATTEMPTS, attempts.toString(), LOCK_STORE_OPTIONS);
     
     // Logger la tentative échouée
     await securityLogger.logPinAttempt(false, attempts);
@@ -1278,7 +1506,7 @@ async function handleFailedAttempt(): Promise<void> {
       }
     } else if (lockoutSeconds > 0) {
       const lockoutUntil = Date.now() + (lockoutSeconds * 1000);
-      await SecureStore.setItemAsync(STORAGE_KEYS.LOCKOUT_UNTIL, lockoutUntil.toString());
+      await SecureStore.setItemAsync(STORAGE_KEYS.LOCKOUT_UNTIL, lockoutUntil.toString(), LOCK_STORE_OPTIONS);
       __DEV__ && console.log(`Lockout: ${lockoutSeconds}s (${attempts} tentatives)`);
     }
   } catch (e) {

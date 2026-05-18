@@ -6,11 +6,31 @@ primary_region = 'cdg'
 [http_service]
   internal_port = 3200
   force_https = true
-  auto_stop_machines = 'stop'
+  # P0-A1: min_machines_running passé de 0 → 1.
+  # auto_stop_machines DÉSACTIVÉ pour éliminer les cold starts (3-6s).
+  # Sans ça, les push d'appel arrivent 5-15s en retard car la machine
+  # devait redémarrer + recharger FCM service account + obtenir OAuth + handshake APNs.
+  # De plus, le cover traffic du gateway réveille la machine en permanence,
+  # donc le scale-to-zero ne faisait économiser RIEN en pratique mais payait
+  # le coût des cold starts à chaque fois.
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
+
+  # Healthcheck — Fly détecte rapidement les pannes pour redémarrer la machine.
+  # Note: Fly ne RESTART PAS automatiquement sur fail (cf docs), mais le check
+  # affecte le routing : si le check fail, le trafic est redirigé.
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/health'
 
 [[vm]]
-  memory = '256mb'
+  # P0-A1: RAM 256MB → 512MB. Le push proxy maintient en mémoire une connexion
+  # HTTP/2 persistante APNs, recentPushes Map (dédup), JWT FCM/APNs cachés.
+  # Sous load (200 push/s soutenu), Node + http2 consomme 300-400MB.
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1

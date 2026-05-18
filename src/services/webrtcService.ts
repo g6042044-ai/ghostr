@@ -20,7 +20,7 @@
 // - Le relay ne voit que des paquets chiffrés opaques
 
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
-import { getRandomBytes, secureRandomInt } from './crypto';
+import { secureRandomInt } from './crypto';
 import { decodeUTF8 } from 'tweetnacl-util';
 import { hmac } from '@noble/hashes/hmac';
 import { sha256 } from '@noble/hashes/sha256';
@@ -123,7 +123,6 @@ const RECONNECT_DELAY_MS = 1000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const PING_INTERVAL_MS = 15000;
 const CONNECTION_TIMEOUT_MS = 15000;
-const HEALTHCHECK_TIMEOUT_MS = 5000;
 
 // ============================================
 // ÉTAT DU SERVICE
@@ -424,10 +423,7 @@ export async function connectToSfu(
         if (state.ws !== wsInstance) {
           return;
         }
-        // Log les 10 premiers messages reçus pour diagnostic
-        if (wsMessageCount <= 10) {
-          const preview = typeof event.data === 'string' ? event.data.slice(0, 120) : `[binary ${event.data?.byteLength || '?'}B]`;
-        } else if (wsMessageCount % 200 === 0) {
+        if (wsMessageCount % 200 === 0) {
           __DEV__ && console.log(`🔌 DIAG total msgs received: ${wsMessageCount}`);
         }
         handleSfuMessage(event.data);

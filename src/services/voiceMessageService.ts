@@ -16,6 +16,11 @@ import { supabaseStorage } from './api';
 import { getRandomBytes } from './crypto';
 // P0-A2: legacyMediaProxy supprimé — tous les downloads via OHTTP relay
 import { fetchMediaViaRelay } from './encryptedBlobService';
+// Note PERM FIX : suppressLock/releaseLock plus utilisés directement ici.
+// Le service `permissions` les utilise en interne autour de
+// requestPermissionsAsync, donc plus besoin de wrapper côté caller.
+import { ensureMicrophonePermission } from './permissions';
+import i18n from '../i18n';
 
 // ============================================
 // CONFIGURATION
@@ -138,18 +143,27 @@ let playbackCallback: PlaybackCallback | null = null;
 // ============================================
 
 /**
- * Initialise le service audio pour l'enregistrement de vocaux
+ * Initialise le service audio EN MODE LECTURE SEULE.
+ *
+ * IMPORTANT — Changement de comportement (PERM FIX) :
+ * Cette fonction NE DEMANDE PLUS la permission micro. Avant, elle prompt
+ * `Audio.requestPermissionsAsync()` au mount de chaque ConversationScreen
+ * → l'utilisateur voyait le dialog "Autoriser le microphone" à chaque
+ * ouverture de conversation, même s'il ne voulait jamais enregistrer un vocal.
+ *
+ * Maintenant, la permission est demandée à la demande dans `startRecording()`,
+ * uniquement quand l'utilisateur appuie réellement sur le bouton micro.
+ *
+ * Cette fonction se contente de configurer le mode audio en LECTURE SEULE
+ * (allowsRecordingIOS: false) pour que les vocaux reçus puissent être joués.
+ * Le mode enregistrement (allowsRecordingIOS: true) est activé uniquement
+ * dans startRecording().
+ *
+ * Retourne true tant que la config audio passe, false en cas d'erreur native.
  */
 export async function initializeVoiceService(): Promise<boolean> {
   try {
-    // Demander les permissions
-    const { status } = await Audio.requestPermissionsAsync();
-    if (status !== 'granted') {
-      __DEV__ && console.error('🎤 Permission microphone refusée');
-      return false;
-    }
-
-    // FIX: Configurer en mode LECTURE seule au démarrage.
+    // Configurer en mode LECTURE seule au démarrage.
     // On n'active le mode enregistrement que dans startRecording(),
     // juste avant de créer le Recording object.
     // Avant ce fix, initializeVoiceService() activait le mode enregistrement
@@ -167,7 +181,7 @@ export async function initializeVoiceService(): Promise<boolean> {
       playThroughEarpieceAndroid: false,
     });
 
-    __DEV__ && console.log('🎤 Voice service initialized (playback mode)');
+    __DEV__ && console.log('🎤 Voice service initialized (playback mode, no perm prompt)');
     return true;
   } catch (error) {
     __DEV__ && console.error('🎤 Voice service init error:', error);
@@ -190,6 +204,21 @@ export async function startRecording(
     // S'assurer qu'aucun enregistrement n'est en cours
     if (state.recording) {
       await stopRecording();
+    }
+
+    // ─── PERMISSION FIX : prompt micro à la demande (pas au mount) ─────
+    // Avant : initializeVoiceService() prompttait au mount de chaque
+    // ConversationScreen. Maintenant : on le fait ici, uniquement quand
+    // l'utilisateur appuie réellement sur le bouton micro.
+    //
+    // Si refusé/bloqué → le service `permissions` affiche déjà l'Alert
+    // (avec bouton "Ouvrir les paramètres" si bloqué). On retourne false,
+    // le composant appelant (VoiceRecordButton) ne démarre pas son UI
+    // d'enregistrement.
+    const micPerm = await ensureMicrophonePermission();
+    if (micPerm.status !== 'granted') {
+      __DEV__ && console.log('🎤 Permission micro refusée, abort recording');
+      return false;
     }
 
     // Arrêter la lecture si en cours
@@ -547,7 +576,7 @@ export async function encryptVoice(uri: string): Promise<EncryptedVoiceData> {
   const encrypted = nacl.secretbox(audioData, nonce, fileKey);
 
   if (!encrypted) {
-    throw new Error('Échec du chiffrement du vocal');
+    throw new Error(i18n.t('errors.voiceEncryptionFailed'));
   }
 
   return {
@@ -568,7 +597,7 @@ export function decryptVoice(
   const decrypted = nacl.secretbox.open(encryptedData, nonce, fileKey);
 
   if (!decrypted) {
-    throw new Error('Échec du déchiffrement du vocal');
+    throw new Error(i18n.t('errors.voiceDecryptionFailed'));
   }
 
   return decrypted;
@@ -629,7 +658,7 @@ export async function uploadEncryptedVoice(
     });
 
   if (error) {
-    throw new Error(`Échec upload vocal: ${error.message}`);
+    throw new Error(i18n.t('errors.voiceUploadFailed', { message: error.message }));
   }
 
   // Obtenir l'URL publique
@@ -667,7 +696,7 @@ export function encryptVoiceKey(fileKey: Uint8Array, e2eKey: Uint8Array): string
   const encrypted = nacl.secretbox(fileKey, nonce, e2eKey);
 
   if (!encrypted) {
-    throw new Error('Échec chiffrement clé vocal');
+    throw new Error(i18n.t('errors.voiceKeyEncryptionFailed'));
   }
 
   // Format: nonce + encrypted (tout en base64)
@@ -689,7 +718,7 @@ export function decryptVoiceKey(encryptedKey: string, e2eKey: Uint8Array): Uint8
   const decrypted = nacl.secretbox.open(encrypted, nonce, e2eKey);
 
   if (!decrypted) {
-    throw new Error('Échec déchiffrement clé vocal');
+    throw new Error(i18n.t('errors.voiceKeyDecryptionFailed'));
   }
 
   return decrypted;
@@ -893,21 +922,24 @@ export async function validateVoiceFile(uri: string): Promise<{ valid: boolean; 
   try {
     const fileInfo = await FileSystem.getInfoAsync(uri);
     if (!fileInfo.exists) {
-      return { valid: false, error: 'Fichier introuvable' };
+      return { valid: false, error: i18n.t('errors.fileNotFound') };
     }
 
     const sizeBytes = (fileInfo as any).size || 0;
     if (sizeBytes > MAX_VOICE_SIZE_BYTES) {
       return {
         valid: false,
-        error: `Le vocal fait ${(sizeBytes / (1024 * 1024)).toFixed(1)} MB. La limite est de ${MAX_VOICE_SIZE_MB} MB.`,
+        error: i18n.t('errors.voiceSizeLimit', {
+          size: (sizeBytes / (1024 * 1024)).toFixed(1),
+          max: MAX_VOICE_SIZE_MB,
+        }),
       };
     }
 
     return { valid: true };
   } catch (e) {
     __DEV__ && console.error('Erreur validation vocal:', e);
-    return { valid: false, error: 'Impossible de valider le fichier' };
+    return { valid: false, error: i18n.t('errors.voiceFileValidation') };
   }
 }
 

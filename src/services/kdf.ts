@@ -79,6 +79,28 @@ const SALT_LENGTH = 32;
 const CURRENT_VERSION = 6;
 
 // ============================================
+// ERREURS TYPÉES
+// ============================================
+
+/**
+ * Lancée quand Argon2id natif n'est pas disponible dans un build natif
+ * (EAS Build, `expo run`, etc.). Indique une erreur de configuration : le
+ * module react-native-argon2 doit être présent et nativement linké.
+ *
+ * L'UI doit attraper cette erreur spécifiquement et afficher un message
+ * explicite à l'utilisateur plutôt qu'un « échec du verrouillage » opaque.
+ */
+export class ArgonUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ArgonUnavailableError';
+    // Restaurer la chaîne de prototype (nécessaire avec ES5 target sur certains
+    // transpilers, sinon `instanceof` ne fonctionne pas correctement).
+    Object.setPrototypeOf(this, ArgonUnavailableError.prototype);
+  }
+}
+
+// ============================================
 // DÉTECTION ARGON2 NATIF
 // ============================================
 
@@ -361,7 +383,7 @@ export async function deriveKey(
   let algorithmInfo: AlgorithmInfo;
   
   if (hasArgon2 && argon2Module) {
-    // 🔒 Mode production : Argon2id natif
+    // 🔒 Argon2id natif — chemin UNIQUE en production
     key = await deriveWithArgon2(
       password,
       salt,
@@ -370,7 +392,7 @@ export async function deriveKey(
       ARGON2_PARALLELISM,
       onProgress
     );
-    
+
     params = {
       algorithm: 'argon2id',
       salt: encodeBase64(salt),
@@ -380,7 +402,7 @@ export async function deriveKey(
       version: CURRENT_VERSION,
       native: true,
     };
-    
+
     algorithmInfo = {
       name: 'Argon2id (64 MiB)',
       strength: 'high',
@@ -389,29 +411,24 @@ export async function deriveKey(
       estimatedTimeMs: 300,
       native: true,
     };
-    
-    __DEV__ && console.log('🔐 Clé dérivée avec Argon2id (sécurité maximale)');
-  } else {
-    // ⚠️ PBKDF2 UNIQUEMENT autorisé en développement (Expo Go)
-    // En production, Argon2id est OBLIGATOIRE — un build sans react-native-argon2
-    // fonctionnel est un build défectueux qui ne doit pas permettre le verrouillage.
-    if (!__DEV__ && !isExpoGo) {
-      throw new Error(
-        'SECURITY_FATAL: Argon2id is not available in this production build. ' +
-        'react-native-argon2 must be installed and functional for app lock. ' +
-        'This is a build configuration error — please rebuild with: ' +
-        'npx expo install react-native-argon2 && npx expo prebuild && eas build'
-      );
-    }
 
-    // Fallback développement uniquement : PBKDF2 JS
+    __DEV__ && console.log('🔐 Clé dérivée avec Argon2id (sécurité maximale)');
+  } else if (isExpoGo) {
+    // Expo Go UNIQUEMENT : fallback PBKDF2 pour permettre le développement.
+    // Ce chemin ne peut PAS être atteint dans un build EAS de production :
+    //   - isExpoGo requiert Constants.executionEnvironment === 'storeClient'
+    //     (Expo Go sur le store), ce qui est impossible dans un EAS Build.
+    //   - Tout build EAS (dev ou prod) a executionEnvironment = 'standalone'
+    //     ou 'bare', jamais 'storeClient'.
+    // Même un __DEV__ EAS Build passera donc par la branche "else" ci-dessous
+    // et lèvera ArgonUnavailableError si le module natif manque.
     key = await deriveWithPBKDF2(
       password,
       salt,
       PBKDF2_ITERATIONS_JS,
       onProgress
     );
-    
+
     params = {
       algorithm: 'pbkdf2',
       salt: encodeBase64(salt),
@@ -419,19 +436,38 @@ export async function deriveKey(
       version: CURRENT_VERSION,
       native: false,
     };
-    
+
     algorithmInfo = {
       name: 'PBKDF2-SHA256',
       strength: 'standard',
       iterations: PBKDF2_ITERATIONS_JS,
       estimatedTimeMs: 1500,
       native: false,
-      warning: 'Mode développement (Expo Go) - PBKDF2 fallback actif',
+      warning: 'Mode développement (Expo Go) — PBKDF2 fallback actif',
     };
-    
-    __DEV__ && console.log('⚠️ Clé dérivée avec PBKDF2 (fallback dev uniquement)');
+
+    __DEV__ && console.log('⚠️ Clé dérivée avec PBKDF2 (Expo Go uniquement)');
+  } else {
+    // ═══════════════════════════════════════════════════════════════════════
+    // ARGON2 INDISPONIBLE DANS UN BUILD NATIF — ERREUR DE BUILD
+    // ═══════════════════════════════════════════════════════════════════════
+    // On arrive ici si :
+    //   - react-native-argon2 n'est pas dans package.json, OU
+    //   - le module natif a été retiré du bundle par le bundler, OU
+    //   - le module a planté au test de disponibilité.
+    //
+    // Dans TOUS les cas, c'est une erreur de configuration du build qu'il
+    // faut corriger à la source. On lève une erreur typée pour que l'UI
+    // (SecurityScreen) puisse afficher un message clair à l'utilisateur
+    // au lieu d'un échec silencieux.
+    // ═══════════════════════════════════════════════════════════════════════
+    throw new ArgonUnavailableError(
+      'Argon2id natif non disponible. ' +
+      'react-native-argon2 doit être installé et linké nativement dans ce build. ' +
+      'Commandes : npx expo install react-native-argon2 && npx expo prebuild --clean && eas build'
+    );
   }
-  
+
   return { key, params: JSON.stringify(params), algorithmInfo };
 }
 
@@ -448,7 +484,7 @@ export async function deriveKeyWithParams(
   
   if (params.algorithm === 'argon2id') {
     const hasArgon2 = await checkArgon2Available();
-    
+
     if (hasArgon2 && argon2Module) {
       return deriveWithArgon2(
         password,
@@ -459,17 +495,21 @@ export async function deriveKeyWithParams(
         onProgress
       );
     } else {
-      // Argon2 requis mais non disponible
-      __DEV__ && console.error('🔴 ERREUR: Les données ont été chiffrées avec Argon2id');
-      __DEV__ && console.error('🔴 Argon2 natif non disponible dans cet environnement');
-      __DEV__ && console.error('🔴 Utilisez un EAS Build pour déchiffrer');
-      throw new Error(
-        'Ces données nécessitent Argon2id qui n\'est pas disponible. ' +
-        'Utilisez un build de production (EAS Build) pour y accéder.'
+      // Argon2 requis mais non disponible — erreur typée pour l'UI
+      throw new ArgonUnavailableError(
+        'Les données sont chiffrées avec Argon2id mais le module natif est ' +
+        'indisponible. Reconstruisez l\'application avec react-native-argon2.'
       );
     }
   } else {
-    // PBKDF2
+    // Params PBKDF2 : uniquement acceptés en Expo Go. Dans tout autre
+    // environnement, refuser — un build natif ne doit jamais utiliser PBKDF2.
+    if (!isExpoGo) {
+      throw new ArgonUnavailableError(
+        'Ce build natif refuse PBKDF2 pour raison de sécurité. Les données ' +
+        'doivent être re-chiffrées avec Argon2id (réinitialisez le verrouillage).'
+      );
+    }
     const iterations = params.iterations || PBKDF2_ITERATIONS_JS;
     return deriveWithPBKDF2(password, salt, iterations, onProgress);
   }

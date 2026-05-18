@@ -1,44 +1,39 @@
 // src/screens/SplashScreen.tsx
 // Premium loading screen — GhostLogo with rings, animated status text, modern bottom branding
+// v2.0 — Full light/dark support via useThemedStyles. The previous version had a hardcoded
+// near-black background (#060A0E) which read as "wrong app" on light-mode devices.
 
-import React, { useEffect, useRef, useState, useMemo } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  Platform,
-  StatusBar,
-  Dimensions,
-  Animated,
-  Easing,
-} from 'react-native';
+import { useEffect, useRef, useState, useMemo } from 'react';
+import { View, Text, StyleSheet, Platform, StatusBar, Dimensions, Animated, Easing } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { theme } from '../components/ui/theme';
+import { useTranslation } from 'react-i18next';
+import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 import { GhostLogo } from '../components/GhostLogo';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const LOGO_SIZE = Math.min(SCREEN_WIDTH * 0.3, 130);
 
-const INIT_MESSAGES = [
-  { text: 'Initialisation du chiffrement', delay: 0 },
-  { text: 'Génération des clés de session', delay: 2500 },
-  { text: 'Protection post-quantique', delay: 5500 },
-  { text: "Vérification de l'intégrité", delay: 8500 },
-  { text: 'Presque prêt', delay: 11000 },
-];
+const INIT_MESSAGE_KEYS = [
+  { key: 'splash.initEncryption', delay: 0 },
+  { key: 'splash.generatingKeys', delay: 2500 },
+  { key: 'splash.pqProtection', delay: 5500 },
+  { key: 'splash.integrityCheck', delay: 8500 },
+  { key: 'splash.almostReady', delay: 11000 },
+] as const;
 
 export interface SplashScreenProps {
   statusMessage?: string;
   statusSubtitle?: string;
   progress?: number;
+  instant?: boolean;
 }
 
 // ── Pulsing dot indicator — single timing, no loops ──
 const PulsingDots = () => {
+  const { colors } = useTheme();
   const clock = useRef(new Animated.Value(0)).current;
 
-  // Pre-compute interpolation tables once
-  const cycles = 40; // ~1.5s per cycle over 60s
+  const cycles = 40;
   const ppc = 8;
   const total = cycles * ppc;
 
@@ -49,8 +44,8 @@ const PulsingDots = () => {
     for (let i = 0; i <= total; i++) {
       iR.push(Math.min(i / total, 1));
       const sin = Math.sin((2 * Math.PI * i) / ppc + phaseOffset);
-      opOut.push(0.65 + 0.35 * sin);   // 0.3 ↔ 1.0
-      scOut.push(0.85 + 0.15 * sin);   // 0.7 ↔ 1.0
+      opOut.push(0.65 + 0.35 * sin);
+      scOut.push(0.85 + 0.15 * sin);
     }
     return {
       opacity: clock.interpolate({ inputRange: iR, outputRange: opOut }),
@@ -74,11 +69,12 @@ const PulsingDots = () => {
   }, []);
 
   return (
-    <View style={dotStyles.container}>
+    <View style={dotStaticStyles.container}>
       {dots.map((dot, i) => (
         <Animated.View
           key={i}
-          style={[dotStyles.dot, {
+          style={[dotStaticStyles.dot, {
+            backgroundColor: colors.primary,
             opacity: dot.opacity,
             transform: [{ scale: dot.scale }],
           }]}
@@ -88,7 +84,7 @@ const PulsingDots = () => {
   );
 };
 
-const dotStyles = StyleSheet.create({
+const dotStaticStyles = StyleSheet.create({
   container: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -99,31 +95,33 @@ const dotStyles = StyleSheet.create({
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: theme.colors.primary,
   },
 });
 
 // ── Main SplashScreen ──
-export function SplashScreen({ statusMessage, statusSubtitle, progress }: SplashScreenProps = {}) {
+export function SplashScreen({ statusMessage, statusSubtitle, progress, instant = false }: SplashScreenProps = {}) {
   const insets = useSafeAreaInsets();
+  const { t } = useTranslation();
+  const { colors, isDark } = useTheme();
+  const styles = useThemedStyles(makeStyles);
   const [currentMessageIndex, setCurrentMessageIndex] = useState(0);
 
   useEffect(() => {
     if (statusMessage) return;
-    const timers = INIT_MESSAGES.map((msg, i) =>
+    const timers = INIT_MESSAGE_KEYS.map((msg, i) =>
       setTimeout(() => setCurrentMessageIndex(i), msg.delay)
     );
     return () => timers.forEach(clearTimeout);
   }, [statusMessage]);
 
-  const displayedMessage = statusMessage || INIT_MESSAGES[currentMessageIndex].text;
+  const displayedMessage = statusMessage || t(INIT_MESSAGE_KEYS[currentMessageIndex].key as any);
 
-  // Text crossfade
-  const textOpacity = useRef(new Animated.Value(0)).current;
-  const textY = useRef(new Animated.Value(10)).current;
+  const textOpacity = useRef(new Animated.Value(instant ? 1 : 0)).current;
+  const textY = useRef(new Animated.Value(instant ? 0 : 10)).current;
   const prevMsg = useRef(displayedMessage);
 
   useEffect(() => {
+    if (instant) return;
     Animated.parallel([
       Animated.timing(textOpacity, { toValue: 1, duration: 700, useNativeDriver: true }),
       Animated.timing(textY, { toValue: 0, duration: 700, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
@@ -145,27 +143,28 @@ export function SplashScreen({ statusMessage, statusSubtitle, progress }: Splash
     ]).start();
   }, [displayedMessage]);
 
-  // Progress bar
   const progressAnim = useRef(new Animated.Value(0)).current;
   useEffect(() => {
     if (progress === undefined) return;
     Animated.timing(progressAnim, { toValue: progress, duration: 400, easing: Easing.out(Easing.cubic), useNativeDriver: false }).start();
   }, [progress]);
 
-  // Bottom entrance
-  const bottomOpacity = useRef(new Animated.Value(0)).current;
+  const bottomOpacity = useRef(new Animated.Value(instant ? 1 : 0)).current;
   useEffect(() => {
+    if (instant) return;
     Animated.timing(bottomOpacity, { toValue: 1, duration: 1200, delay: 600, useNativeDriver: true }).start();
   }, []);
 
   return (
     <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#060A0E" translucent={Platform.OS === 'android'} />
+      <StatusBar
+        barStyle={isDark ? 'light-content' : 'dark-content'}
+        backgroundColor={colors.background}
+        translucent={Platform.OS === 'android'}
+      />
 
-      {/* ═══ Logo + Rings ═══ */}
-      <GhostLogo size={LOGO_SIZE} />
+      <GhostLogo size={LOGO_SIZE} instant={instant} />
 
-      {/* ═══ Status area ═══ */}
       <View style={styles.statusArea}>
         <Animated.Text style={[styles.statusText, { opacity: textOpacity, transform: [{ translateY: textY }] }]}>
           {displayedMessage}
@@ -175,7 +174,6 @@ export function SplashScreen({ statusMessage, statusSubtitle, progress }: Splash
           <Text style={styles.statusSubtitle}>{statusSubtitle}</Text>
         ) : null}
 
-        {/* Progress bar OR dots */}
         {progress !== undefined ? (
           <View style={styles.progressContainer}>
             <View style={styles.progressTrack}>
@@ -190,48 +188,43 @@ export function SplashScreen({ statusMessage, statusSubtitle, progress }: Splash
         )}
       </View>
 
-      {/* ═══ Bottom branding ═══ */}
       <Animated.View style={[styles.bottom, { paddingBottom: insets.bottom + 24, opacity: bottomOpacity }]}>
-        <Text style={styles.bottomTagline}>Chiffrement de bout en bout</Text>
+        <Text style={styles.bottomTagline}>{t('splash.bottomTagline')}</Text>
       </Animated.View>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   container: {
     flex: 1,
-    backgroundColor: '#060A0E',
-    justifyContent: 'center',
-    alignItems: 'center',
+    backgroundColor: colors.background,
+    justifyContent: 'center' as const,
+    alignItems: 'center' as const,
   },
-
-  // Status — pushed well below outer ring edge
   statusArea: {
     marginTop: 100,
-    alignItems: 'center',
+    alignItems: 'center' as const,
     paddingHorizontal: 40,
     minHeight: 100,
   },
   statusText: {
     fontSize: 17,
-    fontWeight: '500',
-    color: 'rgba(240, 244, 248, 0.7)',
-    textAlign: 'center',
+    fontWeight: '500' as const,
+    color: colors.textSecondary,
+    textAlign: 'center' as const,
     letterSpacing: 0.2,
     lineHeight: 24,
   },
   statusSubtitle: {
     fontSize: 14,
-    color: theme.colors.textMuted,
-    textAlign: 'center',
+    color: colors.textMuted,
+    textAlign: 'center' as const,
     marginTop: 10,
   },
-
-  // Progress bar
   progressContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
+    flexDirection: 'row' as const,
+    alignItems: 'center' as const,
     marginTop: 32,
     width: 200,
     gap: 12,
@@ -239,40 +232,32 @@ const styles = StyleSheet.create({
   progressTrack: {
     flex: 1,
     height: 3,
-    backgroundColor: 'rgba(139, 164, 184, 0.10)',
+    backgroundColor: colors.surfaceLight,
     borderRadius: 1.5,
-    overflow: 'hidden',
+    overflow: 'hidden' as const,
   },
   progressFill: {
-    height: '100%',
-    backgroundColor: theme.colors.primary,
+    height: '100%' as const,
+    backgroundColor: colors.primary,
     borderRadius: 1.5,
   },
   progressPercent: {
     fontSize: 13,
-    color: theme.colors.textMuted,
-    fontWeight: '600',
+    color: colors.textMuted,
+    fontWeight: '600' as const,
     minWidth: 32,
-    textAlign: 'right',
+    textAlign: 'right' as const,
   },
-
-  // Bottom
   bottom: {
-    position: 'absolute',
+    position: 'absolute' as const,
     bottom: 0,
-    alignItems: 'center',
-  },
-  bottomBrand: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: 'rgba(240, 244, 248, 0.25)',
-    letterSpacing: -0.3,
-    marginBottom: 4,
+    alignItems: 'center' as const,
   },
   bottomTagline: {
     fontSize: 12,
-    color: 'rgba(240, 244, 248, 0.15)',
-    fontWeight: '500',
+    color: colors.textMuted,
+    opacity: 0.5,
+    fontWeight: '500' as const,
     letterSpacing: 0.2,
   },
 });

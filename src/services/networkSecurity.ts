@@ -36,6 +36,8 @@
  * (un principal + un backup). Un seul pin = crash sur iOS.
  */
 
+import i18n from '../i18n';
+
 interface DomainPinConfig {
   includeSubdomains: boolean;
   publicKeyHashes: string[];
@@ -205,11 +207,9 @@ export function verifyPinningOrWarn(): string | null {
   }
 
   if (!pinningAvailable) {
-    return (
-      'Le certificate pinning n\'est pas actif. ' +
-      (pinningError ? `Raison: ${pinningError}. ` : '') +
-      'Veuillez mettre à jour l\'application.'
-    );
+    return pinningError
+      ? i18n.t('errors.pinningInactiveWithReason', { reason: pinningError })
+      : i18n.t('errors.applicationUpdateRequired');
   }
 
   return null;

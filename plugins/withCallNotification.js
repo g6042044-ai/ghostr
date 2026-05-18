@@ -4,9 +4,8 @@
 //
 // ANDROID:
 //   - Copies ghostr_ringtone.mp3 into res/raw/ for the notification channel
-//   - Adds USE_FULL_SCREEN_INTENT permission (already declared but explicit here)
-//   - Adds FOREGROUND_SERVICE permission for persistent notifications
-//   - Configures the call notification channel natively for full-screen intent
+//   - Adds POST_NOTIFICATIONS, VIBRATE, WAKE_LOCK permissions for the call channel
+//   - Configures the call notification channel via push-proxy + expo-notifications
 //
 // iOS:
 //   - Copies ghostr_ringtone.mp3 into the Xcode project bundle
@@ -31,7 +30,6 @@ const path = require('path');
 
 const RINGTONE_FILE = 'ghostr_ringtone.mp3';
 const FALLBACK_RINGTONE = 'incallmanager_ringback.mp3';
-const CALL_AVATAR_FILE = 'ghostr_call_avatar.png'; // Logo affiché en grand dans la notification d'appel
 
 function getRingtoneSource() {
   const primary = path.resolve(__dirname, '..', 'assets', 'sounds', RINGTONE_FILE);
@@ -71,25 +69,6 @@ function withCallNotificationAndroid(config) {
       fs.copyFileSync(source, dest);
       console.log(`[withCallNotification] Android: copied ${path.basename(source)} → ${dest}`);
 
-      // Copier le logo de l'app dans res/drawable pour l'avatar de la notification d'appel.
-      // Le module natif react-native-full-screen-notification-incoming-call utilise
-      // ce drawable comme "photo de l'appelant" (le grand cercle dans la notification).
-      // On y met le logo Ghostr car l'identité de l'appelant est chiffrée E2E.
-      const drawableDir = path.join(
-        config.modRequest.platformProjectRoot,
-        'app', 'src', 'main', 'res', 'drawable'
-      );
-      fs.mkdirSync(drawableDir, { recursive: true });
-
-      const iconSource = path.resolve(__dirname, '..', 'assets', 'icon.png');
-      if (fs.existsSync(iconSource)) {
-        const iconDest = path.join(drawableDir, CALL_AVATAR_FILE);
-        fs.copyFileSync(iconSource, iconDest);
-        console.log(`[withCallNotification] Android: copied icon.png → ${iconDest}`);
-      } else {
-        console.warn(`[withCallNotification] Android: icon.png not found at ${iconSource}`);
-      }
-
       return config;
     },
   ]);
@@ -106,7 +85,6 @@ function withCallNotificationAndroid(config) {
     const permissionNames = permissions.map(p => p.$?.['android:name']);
 
     const requiredPermissions = [
-      'android.permission.USE_FULL_SCREEN_INTENT',
       'android.permission.POST_NOTIFICATIONS',
       'android.permission.VIBRATE',
       'android.permission.WAKE_LOCK',

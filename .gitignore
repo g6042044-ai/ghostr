@@ -1,49 +1,107 @@
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
 # GHOSTR — .gitignore
-# ============================================
+# ════════════════════════════════════════════════════════════════════════════
 
-# Credentials — NEVER commit these
+# ─── Credentials & secrets ─────────────────────────────────────────────────
+# JAMAIS de clés privées, mots de passe ou config de service signé.
 push-proxy/fcm-service-account.json
 push-proxy/apns-key.p8
 google-services.json
+GoogleService-Info.plist
 *.p8
 *.p12
 *.keystore
 *.jks
+*.pem
+*.cer
+*.crt
+secrets/
+credentials/
 
-# Environment files
+# Clé privée Ed25519 du système d'avis (kill-switch)
+# La publique est embarquée dans le code source. La privée reste offline.
+scripts/notice-private*.key
+scripts/notice-keys.json
+notice-*.priv
+
+# ─── Environment files ──────────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
 
-# Node
+# Wrangler / Cloudflare Workers (ohttp-gateway)
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# ─── Données utilisateur exportées ──────────────────────────────────────────
+# Backups produits par le flux de migration. Même chiffrés AES-256, aucune
+# raison de les committer (test ou autre).
+*.ghostrbk
+
+# ─── Node ───────────────────────────────────────────────────────────────────
 node_modules/
 npm-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
 
-# Expo / React Native
+# ─── Expo / React Native ────────────────────────────────────────────────────
 .expo/
+.expo-shared/
 dist/
 *.hbc
 *.jsbundle
 web-build/
+.metro-health-check*
+metro-cache/
 
-# Build outputs
+# ─── Build outputs ──────────────────────────────────────────────────────────
 android/
 ios/
 *.apk
 *.aab
 *.ipa
 
-# OS
+# Au cas où android/ ou ios/ seraient un jour committés (bare workflow)
+android/local.properties
+*.xcode.env.local
+ios/.xcode.env.local
+
+# ─── TypeScript / tests ─────────────────────────────────────────────────────
+*.tsbuildinfo
+coverage/
+.nyc_output/
+*.lcov
+
+# ─── Supabase ───────────────────────────────────────────────────────────────
+supabase/.branches/
+supabase/.temp/
+
+# ─── Logs ───────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── OS ─────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# IDE
+# ─── IDE / editors ──────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-project
+*.sublime-workspace
 
-# Backups
+# AI tooling locales
+.cursor/
+.claude/
+.aider*
+
+# ─── Misc ───────────────────────────────────────────────────────────────────
 *.bak
+*.orig
+*.tmp
+tmp/
+temp/

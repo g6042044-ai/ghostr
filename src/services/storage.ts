@@ -20,6 +20,7 @@ import * as SecureStore from 'expo-secure-store';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
+import i18n from '../i18n';
 import { deriveAllKeys, DerivedKeys, deriveConversationSenderToken } from './crypto';
 import {
   encryptIfEnabled,
@@ -39,7 +40,7 @@ import {
   setOpaqueKeySeed,
   clearOpaqueKeySeed,
 } from './localCrypto';
-import { getOrCreateHardwareConvKey, deleteHardwareKeys } from './hardwareKeyProvider';
+import { getOrCreateHardwareConvKey, deleteHardwareKeys, verifyHardwareKeysPersisted } from './hardwareKeyProvider';
 // Legacy ratchet cleanup (inline, ratchetStorage.ts supprimé)
 const LEGACY_RATCHET_PREFIX = 'whisper_ratchet_v1_';
 
@@ -389,6 +390,30 @@ export function getEncryptionKey(): Uint8Array | null {
   return getKey();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// REGISTRE DE HOOKS DE VERROUILLAGE
+// ═══════════════════════════════════════════════════════════════════════════
+// Permet à des modules tiers (sessionService, callCryptoService, etc.) de
+// s'enregistrer pour être zéroisés quand clearEncryptionKey() est appelée,
+// SANS créer de cycle d'import statique entre storage.ts et ./tripleRatchet.
+//
+// Le cycle problématique évité :
+//   storage.ts → require('./tripleRatchet') → sessionService.ts → '../storage'
+//
+// Avec ce registre, sessionService appelle registerLockHook() à la fin de son
+// propre chargement (après que les exports de storage.ts soient disponibles),
+// et clearEncryptionKey() itère simplement sur les hooks enregistrés.
+// Cela fonctionne de manière identique en dev (Metro) et en prod (Hermes bundle).
+// ═══════════════════════════════════════════════════════════════════════════
+
+type LockHook = () => void;
+const lockHooks: Set<LockHook> = new Set();
+
+export function registerLockHook(hook: LockHook): () => void {
+  lockHooks.add(hook);
+  return () => { lockHooks.delete(hook); };
+}
+
 export function clearEncryptionKey(): void {
   clearLocalEncryptionKey();
   if (conversationsEncryptionKey) {
@@ -401,19 +426,16 @@ export function clearEncryptionKey(): void {
   // pouvait révéler les mappings conversation-token.
   clearConversationTokenCache();
 
-  // Verrouiller la mémoire de SessionService : zéroise toutes les clés privées
-  // (identité Ed25519 + X25519, signed pre-keys, OTPKs, PQ signed keys, anciennes
-  //  clés archivées, états de ratchet actifs et leurs header/chain keys).
-  // require() synchrone + try/catch pour éviter les cycles d'import et gérer
-  // le cas où le module ne serait pas encore chargé (premier démarrage).
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { sessionService } = require('./tripleRatchet');
-    if (sessionService && typeof sessionService.lockMemory === 'function') {
-      sessionService.lockMemory();
+  // Invoquer tous les hooks de verrouillage enregistrés (sessionService, etc.)
+  // pour qu'ils zéroisent leurs caches internes. Chaque hook est protégé par
+  // try/catch : une exception dans un hook ne doit pas empêcher les autres
+  // de s'exécuter.
+  for (const hook of lockHooks) {
+    try {
+      hook();
+    } catch (e) {
+      __DEV__ && console.error('[storage] lock hook failed:', e);
     }
-  } catch (e) {
-    __DEV__ && console.error('[storage] sessionService.lockMemory failed:', e);
   }
 }
 
@@ -423,30 +445,78 @@ export { isEncryptionEnabled };
  * ACTION-04 (Phase 2 Security): Initialize hardware-backed encryption for ALL local data.
  * Sets both the AsyncStorage encryption key (localCrypto) and the conversations encryption key.
  * Called at app startup when no PIN is configured.
+ *
+ * RETRY LOGIC (mai 2026) — bug "données perdues après reboot post-import" :
+ *   Sur certains appareils, SecureStore peut renvoyer transitoirement null
+ *   immédiatement après un `deleteItemAsync` (cas typique : nuclearReset puis
+ *   re-init dans la foulée). Le path "create" est alors emprunté, une nouvelle
+ *   clé est générée, mais l'écriture peut échouer silencieusement → au prochain
+ *   boot, la clé en SecureStore est différente de celle utilisée pour chiffrer
+ *   les données → tout devient illisible.
+ *
+ *   Solution : après l'init, on relit SecureStore pour vérifier que les deux
+ *   clés sont bien persistées avec la bonne longueur (32 bytes). Si non, on
+ *   retente UNE fois avec un petit délai. Si la 2e tentative échoue aussi,
+ *   on retourne false pour permettre au caller de fail-closed plutôt que
+ *   d'écrire des données qui seront orphelines.
  */
 export async function initHardwareEncryptionAll(): Promise<boolean> {
-  try {
-    const localOk = await initHardwareEncryption();
-    if (!localOk) return false;
-    
-    const hwConvKey = await getOrCreateHardwareConvKey();
-    // Set HARDWARE conv key, NOT conversationsEncryptionKey.
-    // conversationsEncryptionKey stays null → PIN-specific code unaffected.
-    conversationsHardwareKey = new Uint8Array(hwConvKey);
-    
-    // ACTION 5: Initialize opaque key seed from hardware key
-    const { sha256 } = await import('@noble/hashes/sha256');
-    const seedInput = new Uint8Array(hwConvKey.length + 11);
-    seedInput.set(hwConvKey, 0);
-    seedInput.set(new TextEncoder().encode('opaque-seed'), hwConvKey.length);
-    setOpaqueKeySeed(sha256(seedInput));
-    
-    __DEV__ && console.log('[storage] 🔒 Hardware encryption initialized for all local data');
-    return true;
-  } catch (error) {
-    __DEV__ && console.error('[storage] ❌ Hardware encryption init failed:', error);
-    return false;
+  const ATTEMPTS = 2;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      const localOk = await initHardwareEncryption();
+      if (!localOk) {
+        __DEV__ && console.warn(`[storage] initHardwareEncryption attempt ${attempt} failed`);
+        if (attempt < ATTEMPTS) {
+          await new Promise(r => setTimeout(r, 50 * attempt));
+          continue;
+        }
+        return false;
+      }
+
+      const hwConvKey = await getOrCreateHardwareConvKey();
+      // Set HARDWARE conv key, NOT conversationsEncryptionKey.
+      // conversationsEncryptionKey stays null → PIN-specific code unaffected.
+      conversationsHardwareKey = new Uint8Array(hwConvKey);
+
+      // ACTION 5: Initialize opaque key seed from hardware key
+      const { sha256 } = await import('@noble/hashes/sha256');
+      const seedInput = new Uint8Array(hwConvKey.length + 11);
+      seedInput.set(hwConvKey, 0);
+      seedInput.set(new TextEncoder().encode('opaque-seed'), hwConvKey.length);
+      setOpaqueKeySeed(sha256(seedInput));
+
+      // ── Vérification readback (cf. docstring) ─────────────────────────
+      const persisted = await verifyHardwareKeysPersisted();
+      if (!persisted) {
+        __DEV__ && console.warn(
+          `[storage] Hardware keys not persisted after init (attempt ${attempt}/${ATTEMPTS})`
+        );
+        if (attempt < ATTEMPTS) {
+          // Reset in-RAM state and retry. Le délai laisse le temps au Keystore
+          // de se stabiliser après un nuclearReset récent.
+          conversationsHardwareKey = null;
+          clearOpaqueKeySeed();
+          await new Promise(r => setTimeout(r, 50 * attempt));
+          continue;
+        }
+        return false;
+      }
+
+      __DEV__ && console.log(
+        `[storage] 🔒 Hardware encryption initialized for all local data (attempt ${attempt})`
+      );
+      return true;
+    } catch (error) {
+      __DEV__ && console.error(`[storage] ❌ Hardware encryption init attempt ${attempt} failed:`, error);
+      if (attempt < ATTEMPTS) {
+        await new Promise(r => setTimeout(r, 50 * attempt));
+        continue;
+      }
+      return false;
+    }
   }
+  return false;
 }
 
 /**
@@ -775,7 +845,7 @@ export async function getGlobalDisplayName(): Promise<string | null> {
  */
 export async function setGlobalDisplayName(name: string): Promise<void> {
   if (!name || name.trim().length === 0) {
-    throw new Error('Le pseudo ne peut pas être vide');
+    throw new Error(i18n.t('errors.usernameEmpty'));
   }
   try {
     await AsyncStorage.setItem(OPAQUE_DISPLAY_NAME_KEY, encryptIfEnabled(name.trim()));
@@ -1623,6 +1693,61 @@ export async function nuclearReset(): Promise<void> {
   } catch {}
   __DEV__ && console.log('[storage] ☢️ Network services stopped');
   
+  // ─────────────────────────────────────────────────────────────────────
+  // 0. Collect session IDs BEFORE wiping AsyncStorage.
+  //    Per-session monotonic anti-replay counters live in SecureStore under
+  //    the prefix `ghostr_monotonic_send_v1_<sessionId>`. SecureStore does
+  //    not support enumeration on iOS, so we MUST know the sessionIds
+  //    explicitly to delete each counter.
+  //    We read them from the AsyncStorage sessions index (decrypted if
+  //    encrypted by localCrypto). After this, step 1 (AsyncStorage.clear)
+  //    and step 2 (SecureStore deletes including counters) finish the job.
+  // ─────────────────────────────────────────────────────────────────────
+  let sessionIdsForCounterCleanup: string[] = [];
+  try {
+    const SESSIONS_INDEX_KEY = 'ghostr_pq_sessions_index';
+    const sessionsRaw = await AsyncStorage.getItem(SESSIONS_INDEX_KEY);
+    if (sessionsRaw) {
+      let json = sessionsRaw;
+      if (sessionsRaw.startsWith('enc1:')) {
+        try {
+          // FIX migration (mai 2026) : utilise hasAnyEncryptionKey() (PIN OR
+          // hardware) au lieu de isEncryptionEnabled() (PIN only). Sans ça,
+          // en mode no-PIN après import, hardwareKey est en RAM mais le test
+          // retournait false → la décryption était skippée → sessionIds vide
+          // → les compteurs anti-replay (`ghostr_monotonic_send_v1_*`) en
+          // SecureStore restent orphelins → au prochain envoi, le state Triple
+          // Ratchet restauré (messageNumberSend=N) est inférieur au compteur
+          // résiduel (storedCounter=M>N) → forced DH ratchet imprévu → l'autre
+          // côté ne peut pas déchiffrer (AEAD authentication failed).
+          const { decryptIfNeeded, hasAnyEncryptionKey } = await import('./localCrypto');
+          if (hasAnyEncryptionKey()) {
+            json = decryptIfNeeded(sessionsRaw);
+          } else {
+            __DEV__ && console.warn(
+              '[storage] ⚠️ nuclearReset: no key in RAM to decrypt sessions index ' +
+              '— monotonic counters may linger. Caller should clean them by sessionId.'
+            );
+          }
+        } catch {
+          // If we can't decrypt (e.g. key truly absent during crash recovery),
+          // we lose the session IDs. The counters will linger in SecureStore.
+          // applyMigrationDump compensates by also deleting counters explicitly
+          // for each sessionId in the dump, so this path is no longer fatal.
+        }
+      }
+      try {
+        const parsed = JSON.parse(json);
+        if (Array.isArray(parsed)) {
+          sessionIdsForCounterCleanup = parsed.filter(x => typeof x === 'string');
+        }
+      } catch {}
+    }
+  } catch (e) {
+    __DEV__ && console.warn('[storage] could not read sessions index for counter cleanup:', e);
+  }
+  __DEV__ && console.log(`[storage] ☢️ Will clean ${sessionIdsForCounterCleanup.length} monotonic counter(s)`);
+
   // 1. Wipe ALL AsyncStorage (conversations, messages, onboarding flag, profile, everything)
   try {
     await AsyncStorage.clear();
@@ -1664,6 +1789,17 @@ export async function nuclearReset(): Promise<void> {
     'ghostr_rotated_enc_key_v1_pending',
     // Device-level encryption key (from ensureDeviceLevelEncryption)
     'ghostr_device_encryption_key_v1',
+    // Migration marker — sans cette ligne, nuclearReset() ne supprime PAS le
+    // marker SecureStore. wipeAfterExport() le compense via son clearMarker()
+    // final, mais TOUT autre appelant (Settings → "Effacer tout", flag
+    // RESET_ALL_DATA, etc.) laisserait un marker orphelin → device piégé.
+    'ghostr_migration_marker_v1',
+    // Triple Ratchet identity material — defensive duplicate of what
+    // sessionService.clearAllData() also deletes. Listed here as belt-and-
+    // suspenders so an exception in clearAllData() between AsyncStorage.clear
+    // (step 1) and the identity-delete line still produces a clean wipe.
+    'ghostr_pq_identity_key_pair',
+    'ghostr_pq_signed_pre_key',
   ];
   
   for (const key of secureStoreKeys) {
@@ -1671,6 +1807,20 @@ export async function nuclearReset(): Promise<void> {
       await SecureStore.deleteItemAsync(key);
     } catch {
       // Key might not exist, that's fine
+    }
+  }
+
+  // 2bis. Per-session monotonic anti-replay counters (SecureStore, prefixed)
+  if (sessionIdsForCounterCleanup.length > 0) {
+    const COUNTER_KEY_PREFIX = 'ghostr_monotonic_send_v1_';
+    for (const sid of sessionIdsForCounterCleanup) {
+      try {
+        await SecureStore.deleteItemAsync(COUNTER_KEY_PREFIX + sid);
+      } catch {
+        // Best-effort: a leftover counter is harmless (the next sender on a
+        // new device gets verified=false from verifySendCounter and forces a
+        // fresh DH ratchet, which is the safe behaviour).
+      }
     }
   }
   __DEV__ && console.log('[storage] ☢️ SecureStore keys cleared');
@@ -1692,7 +1842,25 @@ export async function nuclearReset(): Promise<void> {
   } catch (e) {
     __DEV__ && console.error('[storage] SessionService cleanup error:', e);
   }
-  
+
+  // 4bis. Reset cached "PIN was ever configured" flag.
+  //
+  // sessionService caches the result of `wasLockEverConfigured()` (a check on
+  // SecureStore's whisper_lock_data_v6). nuclearReset deletes that key but
+  // does NOT touch the in-memory cache. If the cache happens to be true at
+  // the time of the wipe, subsequent loadSession() calls treat any plaintext
+  // entry as tampered and removeItem() them — silently destroying state.
+  //
+  // In the import flow we only write enc1: data, so the failure surface is
+  // narrow, but the cost of this line is zero and it eliminates a class of
+  // hard-to-reproduce data-loss bugs.
+  try {
+    const { resetLockConfiguredCache } = await import('./tripleRatchet/sessionService');
+    resetLockConfiguredCache();
+  } catch (e) {
+    __DEV__ && console.warn('[storage] resetLockConfiguredCache failed (non-fatal):', e);
+  }
+
   // 5. 1-to-1 message data
   try {
     const { clearAll1to1Data } = await import('./api1to1');
@@ -1701,12 +1869,13 @@ export async function nuclearReset(): Promise<void> {
   } catch (e) {
     __DEV__ && console.error('[storage] 1-to-1 cleanup error:', e);
   }
-  
+
   // 6. Reset in-memory state
   clearCache();
+  clearOpaqueKeySeed(); // ACTION 5: clear opaque storage key derivation seed
   clearConversationTokenCache();
   cachedDeviceState = null;
-  
+
   __DEV__ && console.log('[storage] ☢️ NUCLEAR RESET COMPLETE — app is a blank slate');
 }
 

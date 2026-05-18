@@ -9,27 +9,9 @@
 // - Protection anti-replay
 // - Rotation DH périodique optionnelle
 
-import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
+import { decodeBase64 } from 'tweetnacl-util';
 
-import {
-  CallRatchetState,
-  SerializedCallRatchetInit,
-  DHRotationMessage,
-  initializeCallRatchet,
-  initializeCallRatchetFromSecret,
-  initializeCallRatchetFromInit,
-  encryptAudioPacket,
-  decryptAudioPacket,
-  shouldRotateDH,
-  prepareDHRotation,
-  processDHRotation,
-  cleanupCallRatchetState,
-  getCallRatchetStats,
-  createCallRatchetInit,
-  processCallRatchetInit,
-  serializeCallRatchetState,
-  deserializeCallRatchetState,
-} from './tripleRatchet/callTripleRatchet';
+import { CallRatchetState, SerializedCallRatchetInit, DHRotationMessage, initializeCallRatchetFromSecret, initializeCallRatchetFromInit, encryptAudioPacket, decryptAudioPacket, shouldRotateDH, prepareDHRotation, processDHRotation, cleanupCallRatchetState, getCallRatchetStats, createCallRatchetInit, processCallRatchetInit, serializeCallRatchetState, deserializeCallRatchetState } from './tripleRatchet/callTripleRatchet';
 
 import { sessionService } from './tripleRatchet/sessionService';
 

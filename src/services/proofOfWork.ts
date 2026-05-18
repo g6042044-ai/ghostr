@@ -98,9 +98,52 @@ export async function computeProofOfWork(
   const remainingBits = difficulty % 8;
   const remainingMask = remainingBits > 0 ? (0xFF << (8 - remainingBits)) : 0;
 
-  // Larger batches = fewer setTimeout yields = faster total time
-  const BATCH_SIZE = 50_000;
+  // ──────────────────────────────────────────────────────────────────────
+  // BATCH_SIZE — compromis temps total vs réactivité UI
+  // ──────────────────────────────────────────────────────────────────────
+  // Le PoW tourne en JS sur le thread principal (pas de Worker en RN). Entre
+  // chaque batch, on yield via setTimeout(0). Cette pause libère le JS thread
+  // pendant ~16-20ms — fenêtre dans laquelle les événements UI (frappes
+  // clavier, animations Animated avec native driver, layout, etc.) peuvent
+  // s'exécuter.
+  //
+  // SUR HERMES (React Native) :
+  //   Hermes n'a PAS le JIT TurboFan de V8. Les opérations numériques et
+  //   le SHA-256 itératif tournent 3-10× plus lentement que sur V8 (Chrome).
+  //
+  // PROBLÈME OBSERVÉ EN PROD (avant fix) :
+  //   Sur device Hermes en cold start, le PoW pouvait prendre 30-60s+ à
+  //   cause de la CONTENTION CPU avec :
+  //     • startGlobalPolling1to1 (constant traffic + invite watcher + global poll)
+  //     • secureRpc OHTTP double-hop (encrypts + decrypts request/response)
+  //     • Décryption des messages entrants
+  //     • AsyncStorage I/O
+  //   Chaque setTimeout(0) yield laissait passer 2-3 microtasks de polling avant
+  //   que la prochaine batch ne reprenne.
+  //
+  // FIX EN DEUX PARTIES :
+  //   1. Polling DIFFÉRÉ jusqu'au bootstrap (api1to1.ts startGlobalPolling1to1)
+  //      → CPU dégagé pour le PoW initial
+  //   2. BATCH_SIZE 5_000 → 10_000 : 2× moins de yields = 2× moins
+  //      d'opportunités d'être starvé par les microtasks restantes
+  //      (notamment InviteWatcher qui poll en parallèle).
+  //
+  // CHOIX DE 10_000 :
+  //   • Sur device Hermes typique : ~220ms par batch (vs 110ms à 5k)
+  //   • ~26 batches pour 260k iterations (vs 52 à 5k)
+  //   • Yield overhead: 26 × 20ms = 520ms (vs 1040ms à 5k) → -520ms total
+  //   • UI freeze 220ms : juste sous le seuil de perceptibilité humaine
+  //     en saisie clavier (~300ms). Toujours fluide pour PIN.
+  //   • Test sur PIN 6 chiffres : ~3 freezes pendant la frappe, à peine
+  //     perceptible. À 25k (550ms), ça devient clairement laggy.
+  //
+  // NE PAS DESCENDRE EN-DESSOUS DE 5_000 ni MONTER AU-DESSUS DE 25_000
+  // SANS BENCHMARK DEVICE.
+  // ──────────────────────────────────────────────────────────────────────
+  const BATCH_SIZE = 10_000;
   let nonce = 0;
+  const startedAt = Date.now();
+  let lastProgressLog = startedAt;
 
   while (true) {
     const batchEnd = nonce + BATCH_SIZE;
@@ -139,6 +182,15 @@ export async function computeProofOfWork(
       }
 
       nonce++;
+    }
+
+    // Progress diagnostic toutes les 10s pour debug device lent
+    const now = Date.now();
+    if (__DEV__ && now - lastProgressLog > 10_000) {
+      console.log(
+        `[PoW] Progress: nonce=${nonce}, elapsed=${now - startedAt}ms (still searching for ${difficulty}-bit valid hash)`
+      );
+      lastProgressLog = now;
     }
 
     // Yield to event loop

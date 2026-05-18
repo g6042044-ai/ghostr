@@ -1,5 +1,5 @@
 // src/services/media1to1.ts
-// v26.0: Envoi de médias via Encrypted Blob Storage
+// v28.0: Envoi de médias via Encrypted Blob Storage — iOS performance fix
 //
 // ARCHITECTURE:
 //   1. Traiter le média (compression image, lecture fichier/vocal)
@@ -13,22 +13,37 @@
 //   - Upload/download via CF Relay (IP cachée)
 //   - Path UUID aléatoire (aucun lien session)
 //   - Clé de déchiffrement dans le message E2E uniquement
+//
+// ============================================================================
+// v28.0 — iOS PERFORMANCE FIX:
+//
+// PROBLÈMES CORRIGÉS:
+//
+//   1. ENCRYPT/UPLOAD ASYNC AVEC YIELD UI:
+//      encryptAndUploadBlob est maintenant entièrement async et yield au
+//      thread JS entre les phases lourdes (cf. encryptedBlobService.ts v28).
+//      Le callback onProgress reçoit donc des notifications RÉELLES alignées
+//      avec les phases plutôt qu'un saut 0→100 quand le thread se débloque.
+//
+//   2. PROGRESS MORE GRANULAR:
+//      Anciennement, onProgress('processing', 60) → onProgress('uploading', 0)
+//      étaient envoyés immédiatement après le yield ImageManipulator. Quand
+//      le NaCl secretbox bloquait 2s, l'UI ne voyait rien. Maintenant on
+//      découpe en 'processing' → 'encrypting' → 'uploading' → 'sending'.
+//
+//   3. CALLBACK PROGRESS YIELD:
+//      Après chaque onProgress, on yield au thread JS pour que React puisse
+//      effectivement redessiner l'overlay de progression. Sans ce yield,
+//      les setState seraient batchés et l'utilisateur ne verrait que la
+//      progression finale.
+// ============================================================================
 
 import * as FileSystem from 'expo-file-system/legacy';
 import * as ImageManipulator from 'expo-image-manipulator';
-import { 
-  sendMediaRef1to1,
-  BlobUploadResult,
-  Message1to1,
-  saveLocalMessage1to1,
-} from './api1to1';
+import i18n from '../i18n';
+import { sendMediaRef1to1, Message1to1, saveLocalMessage1to1 } from './api1to1';
 import { sessionService } from './tripleRatchet';
-import {
-  encryptAndUploadBlob,
-  downloadAndDecryptBlob,
-  base64ToUint8Array,
-  uint8ArrayToBase64,
-} from './encryptedBlobService';
+import { encryptAndUploadBlob, downloadAndDecryptBlob, base64ToUint8Array, uint8ArrayToBase64 } from './encryptedBlobService';
 
 // ============================================
 // CONSTANTES
@@ -48,6 +63,18 @@ const MAX_VOICE_SIZE = 10 * 1024 * 1024;
 const MAX_VOICE_DURATION = 600;
 
 // ============================================
+// UTILS
+// ============================================
+
+/**
+ * Yield au thread JS pour laisser React redessiner l'overlay de progression.
+ * Indispensable sur iOS où le thread JS est très chargé pendant l'encryption.
+ */
+function yieldToUI(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+// ============================================
 // ENVOI D'IMAGE
 // ============================================
 
@@ -61,28 +88,32 @@ export interface SendImageResult {
 export async function sendImageMessage1to1(
   sessionId: string,
   imageUri: string,
-  onProgress?: (stage: 'processing' | 'uploading' | 'sending', progress: number) => void
+  onProgress?: (stage: 'processing' | 'encrypting' | 'uploading' | 'sending', progress: number) => void
 ): Promise<SendImageResult> {
   try {
-    __DEV__ && console.log('[media1to1] 📸 Starting image send (v26.0 blob storage)...');
+    __DEV__ && console.log('[media1to1] 📸 Starting image send (v28.0 blob storage)...');
     onProgress?.('processing', 0);
+    await yieldToUI();
 
-    // 1. Compression
+    // 1. Compression (ImageManipulator est natif → ne bloque pas le thread JS)
     const processedImage = await processImage(imageUri);
-    onProgress?.('processing', 40);
+    onProgress?.('processing', 100);
+    await yieldToUI();
 
-    // v27.1: Thumbnail SUPPRIMÉ — il n'est plus envoyé sur le réseau (v27.0),
-    // et l'envoyeur a déjà imageData localement. Zéro utilité, CPU gaspillé.
-    onProgress?.('processing', 60);
-
-    // 3. Chiffrer + uploader le blob
-    onProgress?.('uploading', 0);
+    // 2. Chiffrer + uploader le blob (interne: yield JS entre chaque phase lourde)
+    onProgress?.('encrypting', 0);
+    await yieldToUI();
     const imageBytes = base64ToUint8Array(processedImage.base64);
+    onProgress?.('encrypting', 50);
+    await yieldToUI();
+
+    onProgress?.('uploading', 0);
     const blobResult = await encryptAndUploadBlob(imageBytes);
     __DEV__ && console.log('[media1to1] ✅ Blob uploaded:', blobResult.blobId.slice(0, 12) + '...');
     onProgress?.('uploading', 100);
+    await yieldToUI();
 
-    // 4. Envoyer la référence E2E (~350B sans thumbnail → tier 2KB = indistinguable des decoys)
+    // 3. Envoyer la référence E2E (~350B sans thumbnail → tier 2KB = indistinguable des decoys)
     onProgress?.('sending', 0);
     const result = await sendMediaRef1to1(sessionId, blobResult, 'image', {
       // thumbnailData supprimé — pas envoyé, pas stocké
@@ -115,7 +146,7 @@ export async function sendImageMessage1to1(
     return result;
   } catch (error: any) {
     __DEV__ && console.error('[media1to1] ❌ Exception:', error);
-    return { success: false, error: error.message || 'Erreur lors de l\'envoi de l\'image' };
+    return { success: false, error: error.message || i18n.t('errors.imageSendFailed') };
   }
 }
 
@@ -136,11 +167,12 @@ export async function sendFileMessage1to1(
   fileUri: string,
   fileName: string,
   mimeType: string,
-  onProgress?: (stage: 'validating' | 'uploading' | 'sending', progress: number) => void
+  onProgress?: (stage: 'validating' | 'reading' | 'uploading' | 'sending', progress: number) => void
 ): Promise<SendFileResult> {
   try {
-    __DEV__ && console.log('[media1to1] 📎 Starting file send (v26.0 blob storage)...');
+    __DEV__ && console.log('[media1to1] 📎 Starting file send (v28.0 blob storage)...');
     onProgress?.('validating', 0);
+    await yieldToUI();
 
     const fileInfo = await FileSystem.getInfoAsync(fileUri);
     if (!fileInfo.exists) return { success: false, error: 'Fichier introuvable' };
@@ -149,13 +181,19 @@ export async function sendFileMessage1to1(
       return { success: false, error: `Fichier trop volumineux (${Math.round(fileSize / 1024 / 1024 * 10) / 10}MB). Max: 10MB`, errorCode: 'FILE_TOO_LARGE' };
     }
     onProgress?.('validating', 100);
+    await yieldToUI();
 
-    // Lire + chiffrer + uploader
-    onProgress?.('uploading', 0);
+    // Lire (natif) + chiffrer + uploader (interne yield)
+    onProgress?.('reading', 0);
     const base64Content = await FileSystem.readAsStringAsync(fileUri, { encoding: FileSystem.EncodingType.Base64 });
+    onProgress?.('reading', 100);
+    await yieldToUI();
+
+    onProgress?.('uploading', 0);
     const fileBytes = base64ToUint8Array(base64Content);
     const blobResult = await encryptAndUploadBlob(fileBytes);
     onProgress?.('uploading', 100);
+    await yieldToUI();
 
     // Envoyer la référence E2E (~300B, pas de thumbnail)
     onProgress?.('sending', 0);
@@ -182,7 +220,7 @@ export async function sendFileMessage1to1(
     return result;
   } catch (error: any) {
     __DEV__ && console.error('[media1to1] ❌ Exception:', error);
-    return { success: false, error: error.message || 'Erreur lors de l\'envoi du fichier' };
+    return { success: false, error: error.message || i18n.t('errors.fileSendFailed') };
   }
 }
 
@@ -205,24 +243,27 @@ export async function sendVoiceMessage1to1(
 ): Promise<SendVoiceResult> {
   try {
     const durationSeconds = duration / 1000;
-    __DEV__ && console.log('[media1to1] 🎤 Starting voice send (v26.0 blob storage)...');
+    __DEV__ && console.log('[media1to1] 🎤 Starting voice send (v28.0 blob storage)...');
     if (durationSeconds > MAX_VOICE_DURATION) {
-      return { success: false, error: `Message vocal trop long. Maximum: 10 minutes` };
+      return { success: false, error: i18n.t('errors.voiceTooLong', { minutes: 10 }) };
     }
 
     onProgress?.('reading', 0);
+    await yieldToUI();
     const fileInfo = await FileSystem.getInfoAsync(audioUri);
     if (!fileInfo.exists) return { success: false, error: 'Fichier audio introuvable' };
     if (((fileInfo as any).size || 0) > MAX_VOICE_SIZE) {
-      return { success: false, error: 'Message vocal trop volumineux' };
+      return { success: false, error: i18n.t('errors.voiceTooLarge') };
     }
     const base64Content = await FileSystem.readAsStringAsync(audioUri, { encoding: FileSystem.EncodingType.Base64 });
     onProgress?.('reading', 100);
+    await yieldToUI();
 
     onProgress?.('uploading', 0);
     const voiceBytes = base64ToUint8Array(base64Content);
     const blobResult = await encryptAndUploadBlob(voiceBytes);
     onProgress?.('uploading', 100);
+    await yieldToUI();
 
     onProgress?.('sending', 0);
     const result = await sendMediaRef1to1(sessionId, blobResult, 'voice', {
@@ -235,7 +276,7 @@ export async function sendVoiceMessage1to1(
       const myProfile = sessionService.getMyProfile();
       const localMessage: Message1to1 = {
         id: result.messageId!, sessionId,
-        content: `[Message vocal ${Math.round(durationSeconds)}s]`, timestamp: Date.now(),
+        content: i18n.t('messages.voiceMessagePlaceholder', { seconds: Math.round(durationSeconds) }), timestamp: Date.now(),
         isMine: true, displayName: myProfile.displayName,
         senderAvatarBase64: myProfile.avatarBase64, status: 'sent',
         messageType: 'voice', voiceData: base64Content, voiceDuration: durationSeconds,
@@ -245,7 +286,7 @@ export async function sendVoiceMessage1to1(
     return result;
   } catch (error: any) {
     __DEV__ && console.error('[media1to1] ❌ Exception:', error);
-    return { success: false, error: error.message || 'Erreur lors de l\'envoi du message vocal' };
+    return { success: false, error: error.message || i18n.t('errors.voiceSendFailed') };
   }
 }
 
@@ -292,7 +333,7 @@ export async function downloadMediaBlob(
     return { success: true, base64Data };
   } catch (error: any) {
     __DEV__ && console.error('[media1to1] ❌ Download error:', error);
-    return { success: false, error: error.message || 'Erreur lors du téléchargement' };
+    return { success: false, error: error.message || i18n.t('errors.downloadError') };
   }
 }
 

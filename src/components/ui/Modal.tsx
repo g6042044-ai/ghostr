@@ -4,22 +4,11 @@
 // BottomSheet avec support du clavier
 
 import React, { useEffect, useRef } from 'react';
-import {
-  Modal as RNModal,
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  Pressable,
-  Animated,
-  Dimensions,
-  Platform,
-  ScrollView,
-  ActivityIndicator,
-  KeyboardAvoidingView,
-} from 'react-native';
+import { Modal as RNModal, View, Text, StyleSheet, TouchableOpacity, Pressable, Animated, Dimensions, Platform, ScrollView, ActivityIndicator, KeyboardAvoidingView } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { theme } from './theme';
+import { useTranslation } from 'react-i18next';
+import { useTheme, useThemedStyles } from './ThemeContext';
+import type { ColorPalette } from './theme';
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -83,6 +72,7 @@ export const BottomSheet: React.FC<BottomSheetProps> = ({
   children,
   showHandle = true,
 }) => {
+  const styles = useThemedStyles(makeStyles);
   const insets = useSafeAreaInsets();
   const slideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
   const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -178,6 +168,7 @@ export const AlertModal: React.FC<AlertModalProps> = ({
   primaryButton,
   secondaryButton,
 }) => {
+  const styles = useThemedStyles(makeStyles);
   const scaleAnim = useRef(new Animated.Value(0.9)).current;
   const fadeAnim = useRef(new Animated.Value(0)).current;
 
@@ -253,7 +244,12 @@ export const AlertModal: React.FC<AlertModalProps> = ({
                 onPress={secondaryButton.onPress}
                 activeOpacity={0.7}
               >
-                <Text style={styles.alertButtonSecondaryText}>
+                <Text
+                  style={styles.alertButtonSecondaryText}
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                  minimumFontScale={0.82}
+                >
                   {secondaryButton.title}
                 </Text>
               </TouchableOpacity>
@@ -268,7 +264,12 @@ export const AlertModal: React.FC<AlertModalProps> = ({
                 {primaryButton.loading ? (
                   <ActivityIndicator size="small" color="#FFFFFF" />
                 ) : (
-                  <Text style={styles.alertButtonPrimaryText}>
+                  <Text
+                    style={styles.alertButtonPrimaryText}
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    minimumFontScale={0.82}
+                  >
                     {primaryButton.title}
                   </Text>
                 )}
@@ -292,65 +293,98 @@ export const ActionSheet: React.FC<ActionSheetProps> = ({
   subtitle,
   items,
   showCancel = true,
-  cancelText = 'Annuler',
+  cancelText,
 }) => {
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
   const insets = useSafeAreaInsets();
+  const { t } = useTranslation();
+  const resolvedCancelText = cancelText ?? t('common.cancel');
   const slideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
   const fadeAnim = useRef(new Animated.Value(0)).current;
-  const itemAnims = useRef(items.map(() => new Animated.Value(0))).current;
 
+  // PERF FIX (UX) : garde anti double-tap.
+  // Pendant la fermeture (200-250ms), le RNModal reste monté donc les
+  // TouchableOpacity restent cliquables. Sans cette garde, un tap rapide
+  // pouvait déclencher item.onPress() deux fois (ou pire, naviguer vers
+  // un écran A puis B avant que le premier ne soit traité côté navigator).
+  const isHandlingPressRef = useRef(false);
+
+  // Reset la garde et les anims chaque ouverture.
   useEffect(() => {
     if (visible) {
-      // Reset item anims
-      itemAnims.forEach(a => a.setValue(0));
-      
-      // PERF FIX: Lancer les animations des items EN PARALLÈLE avec le slide,
-      // pas APRÈS. Avant: le sheet glissait (300-500ms) PUIS les items apparaissaient
-      // un par un (stagger 60ms × N). L'utilisateur attendait ~600ms avant de voir
-      // les boutons. Après: les items commencent à apparaître 80ms après le début
-      // du slide et sont visibles dès que le sheet atteint sa position finale.
+      isHandlingPressRef.current = false;
+
+      // PERF FIX (UX) : les items sont visibles dès le 1er paint.
+      // L'entrée visuelle du menu, c'est le slide-up du sheet — pas besoin
+      // d'animer aussi chaque item. La version précédente ajoutait :
+      //   80ms delay + 40ms × N stagger + spring 250-400ms par item
+      //   = ~400-600ms d'attente avant que les boutons soient "posés".
+      // Maintenant : sheet glisse → items déjà à leur place = snappy.
       Animated.parallel([
         Animated.spring(slideAnim, {
           toValue: 0,
           useNativeDriver: true,
-          tension: 65,
-          friction: 11,
+          tension: 100,   // était 65 — un peu plus stiff = arrive plus vite
+          friction: 13,   // était 11 — limite l'overshoot avec la nouvelle tension
         }),
         Animated.timing(fadeAnim, {
           toValue: 1,
-          duration: 200,
+          duration: 180,  // était 200
           useNativeDriver: true,
         }),
-        // Items: petit délai puis stagger rapide — visibles pendant que le sheet glisse
-        Animated.sequence([
-          Animated.delay(80),
-          Animated.stagger(40,
-            itemAnims.map(anim =>
-              Animated.spring(anim, {
-                toValue: 1,
-                useNativeDriver: true,
-                tension: 120,
-                friction: 14,
-              })
-            )
-          ),
-        ]),
       ]).start();
     } else {
       Animated.parallel([
         Animated.timing(slideAnim, {
           toValue: SCREEN_HEIGHT,
-          duration: 250,
+          duration: 220,  // était 250
           useNativeDriver: true,
         }),
         Animated.timing(fadeAnim, {
           toValue: 0,
-          duration: 200,
+          duration: 180,  // était 200
           useNativeDriver: true,
         }),
       ]).start();
     }
   }, [visible]);
+
+  // PERF FIX (UX) : handler unifié qui résout le bug "1er clic ne marche pas".
+  //
+  // Avant — séquence problématique :
+  //   1. user tap → item.onPress() → setShowMenu(false) puis navigation.navigate(...)
+  //   2. onClose() → setShowMenu(false) (redondant)
+  //   3. React batch → modal.visible passe false
+  //   4. RNModal commence à se détacher
+  //   5. Sur Android, naviguer vers presentation: 'fullScreenModal' ouvre une
+  //      NOUVELLE Activity. Pendant que la WindowManager.removeView du dialog
+  //      tourne, l'event de navigation peut être avalé par le système.
+  //   → l'utilisateur tape "Créer", rien ne se passe, retape, ça marche.
+  //
+  // Après :
+  //   1. on guard contre les taps répétés (isHandlingPressRef)
+  //   2. on ferme d'abord (l'utilisateur voit le feedback immédiat)
+  //   3. on défère item.onPress() au tick suivant via setTimeout(0)
+  //      → laisse React commiter visible=false → RNModal commence le détachement
+  //      → la navigation se fait après, sans race avec la nouvelle Activity
+  //   Délai ajouté : < 1 frame (~4-16ms typique), invisible à l'œil.
+  const handleItemPress = (item: ActionSheetItem) => {
+    if (item.disabled || isHandlingPressRef.current) return;
+    isHandlingPressRef.current = true;
+    onClose();
+    setTimeout(() => {
+      item.onPress();
+    }, 0);
+  };
+
+  // Cancel button : pas de race possible (pas de navigation), on appelle direct.
+  // On guard quand même contre les double-taps pour cohérence.
+  const handleCancelPress = () => {
+    if (isHandlingPressRef.current) return;
+    isHandlingPressRef.current = true;
+    onClose();
+  };
 
   return (
     <RNModal
@@ -362,7 +396,7 @@ export const ActionSheet: React.FC<ActionSheetProps> = ({
     >
       <View style={styles.modalContainer}>
         <Animated.View style={[styles.overlay, { opacity: fadeAnim }]}>
-          <Pressable style={styles.overlayPressable} onPress={onClose} />
+          <Pressable style={styles.overlayPressable} onPress={handleCancelPress} />
         </Animated.View>
 
         <Animated.View
@@ -386,78 +420,62 @@ export const ActionSheet: React.FC<ActionSheetProps> = ({
             </View>
           )}
 
-          {/* Items as cards */}
+          {/* Items as cards — pas d'animation per-item, ils glissent avec le sheet */}
           <View style={styles.actionSheetCards}>
             {items.map((item, index) => (
-              <Animated.View
+              <TouchableOpacity
                 key={index}
-                style={{
-                  opacity: itemAnims[index] || 1,
-                  transform: [{
-                    translateY: (itemAnims[index] || new Animated.Value(1)).interpolate({
-                      inputRange: [0, 1],
-                      outputRange: [16, 0],
-                    }),
-                  }],
-                }}
+                style={[
+                  styles.actionSheetCard,
+                  item.disabled && styles.actionSheetCardDisabled,
+                  item.destructive && styles.actionSheetCardDestructive,
+                ]}
+                onPress={() => handleItemPress(item)}
+                activeOpacity={0.7}
+                disabled={item.disabled}
               >
-                <TouchableOpacity
-                  style={[
-                    styles.actionSheetCard,
-                    item.disabled && styles.actionSheetCardDisabled,
-                    item.destructive && styles.actionSheetCardDestructive,
-                  ]}
-                  onPress={() => {
-                    if (!item.disabled) {
-                      item.onPress();
-                      onClose();
-                    }
-                  }}
-                  activeOpacity={0.7}
-                  disabled={item.disabled}
-                >
-                  {item.icon && (
-                    <View style={[
-                      styles.actionSheetCardIcon,
-                      item.destructive && styles.actionSheetCardIconDestructive,
-                    ]}>
-                      {item.icon}
-                    </View>
-                  )}
-                  <View style={styles.actionSheetCardContent}>
-                    <Text
-                      style={[
-                        styles.actionSheetCardTitle,
-                        item.destructive && styles.actionSheetCardTitleDestructive,
-                        item.disabled && styles.actionSheetCardTitleDisabled,
-                      ]}
-                    >
-                      {item.title}
+                {item.icon && (
+                  <View style={[
+                    styles.actionSheetCardIcon,
+                    item.destructive && styles.actionSheetCardIconDestructive,
+                  ]}>
+                    {item.icon}
+                  </View>
+                )}
+                <View style={styles.actionSheetCardContent}>
+                  <Text
+                    style={[
+                      styles.actionSheetCardTitle,
+                      item.destructive && styles.actionSheetCardTitleDestructive,
+                      item.disabled && styles.actionSheetCardTitleDisabled,
+                    ]}
+                    numberOfLines={1}
+                  >
+                    {item.title}
+                  </Text>
+                  {item.subtitle && (
+                    <Text style={styles.actionSheetCardSubtitle} numberOfLines={2}>
+                      {item.subtitle}
                     </Text>
-                    {item.subtitle && (
-                      <Text style={styles.actionSheetCardSubtitle}>
-                        {item.subtitle}
-                      </Text>
-                    )}
-                  </View>
-                  <View style={styles.actionSheetCardChevron}>
-                    <Text style={[
-                      styles.actionSheetCardChevronText,
-                      item.destructive && { color: theme.colors.danger },
-                    ]}>›</Text>
-                  </View>
-                </TouchableOpacity>
-              </Animated.View>
+                  )}
+                </View>
+                <View style={styles.actionSheetCardChevron}>
+                  <Text style={[
+                    styles.actionSheetCardChevronText,
+                    item.destructive && { color: colors.danger },
+                  ]}>›</Text>
+                </View>
+              </TouchableOpacity>
             ))}
           </View>
 
           {showCancel && (
             <TouchableOpacity
               style={styles.actionSheetCancel}
-              onPress={onClose}
+              onPress={handleCancelPress}
               activeOpacity={0.7}
             >
-              <Text style={styles.actionSheetCancelText}>{cancelText}</Text>
+              <Text style={styles.actionSheetCancelText}>{resolvedCancelText}</Text>
             </TouchableOpacity>
           )}
         </Animated.View>
@@ -470,14 +488,14 @@ export const ActionSheet: React.FC<ActionSheetProps> = ({
 // STYLES
 // ============================================
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   modalContainer: {
     flex: 1,
     justifyContent: 'flex-end',
   },
   overlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: theme.colors.overlay,
+    backgroundColor: colors.overlay,
   },
   overlayPressable: {
     flex: 1,
@@ -485,7 +503,7 @@ const styles = StyleSheet.create({
 
   // Bottom Sheet
   bottomSheet: {
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     maxHeight: SCREEN_HEIGHT * 0.9,
@@ -493,7 +511,7 @@ const styles = StyleSheet.create({
   handle: {
     width: 36,
     height: 4,
-    backgroundColor: theme.colors.borderLight,
+    backgroundColor: colors.borderLight,
     borderRadius: 2,
     alignSelf: 'center',
     marginTop: 12,
@@ -503,12 +521,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingVertical: 16,
     borderBottomWidth: 1,
-    borderBottomColor: theme.colors.divider,
+    borderBottomColor: colors.divider,
   },
   bottomSheetTitle: {
     fontSize: 18,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
   },
   bottomSheetContent: {
     paddingHorizontal: 20,
@@ -524,10 +542,10 @@ const styles = StyleSheet.create({
   },
   alertOverlayAbsolute: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: theme.colors.overlay,
+    backgroundColor: colors.overlay,
   },
   alertContainer: {
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 20,
     padding: 24,
     width: '100%',
@@ -546,13 +564,13 @@ const styles = StyleSheet.create({
   alertTitle: {
     fontSize: 18,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
     textAlign: 'center',
     marginBottom: 8,
   },
   alertMessage: {
     fontSize: 15,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
     textAlign: 'center',
     lineHeight: 22,
     marginBottom: 24,
@@ -571,30 +589,34 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   alertButtonPrimary: {
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
   },
   alertButtonDanger: {
-    backgroundColor: theme.colors.danger,
+    backgroundColor: colors.danger,
   },
   alertButtonSecondary: {
-    backgroundColor: theme.colors.surfaceLight,
+    backgroundColor: colors.surfaceLight,
     borderWidth: 1,
-    borderColor: theme.colors.border,
+    borderColor: colors.border,
   },
   alertButtonPrimaryText: {
     fontSize: 16,
     fontWeight: '600',
     color: '#FFFFFF',
+    flexShrink: 1,
+    textAlign: 'center',
   },
   alertButtonSecondaryText: {
     fontSize: 16,
     fontWeight: '600',
-    color: theme.colors.text,
+    color: colors.text,
+    flexShrink: 1,
+    textAlign: 'center',
   },
 
   // Action Sheet - Modern card-based design
   actionSheet: {
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
   },
@@ -606,12 +628,12 @@ const styles = StyleSheet.create({
   actionSheetTitle: {
     fontSize: 22,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
     letterSpacing: -0.4,
   },
   actionSheetSubtitle: {
     fontSize: 14,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
     marginTop: 4,
     lineHeight: 20,
   },
@@ -624,30 +646,30 @@ const styles = StyleSheet.create({
   actionSheetCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     borderRadius: 16,
     padding: 16,
     borderWidth: 1,
-    borderColor: theme.colors.border,
+    borderColor: colors.border,
   },
   actionSheetCardDisabled: {
     opacity: 0.5,
   },
   actionSheetCardDestructive: {
-    backgroundColor: theme.colors.danger + '08',
-    borderColor: theme.colors.danger + '20',
+    backgroundColor: colors.danger + '08',
+    borderColor: colors.danger + '20',
   },
   actionSheetCardIcon: {
     width: 48,
     height: 48,
     borderRadius: 14,
-    backgroundColor: theme.colors.surfaceLight,
+    backgroundColor: colors.surfaceLight,
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 14,
   },
   actionSheetCardIconDestructive: {
-    backgroundColor: theme.colors.danger + '15',
+    backgroundColor: colors.danger + '15',
   },
   actionSheetCardContent: {
     flex: 1,
@@ -655,18 +677,18 @@ const styles = StyleSheet.create({
   actionSheetCardTitle: {
     fontSize: 16,
     fontWeight: '600',
-    color: theme.colors.text,
+    color: colors.text,
     letterSpacing: -0.2,
   },
   actionSheetCardTitleDestructive: {
-    color: theme.colors.danger,
+    color: colors.danger,
   },
   actionSheetCardTitleDisabled: {
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
   },
   actionSheetCardSubtitle: {
     fontSize: 13,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
     marginTop: 3,
     lineHeight: 18,
   },
@@ -675,7 +697,7 @@ const styles = StyleSheet.create({
   },
   actionSheetCardChevronText: {
     fontSize: 22,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     fontWeight: '300',
   },
   actionSheetCancel: {
@@ -685,14 +707,14 @@ const styles = StyleSheet.create({
     minHeight: 50,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: theme.colors.surfaceLight,
+    backgroundColor: colors.surfaceLight,
     borderRadius: 14,
   },
   actionSheetCancelText: {
     fontSize: 16,
     fontWeight: '600',
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
   },
-});
+}) as const;
 
 export default BottomSheet;

@@ -1,19 +1,41 @@
 // src/components/ui/Header.tsx
 // Header modernes — Safe area aware, cohérent iOS/Android
-// FIX: Utilise useSafeAreaInsets() dynamiquement (pas de valeurs hardcodées)
+// v3.0 — Migré sur useThemedStyles pour réactivité live au changement de thème.
+//
+// ────────────────────────────────────────────────────────────────────────────
+// MIGRATION NOTE
+// ────────────────────────────────────────────────────────────────────────────
+// L'ancienne version v2 utilisait un `StyleSheet.create` au top-level qui
+// capturait `theme.colors.X` au moment de l'import (= dark uniquement). Les
+// styles ne pouvaient pas répondre à un changement de thème — cf.
+// THEME_MIGRATION.md.
+//
+// Ici on déplace `StyleSheet.create` à l'intérieur de chaque sous-composant
+// via `useThemedStyles(builder)`. Le builder est mémoïsé par référence de
+// palette : 0 work tant que `colors` ne change pas. Les composants Header
+// sont rendus à chaque écran — un seul recalcul de StyleSheet survient au
+// moment où l'utilisateur change de thème.
+//
+// Les `<StatusBar barStyle="light-content" …>` internes ont aussi été
+// supprimés : c'est le rôle du `<ThemedStatusBar />` dans App.tsx, et
+// dupliquer le StatusBar par écran provoquait des conflits visibles entre
+// barStyle dark et light quand on naviguait. Le NavigationContainer et
+// App.tsx pilotent désormais le StatusBar globalement.
 
 import React from 'react';
 import {
   View,
   Text,
   StyleSheet,
-  TouchableOpacity,
-  Platform,
   StatusBar,
+  TouchableOpacity,
   ViewStyle,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { theme } from './theme';
+import { useTranslation } from 'react-i18next';
+import { useTheme, useThemedStyles } from './ThemeContext';
+import { theme as themeStatic } from './theme';
+import type { ColorPalette } from './theme';
 import { generateAvatarInitials } from '../../services/crypto';
 
 // ============================================
@@ -54,6 +76,12 @@ interface SelectionHeaderProps {
   rightActions?: React.ReactNode;
 }
 
+interface LargeHeaderProps {
+  title: string;
+  rightComponent?: React.ReactNode;
+  backgroundColor?: string;
+}
+
 // Consistent content height across all platforms
 // Matches ConversationListScreen header visual height
 const HEADER_CONTENT_HEIGHT = 56;
@@ -69,12 +97,17 @@ export const Header: React.FC<HeaderProps> = ({
   rightComponent,
   onBackPress,
   showBackButton = true,
-  backgroundColor = theme.colors.background,
+  backgroundColor,
   titleAlign = 'center',
   style,
   elevated = false,
 }) => {
   const insets = useSafeAreaInsets();
+  const { colors, isDark } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  // Default backgroundColor resolved lazily from the live palette — callers
+  // can still override via prop.
+  const resolvedBg = backgroundColor ?? colors.background;
 
   return (
     <View
@@ -82,14 +115,26 @@ export const Header: React.FC<HeaderProps> = ({
         styles.header,
         {
           paddingTop: insets.top,
-          backgroundColor,
+          backgroundColor: resolvedBg,
         },
         elevated && styles.headerElevated,
         style,
       ]}
     >
-      <StatusBar barStyle="light-content" backgroundColor={backgroundColor} />
-      
+      {/*
+        Re-paint the Android status bar to match the header background so
+        there's no visible seam between the OS status bar region and the
+        header below. iOS ignores backgroundColor here (status bar is
+        translucent), so this is effectively an Android polish.
+
+        barStyle is derived from `isDark` rather than the resolved bg
+        because callers can pass arbitrary backgroundColor props — we
+        don't try to compute the luminance, we trust the global theme.
+      */}
+      <StatusBar
+        barStyle={isDark ? 'light-content' : 'dark-content'}
+        backgroundColor={resolvedBg}
+      />
       <View style={styles.headerContent}>
         <View style={styles.headerLeft}>
           {showBackButton && onBackPress ? (
@@ -113,8 +158,8 @@ export const Header: React.FC<HeaderProps> = ({
           titleAlign === 'left' && styles.headerCenterLeft,
         ]}>
           {title && (
-            <Text 
-              style={styles.headerTitle} 
+            <Text
+              style={styles.headerTitle}
               numberOfLines={1}
             >
               {title}
@@ -152,9 +197,11 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
   rightActions,
 }) => {
   const insets = useSafeAreaInsets();
+  const { t } = useTranslation();
+  const { colors, isDark } = useTheme();
+  const styles = useThemedStyles(makeStyles);
 
-  // WhatsApp-style: only show subtitle when typing or explicit subtitle passed
-  const subtitleText = isTyping ? 'écrit...' : (subtitle || '');
+  const subtitleText = isTyping ? t('conversation.typing') : (subtitle || '');
   const showSubtitle = subtitleText.length > 0;
 
   const headerInfoContent = (
@@ -178,11 +225,11 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
           {title}
         </Text>
         {showSubtitle && (
-          <Text 
+          <Text
             style={[
               styles.chatHeaderSubtitle,
               isTyping && styles.chatHeaderTyping,
-            ]} 
+            ]}
             numberOfLines={1}
           >
             {subtitleText}
@@ -199,8 +246,10 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
         { paddingTop: insets.top },
       ]}
     >
-      <StatusBar barStyle="light-content" backgroundColor={theme.colors.surface} />
-      
+      <StatusBar
+        barStyle={isDark ? 'light-content' : 'dark-content'}
+        backgroundColor={colors.surface}
+      />
       <View style={styles.chatHeaderContent}>
         <TouchableOpacity
           style={styles.chatBackButton}
@@ -212,7 +261,7 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
         </TouchableOpacity>
 
         {onTitlePress ? (
-          <TouchableOpacity 
+          <TouchableOpacity
             style={styles.chatHeaderTouchable}
             onPress={onTitlePress}
             activeOpacity={0.7}
@@ -245,6 +294,9 @@ export const SelectionHeader: React.FC<SelectionHeaderProps> = ({
   rightActions,
 }) => {
   const insets = useSafeAreaInsets();
+  const { t } = useTranslation();
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
 
   return (
     <View
@@ -253,8 +305,14 @@ export const SelectionHeader: React.FC<SelectionHeaderProps> = ({
         { paddingTop: insets.top },
       ]}
     >
-      <StatusBar barStyle="light-content" backgroundColor={theme.colors.primary} />
-      
+      {/*
+        SelectionHeader paints itself with `colors.primary` (the teal
+        brand colour) on both light and dark palettes. White text on
+        teal is AA-legible regardless of theme, so we hardcode
+        light-content here — it's a property of the saturated
+        background, not of the global theme.
+      */}
+      <StatusBar barStyle="light-content" backgroundColor={colors.primary} />
       <View style={styles.selectionContent}>
         <TouchableOpacity
           style={styles.selectionClose}
@@ -265,7 +323,7 @@ export const SelectionHeader: React.FC<SelectionHeaderProps> = ({
         </TouchableOpacity>
 
         <Text style={styles.selectionCount}>
-          {selectedCount} sélectionné{selectedCount > 1 ? 's' : ''}
+          {t('header.selectedCount', { count: selectedCount })}
         </Text>
 
         <View style={styles.selectionActions}>
@@ -298,18 +356,15 @@ export const SelectionHeader: React.FC<SelectionHeaderProps> = ({
 // LARGE HEADER (Style iOS)
 // ============================================
 
-interface LargeHeaderProps {
-  title: string;
-  rightComponent?: React.ReactNode;
-  backgroundColor?: string;
-}
-
 export const LargeHeader: React.FC<LargeHeaderProps> = ({
   title,
   rightComponent,
-  backgroundColor = theme.colors.background,
+  backgroundColor,
 }) => {
   const insets = useSafeAreaInsets();
+  const { colors, isDark } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  const resolvedBg = backgroundColor ?? colors.background;
 
   return (
     <View
@@ -317,12 +372,14 @@ export const LargeHeader: React.FC<LargeHeaderProps> = ({
         styles.largeHeader,
         {
           paddingTop: insets.top + 12,
-          backgroundColor,
+          backgroundColor: resolvedBg,
         },
       ]}
     >
-      <StatusBar barStyle="light-content" backgroundColor={backgroundColor} />
-      
+      <StatusBar
+        barStyle={isDark ? 'light-content' : 'dark-content'}
+        backgroundColor={resolvedBg}
+      />
       <View style={styles.largeHeaderContent}>
         <Text style={styles.largeHeaderTitle}>{title}</Text>
         {rightComponent && (
@@ -334,224 +391,230 @@ export const LargeHeader: React.FC<LargeHeaderProps> = ({
 };
 
 // ============================================
-// STYLES
+// STYLES (live, per-palette)
 // ============================================
 
-const styles = StyleSheet.create({
-  // Standard Header
-  header: {
-    backgroundColor: theme.colors.background,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: theme.colors.divider,
-  },
-  headerElevated: {
-    ...theme.shadow.md,
-    borderBottomWidth: 0,
-  },
-  headerContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    height: HEADER_CONTENT_HEIGHT,
-    paddingHorizontal: 4,
-  },
-  headerLeft: {
-    flex: 1,
-    alignItems: 'flex-start',
-  },
-  headerCenter: {
-    flex: 3,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  headerCenterLeft: {
-    alignItems: 'flex-start',
-    paddingLeft: 8,
-  },
-  headerRight: {
-    flex: 1,
-    alignItems: 'flex-end',
-  },
-  headerTitle: {
-    fontSize: theme.fontSize.lg,
-    fontWeight: '600',
-    color: theme.colors.text,
-    letterSpacing: -0.3,
-  },
-  headerSubtitle: {
-    fontSize: theme.fontSize.xs,
-    color: theme.colors.textSecondary,
-    marginTop: 1,
-  },
-  backButton: {
-    width: 44,
-    height: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  backIcon: {
-    fontSize: 32,
-    color: theme.colors.primary,
-    fontWeight: '300',
-  },
-  placeholder: {
-    width: 44,
-  },
+const makeStyles = (colors: ColorPalette) =>
+  ({
+    // Standard Header
+    header: {
+      backgroundColor: colors.background,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.divider,
+    },
+    headerElevated: {
+      ...themeStatic.shadow.md,
+      borderBottomWidth: 0,
+    },
+    headerContent: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      height: HEADER_CONTENT_HEIGHT,
+      paddingHorizontal: 4,
+    },
+    // ════════════════════════════════════════════════════════════════════════
+    // FLEX BALANCE — adapté i18n (préservé de v2.0)
+    // ════════════════════════════════════════════════════════════════════════
+    // 1 / 2 / 1.4 — le rightComponent obtient une zone plus généreuse
+    // sans sacrifier la lisibilité du titre.
+    headerLeft: {
+      flex: 1,
+      alignItems: 'flex-start',
+    },
+    headerCenter: {
+      flex: 2,
+      alignItems: 'center',
+      paddingHorizontal: 8,
+    },
+    headerCenterLeft: {
+      alignItems: 'flex-start',
+      paddingLeft: 8,
+    },
+    headerRight: {
+      flex: 1.4,
+      alignItems: 'flex-end',
+    },
+    headerTitle: {
+      fontSize: themeStatic.fontSize.lg,
+      fontWeight: '600',
+      color: colors.text,
+      letterSpacing: -0.3,
+    },
+    headerSubtitle: {
+      fontSize: themeStatic.fontSize.xs,
+      color: colors.textSecondary,
+      marginTop: 1,
+    },
+    backButton: {
+      width: 44,
+      height: 44,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    backIcon: {
+      fontSize: 32,
+      color: colors.primary,
+      fontWeight: '300',
+    },
+    placeholder: {
+      width: 44,
+    },
 
-  // Chat Header
-  chatHeader: {
-    backgroundColor: theme.colors.surface,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: theme.colors.divider,
-  },
-  chatHeaderContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    height: HEADER_CONTENT_HEIGHT,
-    paddingRight: 8,
-  },
-  chatBackButton: {
-    width: 44,
-    height: HEADER_CONTENT_HEIGHT,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  chatBackIcon: {
-    fontSize: 32,
-    color: theme.colors.primary,
-    fontWeight: '300',
-  },
-  chatHeaderTouchable: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  avatarContainer: {
-    position: 'relative',
-    marginRight: 12,
-  },
-  avatarPlaceholder: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: theme.colors.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 12,
-  },
-  avatarText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: theme.colors.textOnPrimary,
-    letterSpacing: 0.3,
-  },
-  onlineIndicator: {
-    position: 'absolute',
-    bottom: 0,
-    right: 0,
-    width: 11,
-    height: 11,
-    borderRadius: 5.5,
-    backgroundColor: theme.colors.online,
-    borderWidth: 2,
-    borderColor: theme.colors.surface,
-  },
-  chatHeaderInfo: {
-    flex: 1,
-    justifyContent: 'center',
-  },
-  chatHeaderTitle: {
-    fontSize: theme.fontSize.base,
-    fontWeight: '600',
-    color: theme.colors.text,
-    letterSpacing: -0.2,
-  },
-  chatHeaderTitleSolo: {
-    fontSize: theme.fontSize.lg,
-  },
-  chatHeaderSubtitle: {
-    fontSize: theme.fontSize.xs,
-    color: theme.colors.textSecondary,
-    marginTop: 1,
-  },
-  chatHeaderTyping: {
-    color: theme.colors.typing,
-  },
-  chatHeaderActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  menuButton: {
-    width: 44,
-    height: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  menuIcon: {
-    fontSize: 22,
-    color: theme.colors.text,
-  },
+    // Chat Header
+    chatHeader: {
+      backgroundColor: colors.surface,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.divider,
+    },
+    chatHeaderContent: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      height: HEADER_CONTENT_HEIGHT,
+      paddingRight: 8,
+    },
+    chatBackButton: {
+      width: 44,
+      height: HEADER_CONTENT_HEIGHT,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    chatBackIcon: {
+      fontSize: 32,
+      color: colors.primary,
+      fontWeight: '300',
+    },
+    chatHeaderTouchable: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+    },
+    avatarContainer: {
+      position: 'relative',
+      marginRight: 12,
+    },
+    avatarPlaceholder: {
+      width: 40,
+      height: 40,
+      borderRadius: 20,
+      backgroundColor: colors.primary,
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginRight: 12,
+    },
+    avatarText: {
+      fontSize: 14,
+      fontWeight: '600',
+      color: colors.textOnPrimary,
+      letterSpacing: 0.3,
+    },
+    onlineIndicator: {
+      position: 'absolute',
+      bottom: 0,
+      right: 0,
+      width: 11,
+      height: 11,
+      borderRadius: 5.5,
+      backgroundColor: colors.online,
+      borderWidth: 2,
+      borderColor: colors.surface,
+    },
+    chatHeaderInfo: {
+      flex: 1,
+      justifyContent: 'center',
+    },
+    chatHeaderTitle: {
+      fontSize: themeStatic.fontSize.base,
+      fontWeight: '600',
+      color: colors.text,
+      letterSpacing: -0.2,
+    },
+    chatHeaderTitleSolo: {
+      fontSize: themeStatic.fontSize.lg,
+    },
+    chatHeaderSubtitle: {
+      fontSize: themeStatic.fontSize.xs,
+      color: colors.textSecondary,
+      marginTop: 1,
+    },
+    chatHeaderTyping: {
+      color: colors.typing,
+    },
+    chatHeaderActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+    },
+    menuButton: {
+      width: 44,
+      height: 44,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    menuIcon: {
+      fontSize: 22,
+      color: colors.text,
+    },
 
-  // Selection Header
-  selectionHeader: {
-    backgroundColor: theme.colors.primary,
-  },
-  selectionContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    height: HEADER_CONTENT_HEIGHT,
-    paddingHorizontal: 4,
-  },
-  selectionClose: {
-    width: 48,
-    height: HEADER_CONTENT_HEIGHT,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  selectionCloseIcon: {
-    fontSize: 18,
-    color: theme.colors.textOnPrimary,
-    fontWeight: '600',
-  },
-  selectionCount: {
-    flex: 1,
-    fontSize: theme.fontSize.lg,
-    fontWeight: '600',
-    color: theme.colors.textOnPrimary,
-  },
-  selectionActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  selectionAction: {
-    width: 44,
-    height: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  selectionActionIcon: {
-    fontSize: 20,
-  },
+    // Selection Header
+    selectionHeader: {
+      backgroundColor: colors.primary,
+    },
+    selectionContent: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      height: HEADER_CONTENT_HEIGHT,
+      paddingHorizontal: 4,
+    },
+    selectionClose: {
+      width: 48,
+      height: HEADER_CONTENT_HEIGHT,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    selectionCloseIcon: {
+      fontSize: 18,
+      color: colors.textOnPrimary,
+      fontWeight: '600',
+    },
+    selectionCount: {
+      flex: 1,
+      fontSize: themeStatic.fontSize.lg,
+      fontWeight: '600',
+      color: colors.textOnPrimary,
+    },
+    selectionActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+    },
+    selectionAction: {
+      width: 44,
+      height: 44,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    selectionActionIcon: {
+      fontSize: 20,
+    },
 
-  // Large Header
-  largeHeader: {
-    paddingHorizontal: 20,
-    paddingBottom: 16,
-  },
-  largeHeaderContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  largeHeaderTitle: {
-    fontSize: theme.fontSize.display,
-    fontWeight: '700',
-    color: theme.colors.text,
-  },
-  largeHeaderRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-});
+    // Large Header
+    largeHeader: {
+      paddingHorizontal: 20,
+      paddingBottom: 16,
+    },
+    largeHeaderContent: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+    },
+    largeHeaderTitle: {
+      fontSize: themeStatic.fontSize.display,
+      fontWeight: '700',
+      color: colors.text,
+    },
+    largeHeaderRight: {
+      flexDirection: 'row',
+      alignItems: 'center',
+    },
+  } as const);
 
 export default Header;

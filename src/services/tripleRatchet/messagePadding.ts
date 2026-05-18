@@ -29,7 +29,7 @@
 // 1. Messages < 64KB: Buckets classiques (256B, 1KB, 4KB, 16KB, 64KB)
 // 2. Messages >= 64KB: Arrondi au multiple de 64KB supérieur
 
-import { getSecureRandomBytes, zeroize } from './primitives';
+import { getSecureRandomBytes } from './primitives';
 import { secureRandomInt } from '../crypto';
 
 // ============================================

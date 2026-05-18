@@ -2,18 +2,9 @@
 // Composants de boutons modernes et réutilisables
 
 import React from 'react';
-import {
-  TouchableOpacity,
-  Text,
-  StyleSheet,
-  ActivityIndicator,
-  View,
-  Animated,
-  Pressable,
-  ViewStyle,
-  TextStyle,
-} from 'react-native';
+import { TouchableOpacity, Text, StyleSheet, ActivityIndicator, View, Animated, ViewStyle, TextStyle } from 'react-native';
 import { theme } from './theme';
+import { useTheme } from './ThemeContext';
 
 // ============================================
 // TYPES
@@ -72,6 +63,7 @@ export const Button: React.FC<ButtonProps> = ({
   style,
   textStyle,
 }) => {
+  const { colors } = useTheme();
   const scaleAnim = React.useRef(new Animated.Value(1)).current;
 
   const handlePressIn = () => {
@@ -97,21 +89,21 @@ export const Button: React.FC<ButtonProps> = ({
       case 'primary':
         return {
           container: {
-            backgroundColor: theme.colors.primary,
+            backgroundColor: colors.primary,
           },
           text: {
-            color: theme.colors.textOnPrimary,
+            color: colors.textOnPrimary,
           },
         };
       case 'secondary':
         return {
           container: {
-            backgroundColor: theme.colors.surface,
+            backgroundColor: colors.surface,
             borderWidth: 1.5,
-            borderColor: theme.colors.border,
+            borderColor: colors.border,
           },
           text: {
-            color: theme.colors.text,
+            color: colors.text,
           },
         };
       case 'ghost':
@@ -120,25 +112,25 @@ export const Button: React.FC<ButtonProps> = ({
             backgroundColor: 'transparent',
           },
           text: {
-            color: theme.colors.primary,
+            color: colors.primary,
           },
         };
       case 'danger':
         return {
           container: {
-            backgroundColor: theme.colors.danger,
+            backgroundColor: colors.danger,
           },
           text: {
-            color: theme.colors.textOnPrimary,
+            color: colors.textOnPrimary,
           },
         };
       case 'success':
         return {
           container: {
-            backgroundColor: theme.colors.success,
+            backgroundColor: colors.success,
           },
           text: {
-            color: theme.colors.textOnPrimary,
+            color: colors.textOnPrimary,
           },
         };
       default:
@@ -225,6 +217,19 @@ export const Button: React.FC<ButtonProps> = ({
                 disabled && styles.textDisabled,
                 textStyle,
               ]}
+              // ════════════════════════════════════════════════════════════
+              // PROTECTION I18N — texte des boutons
+              // ════════════════════════════════════════════════════════════
+              // numberOfLines=1 : empêche le wrap (qui briserait la hauteur
+              //   fixée du bouton — small=36 / medium=48 / large=56).
+              // adjustsFontSizeToFit + minimumFontScale=0.82 : si la chaîne
+              //   traduite ne tient pas (DE/RU/FR souvent +50% vs EN), RN
+              //   réduit la taille de police jusqu'à 82% avant de tronquer.
+              //   C'est plus lisible qu'une ellipse "Conti…" ou "Запи…".
+              // ════════════════════════════════════════════════════════════
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.82}
             >
               {title}
             </Text>
@@ -304,11 +309,16 @@ export const IconButton: React.FC<IconButtonProps> = ({
 export const FAB: React.FC<FABProps> = ({
   icon,
   onPress,
-  color = theme.colors.textOnPrimary,
-  backgroundColor = theme.colors.primary,
+  color,
+  backgroundColor,
   size = 'medium',
   style,
 }) => {
+  const { colors } = useTheme();
+  // Default colour values intentionally resolved at render time via the
+  // theme context — using `theme.colors.X` as default parameters would
+  // freeze the values to the boot palette and miss live theme changes.
+  const resolvedBg = backgroundColor ?? colors.primary;
   const scaleAnim = React.useRef(new Animated.Value(1)).current;
 
   const getSizeValue = () => {
@@ -348,7 +358,7 @@ export const FAB: React.FC<FABProps> = ({
           width: fabSize,
           height: fabSize,
           borderRadius: fabSize / 2,
-          backgroundColor,
+          backgroundColor: resolvedBg,
         },
         theme.shadow.lg,
         style,
@@ -389,10 +399,12 @@ interface LinkButtonProps {
 export const LinkButton: React.FC<LinkButtonProps> = ({
   title,
   onPress,
-  color = theme.colors.primary,
+  color,
   size = 'medium',
   disabled = false,
 }) => {
+  const { colors } = useTheme();
+  const resolvedColor = color ?? colors.primary;
   const getFontSize = () => {
     switch (size) {
       case 'small': return theme.fontSize.sm;
@@ -412,10 +424,13 @@ export const LinkButton: React.FC<LinkButtonProps> = ({
         style={[
           styles.linkButtonText,
           {
-            color: disabled ? theme.colors.textMuted : color,
+            color: disabled ? colors.textMuted : resolvedColor,
             fontSize: getFontSize(),
           },
         ]}
+        numberOfLines={1}
+        adjustsFontSizeToFit
+        minimumFontScale={0.85}
       >
         {title}
       </Text>
@@ -438,10 +453,13 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
+    flexShrink: 1,        // permet au contenu de se réduire
+    minWidth: 0,          // évite le bug Android où flex:1 ignore l'overflow
   },
   buttonText: {
     fontWeight: '600',
     textAlign: 'center',
+    flexShrink: 1,        // requis pour que adjustsFontSizeToFit s'active
   },
   buttonDisabled: {
     opacity: 0.5,

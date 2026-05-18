@@ -22,43 +22,16 @@
 import { encodeBase64 } from 'tweetnacl-util';
 import { AppState } from 'react-native';
 import { getRandomBytes, generateRoomAuthToken } from './crypto';
-import {
-  connectToSfu,
-  disconnectFromSfu,
-  sendAudio,
-  setWebRTCCallbacks,
-  hashSenderToken,
-  clearNotifiedPeers,
-} from './webrtcService';
-import {
-  callCryptoService,
-  initializeCallCrypto,
-  encryptCallAudio,
-  decryptCallAudio,
-  handleCallCryptoSignal,
-  setCallCryptoSignalCallback,
-  setCallCryptoOnDecryptedAudio,
-  cleanupCallCrypto,
-  isCallCryptoInitialized,
-  CallCryptoSignal,
-} from './callCryptoService';
-import {
-  initializeAudio,
-  addAudioToBuffer,
-  setMuted as setAudioMuted,
-  setSpeaker as setAudioSpeaker,
-  cleanupAudio,
-  startProximityRouteEnforcer,
-  startCallAudioPipeline,
-  checkAudioHealth,
-  resetAudioHealth,
-  restartCallAudioPipeline,
-} from './audioService';
-import { sendCallEndedMessage1to1, forceFetchAndNotify1to1, getLocalMessages1to1 } from './api1to1';
+import i18n from '../i18n';
+import { connectToSfu, disconnectFromSfu, sendAudio, setWebRTCCallbacks, hashSenderToken, clearNotifiedPeers } from './webrtcService';
+import { initializeCallCrypto, encryptCallAudio, decryptCallAudio, handleCallCryptoSignal, setCallCryptoSignalCallback, setCallCryptoOnDecryptedAudio, cleanupCallCrypto, isCallCryptoInitialized, CallCryptoSignal } from './callCryptoService';
+import { initializeAudio, addAudioToBuffer, setMuted as setAudioMuted, setSpeaker as setAudioSpeaker, cleanupAudio, startProximityRouteEnforcer, startCallAudioPipeline, checkAudioHealth, resetAudioHealth, restartCallAudioPipeline } from './audioService';
+import { sendCallEndedMessage1to1, forceFetchAndNotify1to1, getLocalMessages1to1, clearEndedCallTracking } from './api1to1';
 import { forceImmediatePoll } from './constantTraffic';
 import { sessionService } from './tripleRatchet';  // v7.0: Pour récupérer l'avatar du contact
 import { startRingback, startRingtone, playConnectedBeep, playBusyTone, playEndCallBeep, stopTone, transitionToCallAudio, setCallTonePlayFn, getConnectingBeepPCM } from './callTones';
 import { stopRinging, showMissedCallNotification } from './pushNotificationService';
+import { ensureMicrophonePermission } from './permissions';
 
 // ============================================
 // TYPES
@@ -501,10 +474,43 @@ class Call1to1Manager {
     // v22.1: Synchronous guard BEFORE any await — blocks the second tap immediately
     if (this.startCallInProgress) {
       __DEV__ && console.log('[Call1to1] ❌ startCall already in progress (debounce)');
-      return { success: false, error: 'Appel en cours de démarrage' };
+      return { success: false, error: i18n.t('call.errors.starting') };
     }
     this.startCallInProgress = true;
     
+    // ─── PERMISSION FIX : vérifier le micro AVANT toute allocation ──────
+    // On le fait IMMÉDIATEMENT après le debounce guard, AVANT :
+    //   - le cleanup attendant le précédent appel
+    //   - la génération du callId / roomTag / authToken
+    //   - l'initialisation crypto (initializeCallCrypto)
+    //   - la connexion au SFU
+    //   - la sonnerie côté appelant (ringback)
+    //
+    // Si on demandait la permission au milieu (ex: dans startCallAudioPipeline),
+    // l'utilisateur verrait : sonnerie qui démarre, écran d'appel affiché, PUIS
+    // dialog permission. S'il refuse, il faudrait défaire toute la signalisation
+    // déjà partie au peer → appel "fantôme" côté Bob.
+    //
+    // Ici, en cas de refus, on retourne avant tout side-effect réseau/audio.
+    // Le service `permissions` affiche déjà le bon Alert (refus simple OU
+    // bouton "Ouvrir les paramètres" si bloqué). Pas besoin d'en ajouter.
+    try {
+      const micPerm = await ensureMicrophonePermission();
+      if (micPerm.status !== 'granted') {
+        __DEV__ && console.log('[Call1to1] ❌ Microphone permission not granted, aborting call');
+        this.startCallInProgress = false;
+        // L'utilisateur a vu le dialog (refus ou bloqué+settings). On retourne
+        // un succès "métier" (pas une erreur affichée) : le caller (CallButton1to1)
+        // ne doit PAS afficher son propre Alert.alert d'erreur générique
+        // par-dessus. C'est exactement comme un raccrochage volontaire.
+        return { success: true };
+      }
+    } catch (e) {
+      // Si la vérification elle-même échoue (très rare, ex: bug Expo), on
+      // continue : le natif pourra prompt lui-même au démarrage du micro.
+      __DEV__ && console.warn('[Call1to1] Permission check failed, continuing:', e);
+    }
+
     // FIX: Attendre que le cleanup du précédent appel soit terminé
     if (this.cleanupPromise) {
       __DEV__ && console.log('[Call1to1] ⏳ Waiting for previous call cleanup...');
@@ -529,12 +535,12 @@ class Call1to1Manager {
     
     if (this.isInCall()) {
       __DEV__ && console.log('[Call1to1] ❌ Already in a call');
-      return { success: false, error: 'Déjà en appel' };
+      return { success: false, error: i18n.t('call.errors.alreadyInCall') };
     }
 
     if (!SFU_URL) {
       __DEV__ && console.log('[Call1to1] ❌ SFU URL not configured');
-      return { success: false, error: 'SFU non configuré' };
+      return { success: false, error: i18n.t('call.errors.sfuNotConfigured') };
     }
 
     try {
@@ -543,6 +549,11 @@ class Call1to1Manager {
       // l'observe dans les signaux ou logs.
       const callIdBytes = getRandomBytes(20);
       const callId = `call1to1_${encodeBase64(callIdBytes).replace(/[+/=]/g, '').slice(0, 27)}`;
+
+      // FIX P4: Sécurité défensive — s'assurer qu'aucun marquage "ended" résiduel
+      // ne bloque ce nouveau callId. La collision sur 160 bits est astronomiquement
+      // improbable (~1 chance sur 10^48), mais le coût de cette ligne est nul.
+      clearEndedCallTracking(callId);
       
       // Générer roomTag et authToken
       // Le roomTag doit être 32 caractères hexadécimaux pour matcher le pattern du relay
@@ -588,7 +599,7 @@ class Call1to1Manager {
       if (!cryptoResult.success) {
         __DEV__ && console.log('[Call1to1] ❌ Failed to initialize call crypto:', cryptoResult.error);
         await this.cleanup();
-        return { success: false, error: cryptoResult.error || 'Erreur de chiffrement' };
+        return { success: false, error: cryptoResult.error || i18n.t('call.errors.encryption') };
       }
       this.cryptoReady = true;
       // v7.2 FIX #1: Connecter le callback pour les paquets flushed
@@ -668,7 +679,7 @@ class Call1to1Manager {
       if (!connected) {
         __DEV__ && console.log('[Call1to1] ❌ Failed to connect to SFU');
         await this.cleanup();
-        return { success: false, error: 'Impossible de se connecter au serveur' };
+        return { success: false, error: i18n.t('call.errors.serverConnect') };
       }
 
       __DEV__ && console.log('[Call1to1] ✅ Connected to SFU (double-hop)');
@@ -1052,11 +1063,41 @@ class Call1to1Manager {
     this.firstRemoteAudioReceived = false;
 
     if (!this.currentCall || this.currentCall.state !== 'incoming') {
-      return { success: false, error: 'Pas d\'appel entrant' };
+      return { success: false, error: i18n.t('call.errors.noIncoming') };
     }
 
     if (!this.pendingOffer) {
       return { success: false, error: 'Offre manquante' };
+    }
+
+    // ─── PERMISSION FIX : vérifier le micro AVANT d'accepter l'appel ────
+    // Différent du startCall : ici la signalisation côté Bob est déjà
+    // partie (le caller a envoyé l'offer, Bob a sa sonnerie + écran d'appel).
+    // Si Bob refuse le micro :
+    //   1. on ne doit PAS lancer la crypto/connexion SFU (pipeline muet)
+    //   2. on doit DÉCLINER proprement pour que le caller voit "Refusé"
+    //      au lieu d'attendre indéfiniment ou de voir un appel silencieux
+    //   3. on ne doit PAS empiler des ressources inutiles (timeout, etc.)
+    //
+    // Le service `permissions` affiche déjà l'Alert (refus simple OU
+    // bouton "Ouvrir les paramètres" si bloqué). On utilise ensuite
+    // declineCall() qui fait toute la fermeture propre + signale le caller.
+    try {
+      const micPerm = await ensureMicrophonePermission();
+      if (micPerm.status !== 'granted') {
+        __DEV__ && console.log('[Call1to1] ❌ Microphone permission refused on accept, declining call');
+        // declineCall() s'occupe de :
+        //   - stopTone() implicite via endCall()
+        //   - notifier l'UI (état → ended)
+        //   - envoyer le signal 'decline' au caller
+        //   - cleanup complet
+        await this.declineCall();
+        // Pas une "erreur métier" : c'est un decline volontaire (l'utilisateur
+        // a vu le dialog perm, a refusé, donc équivalent à "raccrocher").
+        return { success: true };
+      }
+    } catch (e) {
+      __DEV__ && console.warn('[Call1to1] Permission check failed on accept, continuing:', e);
     }
 
     try {
@@ -1100,7 +1141,7 @@ class Call1to1Manager {
         __DEV__ && console.log('[Call1to1] ❌ Failed to initialize call crypto:', cryptoResult.error);
         this.resetPreWarm();
         await this.cleanup();
-        return { success: false, error: cryptoResult.error || 'Erreur de chiffrement' };
+        return { success: false, error: cryptoResult.error || i18n.t('call.errors.encryption') };
       }
       this.cryptoReady = true;
       // v7.2 FIX #1: Connecter le callback pour les paquets flushed
@@ -1158,7 +1199,7 @@ class Call1to1Manager {
       if (!connected) {
         __DEV__ && console.log('[Call1to1] ❌ Failed to connect to SFU');
         await this.cleanup();
-        return { success: false, error: 'Impossible de se connecter au serveur' };
+        return { success: false, error: i18n.t('call.errors.serverConnect') };
       }
 
       __DEV__ && console.log('[Call1to1] ✅ Connected to SFU (double-hop)');
@@ -1228,7 +1269,7 @@ class Call1to1Manager {
       if (!pipelineOk) {
         __DEV__ && console.error('[Call1to1] ❌ Audio pipeline failed');
         await this.cleanup();
-        return { success: false, error: 'Erreur audio' };
+        return { success: false, error: i18n.t('call.errors.audio') };
       }
       __DEV__ && console.log('[Call1to1] ✅ Audio pipeline started (callee)');
 
@@ -1277,7 +1318,7 @@ class Call1to1Manager {
     __DEV__ && console.log('[Call1to1] ❌ Declining call...');
 
     if (!this.currentCall || this.currentCall.state !== 'incoming') {
-      return { success: false, error: 'Pas d\'appel entrant' };
+      return { success: false, error: i18n.t('call.errors.noIncoming') };
     }
 
     try {
@@ -1312,7 +1353,7 @@ class Call1to1Manager {
     __DEV__ && console.log('[Call1to1] 📴 Hanging up...');
 
     if (!this.currentCall) {
-      return { success: false, error: 'Pas d\'appel en cours' };
+      return { success: false, error: i18n.t('call.errors.noActive') };
     }
 
     try {

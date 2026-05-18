@@ -80,3 +80,50 @@ export async function deleteHardwareKeys(): Promise<void> {
   await SecureStore.deleteItemAsync(HARDWARE_CONV_KEY_STORE);
   __DEV__ && console.log('[HardwareKey] 🗑️ Hardware keys deleted');
 }
+
+/**
+ * Verifies that BOTH hardware keys are actually persisted in SecureStore
+ * with the expected format (32-byte base64).
+ *
+ * RATIONALE — bug de migration (mai 2026)
+ *
+ * `getOrCreateHardwareKey` calls `SecureStore.setItemAsync` and returns the
+ * generated key. On some devices (older Android keystore, emulators with
+ * partial Keychain implementations) the write can return successfully without
+ * actually persisting. The in-RAM key is fine for the current session, but
+ * at the next cold boot SecureStore returns null and a fresh key is generated
+ * — orphaning every piece of data encrypted with the previous one.
+ *
+ * This function does a readback check immediately after init to detect that
+ * failure mode synchronously. Callers should fail closed if it returns false.
+ *
+ * @returns true if both keys are present and 32 bytes; false otherwise.
+ */
+export async function verifyHardwareKeysPersisted(): Promise<boolean> {
+  try {
+    const enc = await SecureStore.getItemAsync(HARDWARE_KEY_STORE, SECURE_STORE_OPTIONS);
+    if (!enc) {
+      __DEV__ && console.error('[HardwareKey] ❌ Verification failed: HARDWARE_KEY_STORE missing');
+      return false;
+    }
+    if (decodeBase64(enc).length !== 32) {
+      __DEV__ && console.error('[HardwareKey] ❌ Verification failed: HARDWARE_KEY_STORE wrong length');
+      return false;
+    }
+
+    const conv = await SecureStore.getItemAsync(HARDWARE_CONV_KEY_STORE, SECURE_STORE_OPTIONS);
+    if (!conv) {
+      __DEV__ && console.error('[HardwareKey] ❌ Verification failed: HARDWARE_CONV_KEY_STORE missing');
+      return false;
+    }
+    if (decodeBase64(conv).length !== 32) {
+      __DEV__ && console.error('[HardwareKey] ❌ Verification failed: HARDWARE_CONV_KEY_STORE wrong length');
+      return false;
+    }
+
+    return true;
+  } catch (e) {
+    __DEV__ && console.error('[HardwareKey] ❌ Verification threw:', e);
+    return false;
+  }
+}

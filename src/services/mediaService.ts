@@ -8,10 +8,13 @@ import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
-import { supabase, supabaseStorage } from './api';
-import { getRandomBytes, encryptE2E, decryptE2E } from './crypto';
+import { supabaseStorage } from './api';
+import { getRandomBytes } from './crypto';
 // P0-A2: legacyMediaProxy supprimé — tous les downloads via OHTTP relay
 import { fetchMediaViaRelay } from './encryptedBlobService';
+import { suppressLock, releaseLock } from './lockGuard';
+import { ensureCameraPermission, ensureMediaLibraryPermission } from './permissions';
+import i18n from '../i18n';
 
 // ============================================
 // CONFIGURATION
@@ -136,49 +139,65 @@ export interface UploadedFile {
  * Demande les permissions et ouvre le picker d'images
  */
 export async function pickImage(): Promise<string | null> {
-  // Demander permission
-  const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-  if (status !== 'granted') {
-    throw new Error('Permission d\'accès à la galerie refusée');
+  // PERM FIX : le service permissions gère suppressLock/releaseLock pendant
+  // le dialog OS et affiche l'Alert "denied" ou "blocked + Settings" si
+  // besoin. On garde suppressLock UNIQUEMENT pour le launchImageLibraryAsync
+  // qui suit (le picker système met aussi l'app en background).
+  const perm = await ensureMediaLibraryPermission();
+  if (perm.status !== 'granted') {
+    // Avant on throw une Error — on garde ce comportement pour ne pas
+    // casser les callers existants qui attendent un throw. Mais le message
+    // est moins critique : le service a déjà affiché un Alert localisé.
+    throw new Error(i18n.t('errors.permissionGalleryDenied'));
   }
 
-  // Ouvrir le picker
-  const result = await ImagePicker.launchImageLibraryAsync({
-    mediaTypes: ['images'], // SDK 54 syntax
-    allowsEditing: false,
-    quality: 1,
-    exif: false,  // Ne pas inclure les métadonnées EXIF
-  });
+  suppressLock();
+  try {
+    // Ouvrir le picker
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'], // SDK 54 syntax
+      allowsEditing: false,
+      quality: 1,
+      exif: false,  // Ne pas inclure les métadonnées EXIF
+    });
 
-  if (result.canceled || !result.assets || result.assets.length === 0) {
-    return null;
+    if (result.canceled || !result.assets || result.assets.length === 0) {
+      return null;
+    }
+
+    return result.assets[0].uri;
+  } finally {
+    releaseLock();
   }
-
-  return result.assets[0].uri;
 }
 
 /**
  * Ouvre la caméra pour prendre une photo
  */
 export async function takePhoto(): Promise<string | null> {
-  // Demander permission
-  const { status } = await ImagePicker.requestCameraPermissionsAsync();
-  if (status !== 'granted') {
-    throw new Error('Permission d\'accès à la caméra refusée');
+  // PERM FIX : voir pickImage.
+  const perm = await ensureCameraPermission();
+  if (perm.status !== 'granted') {
+    throw new Error(i18n.t('errors.permissionCameraDenied'));
   }
 
-  // Ouvrir la caméra
-  const result = await ImagePicker.launchCameraAsync({
-    allowsEditing: false,
-    quality: 1,
-    exif: false,  // Ne pas inclure les métadonnées EXIF
-  });
+  suppressLock();
+  try {
+    // Ouvrir la caméra
+    const result = await ImagePicker.launchCameraAsync({
+      allowsEditing: false,
+      quality: 1,
+      exif: false,  // Ne pas inclure les métadonnées EXIF
+    });
 
-  if (result.canceled || !result.assets || result.assets.length === 0) {
-    return null;
+    if (result.canceled || !result.assets || result.assets.length === 0) {
+      return null;
+    }
+
+    return result.assets[0].uri;
+  } finally {
+    releaseLock();
   }
-
-  return result.assets[0].uri;
 }
 
 // ============================================
@@ -190,6 +209,7 @@ export async function takePhoto(): Promise<string | null> {
  * @returns Informations sur le fichier sélectionné ou null si annulé
  */
 export async function pickFile(): Promise<PickedFile | null> {
+  suppressLock();
   try {
     const result = await DocumentPicker.getDocumentAsync({
       type: '*/*',  // Tous types de fichiers
@@ -224,7 +244,9 @@ export async function pickFile(): Promise<PickedFile | null> {
     };
   } catch (error) {
     __DEV__ && console.error('Erreur sélection fichier:', error);
-    throw new Error('Impossible de sélectionner le fichier');
+    throw new Error(i18n.t('errors.fileSelectFailed'));
+  } finally {
+    releaseLock();
   }
 }
 
@@ -312,17 +334,6 @@ export async function processImage(uri: string): Promise<ProcessedImage> {
  * Obtient les informations d'une image
  */
 async function getImageInfo(uri: string): Promise<{ width: number; height: number }> {
-  // Utiliser ImageManipulator pour obtenir les dimensions
-  const manipulated = await ImageManipulator.manipulateAsync(
-    uri,
-    [],
-    { format: ImageManipulator.SaveFormat.JPEG }
-  );
-  
-  // Obtenir les dimensions via une manipulation nulle
-  // Note: expo-image-manipulator ne retourne pas directement les dimensions
-  // On doit utiliser une autre méthode
-  
   return new Promise((resolve, reject) => {
     const Image = require('react-native').Image;
     Image.getSize(
@@ -384,7 +395,7 @@ export async function encryptImage(uri: string): Promise<EncryptedImageData> {
   const encrypted = nacl.secretbox(imageData, nonce, fileKey);
 
   if (!encrypted) {
-    throw new Error('Échec du chiffrement de l\'image');
+    throw new Error(i18n.t('errors.imageEncryptionFailed'));
   }
 
   return {
@@ -405,7 +416,7 @@ export function decryptImage(
   const decrypted = nacl.secretbox.open(encryptedData, nonce, fileKey);
 
   if (!decrypted) {
-    throw new Error('Échec du déchiffrement de l\'image');
+    throw new Error(i18n.t('errors.imageDecryptionFailed'));
   }
 
   return decrypted;
@@ -435,7 +446,7 @@ export async function encryptFile(uri: string): Promise<EncryptedFileData> {
   const encrypted = nacl.secretbox(fileData, nonce, fileKey);
 
   if (!encrypted) {
-    throw new Error('Échec du chiffrement du fichier');
+    throw new Error(i18n.t('errors.fileEncryptionFailed'));
   }
 
   return {
@@ -456,7 +467,7 @@ export function decryptFile(
   const decrypted = nacl.secretbox.open(encryptedData, nonce, fileKey);
 
   if (!decrypted) {
-    throw new Error('Échec du déchiffrement du fichier');
+    throw new Error(i18n.t('errors.fileDecryptionFailed'));
   }
 
   return decrypted;
@@ -501,7 +512,7 @@ export async function uploadEncryptedImage(
   const thumbEncrypted = nacl.secretbox(thumbData, thumbNonce, fullEncrypted.fileKey);
 
   if (!thumbEncrypted) {
-    throw new Error('Échec du chiffrement de la miniature');
+    throw new Error(i18n.t('errors.thumbnailEncryptionFailed'));
   }
 
   // Paths dans le storage (anonymisés avec le tag)
@@ -518,7 +529,7 @@ export async function uploadEncryptedImage(
     });
 
   if (fullError) {
-    throw new Error(`Échec upload image: ${fullError.message}`);
+    throw new Error(i18n.t('errors.imageUploadFailed', { message: fullError.message }));
   }
 
   // Upload de la miniature
@@ -533,7 +544,7 @@ export async function uploadEncryptedImage(
   if (thumbError) {
     // Nettoyer l'image principale si la miniature échoue
     await supabaseStorage.storage.from(STORAGE_BUCKET).remove([fullPath]);
-    throw new Error(`Échec upload miniature: ${thumbError.message}`);
+    throw new Error(i18n.t('errors.thumbnailUploadFailed', { message: thumbError.message }));
   }
 
   // Obtenir les URLs publiques (le contenu reste chiffré)
@@ -608,7 +619,7 @@ export function encryptFileKey(fileKey: Uint8Array, e2eKey: Uint8Array): string 
   const encrypted = nacl.secretbox(fileKey, nonce, e2eKey);
   
   if (!encrypted) {
-    throw new Error('Échec chiffrement clé fichier');
+    throw new Error(i18n.t('errors.fileKeyEncryptionFailed'));
   }
 
   // Format: nonce + encrypted (tout en base64)
@@ -630,7 +641,7 @@ export function decryptFileKey(encryptedKey: string, e2eKey: Uint8Array): Uint8A
   const decrypted = nacl.secretbox.open(encrypted, nonce, e2eKey);
 
   if (!decrypted) {
-    throw new Error('Échec déchiffrement clé fichier');
+    throw new Error(i18n.t('errors.fileKeyDecryptionFailed'));
   }
 
   return decrypted;
@@ -791,12 +802,12 @@ export async function validateFileSize(input: string | number): Promise<{ valid:
     try {
       const fileInfo = await FileSystem.getInfoAsync(input);
       if (!fileInfo.exists) {
-        return { valid: false, error: 'Fichier introuvable' };
+        return { valid: false, error: i18n.t('errors.fileNotFound') };
       }
       sizeBytes = (fileInfo as any).size || 0;
     } catch (e) {
       __DEV__ && console.error('Erreur lecture taille fichier:', e);
-      return { valid: false, error: 'Impossible de lire le fichier' };
+      return { valid: false, error: i18n.t('errors.fileNotReadable') };
     }
   } else {
     // C'est directement la taille en bytes
@@ -806,7 +817,10 @@ export async function validateFileSize(input: string | number): Promise<{ valid:
   if (sizeBytes > MAX_FILE_SIZE_BYTES) {
     return {
       valid: false,
-      error: `Le fichier fait ${(sizeBytes / (1024 * 1024)).toFixed(1)} MB. La limite est de ${MAX_FILE_SIZE_MB} MB.`,
+      error: i18n.t('errors.fileSizeLimit', {
+        size: (sizeBytes / (1024 * 1024)).toFixed(1),
+        max: MAX_FILE_SIZE_MB,
+      }),
     };
   }
   return { valid: true };
@@ -888,7 +902,7 @@ export async function uploadEncryptedFile(
     });
 
   if (error) {
-    throw new Error(`Échec upload fichier: ${error.message}`);
+    throw new Error(i18n.t('errors.fileUploadFailed', { message: error.message }));
   }
 
   // Obtenir l'URL publique

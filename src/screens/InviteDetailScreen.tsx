@@ -2,21 +2,11 @@
 // Écran dédié pour le détail d'une invitation en attente
 // Accessible depuis la liste des conversations (tap sur une invitation)
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  Alert,
-  ScrollView,
-  Share,
-  Platform,
-  Animated,
-  Easing,
-} from 'react-native';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { View, Text, TouchableOpacity, Alert, ScrollView, Share, Platform, Animated, Easing } from 'react-native';
 import { useNavigation, useRoute, useFocusEffect } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useTranslation } from 'react-i18next';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RouteProp } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
@@ -27,7 +17,9 @@ import { pendingInviteStore, PendingInvite } from '../services/pendingInvites';
 import { inviteWatcher } from '../services/inviteWatcher';
 import { sessionService } from '../services/tripleRatchet';
 import { suppressNotification } from '../components/InAppNotification';
-import { theme } from '../components/ui';
+import { withExternalActivity } from '../services/lockGuard';
+import { buildInviteUrl } from '../services/inviteUrl';
+import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 
 type RootStackParamList = {
   ConversationList: undefined;
@@ -43,6 +35,9 @@ export function InviteDetailScreen() {
   const navigation = useNavigation<NavigationProp>();
   const route = useRoute<DetailRouteProp>();
   const insets = useSafeAreaInsets();
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
   const { tag } = route.params;
 
   const [invite, setInvite] = useState<PendingInvite | null>(null);
@@ -73,7 +68,7 @@ export function InviteDetailScreen() {
     
     const unsub = inviteWatcher.onAccepted((session, acceptedInvite) => {
       if (acceptedInvite.tag === tag) {
-        const contactName = session.theirProfile.displayName || 'Contact';
+        const contactName = session.theirProfile.displayName || t('common.contact');
         navigation.replace('ConnectionSuccess', {
           sessionId: session.id,
           contactName,
@@ -106,27 +101,33 @@ export function InviteDetailScreen() {
   const handleShare = async () => {
     if (!invite) return;
     try {
-      await Share.share({
-        message: `Rejoins ma conversation sécurisée Ghostr !\n\n${invite.inviteString}`,
-      });
+      // Voir InviteModal.handleShare pour la justification de withExternalActivity
+      const inviteUrl = buildInviteUrl(invite.inviteString);
+      await withExternalActivity(() =>
+        Share.share({
+          message: t('inviteDetail.shareMessage', { code: inviteUrl }),
+        })
+      );
     } catch { /* cancelled */ }
   };
 
   const handleCopy = async () => {
     if (!invite) return;
-    await Clipboard.setStringAsync(invite.inviteString);
-    Alert.alert('Copié', 'Code d\'invitation copié dans le presse-papier.');
+    // On copie l'URL complète : si le destinataire a l'app, le lien
+    // l'ouvre directement ; sinon, il est redirigé vers le store.
+    await Clipboard.setStringAsync(buildInviteUrl(invite.inviteString));
+    Alert.alert(t('inviteDetail.copied'), t('inviteDetail.copiedMessage'));
   };
 
   const handleDelete = () => {
     if (!invite) return;
     Alert.alert(
-      'Supprimer l\'invitation ?',
-      'Si quelqu\'un scanne ce QR code après, la connexion échouera.',
+      t('inviteDetail.deleteTitle'),
+      t('inviteDetail.deleteMessage'),
       [
-        { text: 'Annuler', style: 'cancel' },
+        { text: t('common.cancel'), style: 'cancel' },
         {
-          text: 'Supprimer',
+          text: t('common.delete'),
           style: 'destructive',
           onPress: async () => {
             // [Bug #1] Libérer l'OTPK réservée avant suppression
@@ -145,18 +146,18 @@ export function InviteDetailScreen() {
   const formatTimeAgo = (ts: number): string => {
     const diff = Date.now() - ts;
     const min = Math.floor(diff / 60000);
-    if (min < 1) return 'À l\'instant';
-    if (min < 60) return `il y a ${min} min`;
+    if (min < 1) return t('inviteDetail.justNow');
+    if (min < 60) return t('inviteDetail.minutesAgo', { count: min });
     const h = Math.floor(min / 60);
-    if (h < 24) return `il y a ${h}h`;
+    if (h < 24) return t('inviteDetail.hoursAgo', { count: h });
     const d = Math.floor(h / 24);
-    return `il y a ${d}j`;
+    return t('inviteDetail.daysAgo', { count: d });
   };
 
   const formatExpiry = (expiresAt: number): string => {
     const days = Math.max(0, Math.floor((expiresAt - Date.now()) / 86400000));
-    if (days === 0) return 'Expire bientôt';
-    return `Expire dans ${days} jour${days > 1 ? 's' : ''}`;
+    if (days === 0) return t('inviteDetail.expiringSoon');
+    return t('inviteDetail.expiresInDays', { count: days });
   };
 
   if (!invite) return null;
@@ -170,11 +171,11 @@ export function InviteDetailScreen() {
           onPress={() => navigation.goBack()}
           activeOpacity={0.7}
         >
-          <Ionicons name="chevron-back" size={20} color={theme.colors.text} />
+          <Ionicons name="chevron-back" size={20} color={colors.text} />
         </TouchableOpacity>
         <Text style={styles.headerTitle} numberOfLines={1}>{invite.label}</Text>
         <TouchableOpacity onPress={handleDelete} activeOpacity={0.7}>
-          <Text style={styles.deleteText}>Supprimer</Text>
+          <Text style={styles.deleteText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.85}>{t('common.delete')}</Text>
         </TouchableOpacity>
       </View>
       <View style={styles.divider} />
@@ -188,7 +189,7 @@ export function InviteDetailScreen() {
         <View style={styles.qrSection}>
           <View style={styles.qrCard}>
             <QRCode
-              value={invite.inviteString}
+              value={buildInviteUrl(invite.inviteString)}
               size={180}
               backgroundColor="#FFFFFF"
               color="#0A0F14"
@@ -204,34 +205,41 @@ export function InviteDetailScreen() {
               <Animated.View style={[styles.pulseDotRing, { transform: [{ scale: pulseAnim }], opacity: pulseAnim.interpolate({ inputRange: [1, 1.6], outputRange: [0.6, 0] }) }]} />
               <View style={styles.pulseDotInner} />
             </View>
-            <Text style={styles.statusText}>En attente…</Text>
+            <Text style={styles.statusText}>{t('inviteDetail.pending')}</Text>
           </View>
           <Text style={styles.statusSub}>
-            Créée {formatTimeAgo(invite.createdAt)} · {formatExpiry(invite.expiresAt)}
+            {t('inviteDetail.createdAt', { ago: formatTimeAgo(invite.createdAt), expires: formatExpiry(invite.expiresAt) })}
           </Text>
         </View>
 
         {/* Actions */}
         <View style={styles.actionsRow}>
           <TouchableOpacity style={styles.shareBtn} onPress={handleShare} activeOpacity={0.8}>
-            <Ionicons name="share-outline" size={18} color={theme.colors.textOnPrimary} />
-            <Text style={styles.shareBtnText}>Partager</Text>
+            <Ionicons name="share-outline" size={18} color={colors.textOnPrimary} />
+            <Text
+              style={styles.shareBtnText}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.82}
+            >
+              {t('inviteDetail.shareTitle')}
+            </Text>
           </TouchableOpacity>
           <TouchableOpacity style={styles.copyBtn} onPress={handleCopy} activeOpacity={0.7}>
-            <Ionicons name="copy-outline" size={18} color={theme.colors.textSecondary} />
+            <Ionicons name="copy-outline" size={18} color={colors.textSecondary} />
           </TouchableOpacity>
         </View>
 
         {/* Security card */}
         <View style={styles.securityCard}>
-          <Text style={styles.securityTitle}>Sécurité</Text>
+          <Text style={styles.securityTitle}>{t('inviteDetail.securityTitle')}</Text>
           {[
-            { icon: 'key-outline' as const, text: 'Chiffrement X25519 + ML-KEM-768' },
-            { icon: 'eye-off-outline' as const, text: 'Le QR ne contient qu\'un pointeur anonyme' },
-            { icon: 'shield-checkmark-outline' as const, text: 'Le serveur ne peut pas vous identifier' },
+            { icon: 'key-outline' as const, text: t('inviteDetail.security1') },
+            { icon: 'eye-off-outline' as const, text: t('inviteDetail.security2') },
+            { icon: 'shield-checkmark-outline' as const, text: t('inviteDetail.serverCantIdentify') },
           ].map((item, i) => (
             <View key={i} style={styles.securityRow}>
-              <Ionicons name={item.icon} size={15} color={theme.colors.primary} style={{ marginTop: 1 }} />
+              <Ionicons name={item.icon} size={15} color={colors.primary} style={{ marginTop: 1 }} />
               <Text style={styles.securityText}>{item.text}</Text>
             </View>
           ))}
@@ -242,16 +250,16 @@ export function InviteDetailScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: theme.colors.background },
+const makeStyles = (colors: ColorPalette) => ({
+  container: { flex: 1, backgroundColor: colors.background },
   scroll: { flex: 1 },
   scrollContent: {},
 
   header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, gap: 12 },
-  backButton: { width: 36, height: 36, borderRadius: 18, backgroundColor: theme.colors.surface, alignItems: 'center', justifyContent: 'center' },
-  headerTitle: { flex: 1, fontSize: 20, fontWeight: '700', color: theme.colors.text, letterSpacing: -0.3 },
+  backButton: { width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surface, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { flex: 1, fontSize: 20, fontWeight: '700', color: colors.text, letterSpacing: -0.3 },
   deleteText: { fontSize: 14, fontWeight: '600', color: '#FF5A5A' },
-  divider: { height: 1, backgroundColor: theme.colors.divider, marginHorizontal: 16 },
+  divider: { height: 1, backgroundColor: colors.divider, marginHorizontal: 16 },
 
   qrSection: { alignItems: 'center', paddingVertical: 28 },
   qrCard: {
@@ -268,36 +276,36 @@ const styles = StyleSheet.create({
   pulseDotRing: { position: 'absolute', width: 10, height: 10, borderRadius: 5, backgroundColor: '#FFB547' },
   pulseDotInner: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#FFB547' },
   statusText: { fontSize: 17, fontWeight: '700', color: '#FFB547' },
-  statusSub: { fontSize: 13, color: theme.colors.textMuted, textAlign: 'center' },
+  statusSub: { fontSize: 13, color: colors.textMuted, textAlign: 'center' },
 
   actionsRow: { flexDirection: 'row', paddingHorizontal: 20, gap: 10, marginBottom: 28 },
   shareBtn: {
     flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
-    paddingVertical: 14, borderRadius: 14, backgroundColor: theme.colors.primary,
+    paddingVertical: 14, borderRadius: 14, backgroundColor: colors.primary,
   },
-  shareBtnText: { fontSize: 15, fontWeight: '700', color: theme.colors.textOnPrimary },
+  shareBtnText: { fontSize: 15, fontWeight: '700', color: colors.textOnPrimary },
   copyBtn: {
     width: 52, paddingVertical: 14, borderRadius: 14,
-    backgroundColor: theme.colors.surface, borderWidth: 1, borderColor: theme.colors.border,
+    backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border,
     alignItems: 'center', justifyContent: 'center',
   },
 
   securityCard: {
-    marginHorizontal: 20, backgroundColor: theme.colors.surface, borderRadius: 14,
-    padding: 18, borderWidth: 1, borderColor: theme.colors.border,
+    marginHorizontal: 20, backgroundColor: colors.surface, borderRadius: 14,
+    padding: 18, borderWidth: 1, borderColor: colors.border,
   },
-  securityTitle: { fontSize: 13, fontWeight: '700', color: theme.colors.textSecondary, marginBottom: 14 },
+  securityTitle: { fontSize: 13, fontWeight: '700', color: colors.textSecondary, marginBottom: 14 },
   securityRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, marginBottom: 10 },
-  securityText: { fontSize: 13, color: theme.colors.textMuted, flex: 1, lineHeight: 18 },
+  securityText: { fontSize: 13, color: colors.textMuted, flex: 1, lineHeight: 18 },
 
   inviteTagline: {
     fontSize: 12,
     fontWeight: '500',
-    color: theme.colors.primary,
+    color: colors.primary,
     textAlign: 'center',
     marginTop: 24,
     opacity: 0.6,
   },
-});
+}) as const;
 
 export default InviteDetailScreen;

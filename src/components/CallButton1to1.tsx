@@ -2,17 +2,12 @@
 // Bouton d'appel vocal pour les conversations 1-à-1
 // Version 1.0 - Utilise useCall1to1
 
-import React, { useState, useRef } from 'react';
-import {
-  TouchableOpacity,
-  ActivityIndicator,
-  StyleSheet,
-  Animated,
-  Alert,
-} from 'react-native';
+import { useState, useRef } from 'react';
+import { TouchableOpacity, ActivityIndicator, Animated, Alert } from 'react-native';
 import Svg, { Path } from 'react-native-svg';
+import { useTranslation } from 'react-i18next';
 import { useCall1to1 } from '../hooks/useCall1to1';
-import { theme } from './ui/theme';
+import { useTheme, useThemedStyles, type ColorPalette } from './ui';
 
 // ============================================
 // TYPES
@@ -54,6 +49,9 @@ export function CallButton1to1({
   disabled = false,
   size = 'medium',
 }: CallButton1to1Props) {
+  const { t } = useTranslation();
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
   const { startCall, isInCall } = useCall1to1();
   const [isStarting, setIsStarting] = useState(false);
   
@@ -96,18 +94,18 @@ export function CallButton1to1({
 
       if (!result.success) {
         Alert.alert(
-          'Erreur',
-          result.error || 'Impossible de démarrer l\'appel',
-          [{ text: 'OK' }]
+          t('common.error'),
+          result.error || t('contactInfo.callError'),
+          [{ text: t('common.ok') }]
         );
       }
 
     } catch (error) {
       console.error('[CallButton1to1] Start call error:', error);
       Alert.alert(
-        'Erreur',
-        'Une erreur est survenue lors du démarrage de l\'appel',
-        [{ text: 'OK' }]
+        t('common.error'),
+        t('contactInfo.callGenericError'),
+        [{ text: t('common.ok') }]
       );
     } finally {
       setIsStarting(false);
@@ -124,8 +122,8 @@ export function CallButton1to1({
   const config = sizeConfig[size];
   
   const iconColor = disabled 
-    ? theme.colors.textMuted 
-    : theme.colors.primary;
+    ? colors.textMuted 
+    : colors.primary;
 
   const isDisabled = disabled || isInCall;
 
@@ -153,7 +151,7 @@ export function CallButton1to1({
         activeOpacity={0.7}
       >
         {isStarting ? (
-          <ActivityIndicator size="small" color={theme.colors.primary} />
+          <ActivityIndicator size="small" color={colors.primary} />
         ) : (
           <PhoneIcon color={iconColor} size={config.icon} />
         )}
@@ -166,7 +164,7 @@ export function CallButton1to1({
 // STYLES
 // ============================================
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   iconButtonWrapper: {
     alignItems: 'center',
     position: 'relative',
@@ -176,6 +174,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-});
+}) as const;
 
 export default CallButton1to1;

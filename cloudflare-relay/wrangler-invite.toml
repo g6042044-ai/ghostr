@@ -1,0 +1,63 @@
+# cloudflare-relay/wrangler-invite.toml
+# Configuration Wrangler pour le worker d'invitation Ghostr
+#
+# Déploiement :
+#   wrangler deploy -c wrangler-invite.toml
+#
+# Variables à remplir avant le premier déploiement :
+#   TEAM_ID         : Apple Team ID (10 caractères) — App Store Connect → Membership
+#   APP_BUNDLE      : Bundle iOS — déjà connu : com.ghostr.app
+#   ANDROID_PACKAGE : Package Android — déjà connu : com.ghostr.app
+#   SHA256_UPLOAD   : SHA-256 du keystore upload (fingerprint avec ":")
+#                     keytool -list -v -keystore upload-key.jks -alias upload
+#   SHA256_PLAY     : SHA-256 du keystore Play App Signing
+#                     Play Console → Setup → App integrity → App signing key certificate
+#   IOS_APP_ID      : ID numérique de l'app sur l'App Store (ex: 1234567890)
+#                     App Store Connect → ton app → "App Information" → Apple ID
+
+name = "ghostr-invite"
+main = "invite-worker.js"
+compatibility_date = "2025-01-01"
+
+# IMPORTANT — observabilité désactivée pour la vie privée.
+# Cohérent avec wrangler-entry.toml et les autres workers Ghostr.
+[observability]
+enabled = false
+
+# ============================================
+# VARIABLES — À COMPLÉTER
+# ============================================
+# Pour les valeurs sensibles on peut aussi utiliser :
+#   wrangler secret put SHA256_UPLOAD --config wrangler-invite.toml
+# (mais SHA256 et Team ID ne sont pas secrets, donc [vars] est OK).
+[vars]
+TEAM_ID = "X44P5T8828"
+APP_BUNDLE = "com.ghostr.app"
+ANDROID_PACKAGE = "com.ghostr.app"
+SHA256_UPLOAD = "D5:FF:26:3E:5D:CD:91:B0:65:F5:79:6E:98:7E:82:8E:23:DA:95:DE:CF:AD:FE:58:39:BE:5B:E8:FC:D7:6F:51"
+SHA256_PLAY = "A4:84:1A:80:47:80:94:10:13:55:10:36:FB:B8:05:06:4B:EA:12:71:8D:C4:C2:32:F0:91:61:0A:C0:AD:4D:AE"
+IOS_APP_ID = "6766973747"
+
+# ============================================
+# ROUTES — choisir UNE des deux options
+# ============================================
+# OPTION A : Custom domain (recommandé)
+# Configure le domaine theghostr.com comme custom domain du worker.
+# Prérequis : domaine ajouté à Cloudflare (orange cloud actif).
+# Si tu utilises cette option, décommente :
+#
+# routes = [
+#   { pattern = "theghostr.com", custom_domain = true }
+# ]
+#
+# OPTION B : Route via dashboard Cloudflare (manuel)
+# Va sur Workers & Pages → ghostr-invite → Settings → Triggers
+# → Add Custom Domain → theghostr.com
+# (laisse les routes vides ici).
+
+# ============================================
+# DÉVELOPPEMENT LOCAL
+# ============================================
+[dev]
+port = 8787
+local_protocol = "http"

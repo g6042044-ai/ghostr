@@ -15,43 +15,23 @@
 
 // Audit Fix M-02: L'import direct de supabase a été supprimé.
 // Toutes les opérations passent par secureRpc() via le relay OHTTP.
-import {
-  // V2: Triple Ratchet avec protection post-quantique
-  sessionService,
-  StoredSession,
-  encodeBase64,
-  decodeBase64,
-} from './tripleRatchet';
+import { sessionService, StoredSession, encodeBase64 } from './tripleRatchet';
 import { LocalMessage } from './storage';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState } from 'react-native';
 import { getRandomBytes } from './crypto';
-import { encryptIfEnabled, decryptIfNeeded, isEncryptionEnabled } from './localCrypto';
-import { sendSingleDecoy, sendSingleDecoyMediumTier, generateSizedPayload } from './decoyService';
-import { shouldChunkPayload, chunkPayload, processReceivedChunk, startAssemblyCleanup, stopAssemblyCleanup, clearAllAssemblyBuffers, MediaChunkHeader } from './mediaChunking';
-import {
-  reportChunkingSendStart,
-  reportChunkingSendProgress,
-  reportChunkingSendComplete,
-  reportChunkingSendError,
-  reportChunkingReceiveProgress,
-  reportChunkingReceiveComplete,
-  startProgressCleanup,
-  stopProgressCleanup,
-} from './chunkingProgress';
+import i18n from '../i18n';
+import { encryptIfEnabled, decryptIfNeeded, hasAnyEncryptionKey } from './localCrypto';
+import { sendSingleDecoy, sendSingleDecoyMediumTier } from './decoyService';
+import { processReceivedChunk, startAssemblyCleanup, stopAssemblyCleanup, clearAllAssemblyBuffers, MediaChunkHeader } from './mediaChunking';
+import { reportChunkingReceiveProgress, reportChunkingReceiveComplete, startProgressCleanup, stopProgressCleanup } from './chunkingProgress';
 import { requirePinningOrThrow } from './networkSecurity';
 import { startConstantTraffic, stopConstantTraffic, enqueueMessage, getPollGeneration } from './constantTraffic';
 // Audit Fix C-01: Sealed Sender
-import { isSealedSenderReady, createSealedSenderEnvelope, bootstrapSealedSender, invalidateSenderCertificate, SenderCertificate } from './sealedSender';
+import { isSealedSenderReady, createSealedSenderEnvelope, invalidateSenderCertificate, SenderCertificate, ensureSealedSenderBootstrap as _ssEnsureBootstrap, resetSealedSenderBootstrap as _ssResetBootstrap, setSealedSenderCertificateFetcher, subscribeSealedSenderState } from './sealedSender';
 import { secureRpc } from './relayTransport';
 // Push Notifications — Sender-Side Architecture
-import {
-  createPushBlobForPeer,
-  generateRandomPushBlob,
-  getOwnPushTokenInfo,
-  storePeerPushToken,
-  isPushEnabled,
-} from './pushNotificationService';
+import { createPushBlobForPeer, generateRandomPushBlob, getOwnPushTokenInfo, storePeerPushToken } from './pushNotificationService';
 // v20.0: SHA-256 pour le tag de session (remplace XOR faible)
 import { sha256 } from '@noble/hashes/sha256';
 import * as Crypto from 'expo-crypto';
@@ -62,14 +42,7 @@ import { isSessionMutedSync, clearMuteState } from './muteService';
 import { encryptAndUploadBlob, base64ToUint8Array } from './encryptedBlobService';
 // PHASE 1: Epoch tags (rotation 5min) — legacy
 // ACTION 3: Tags directionnels asymétriques avec rotation 24h
-import {
-  deriveTagSeed,
-  getDirectionalSendTag,
-  getDirectionalReceiveTags,
-  generateDecoyTagsForEpoch,
-  getEpochNumber,
-  csprngShuffle as csprngShuffleArray,
-} from './epochTags';
+import { deriveTagSeed, getDirectionalSendTag, getDirectionalReceiveTags, csprngShuffle as csprngShuffleArray } from './epochTags';
 // v26.0: Service de relai pour polling des pending session tags
 
 // ============================================
@@ -84,8 +57,6 @@ const UNREAD_COUNT_PREFIX = 'ghostr_1to1_unread_'; // v6.1: Compteur messages no
 
 // Padding pour messages normaux (texte, réactions, accusés)
 // ACTION 18: PADDED_MESSAGE_SIZE supprimé — remplacé par UNIFORM_PADDING_TIERS (voir addUniformPadding)
-// Padding pour médias (images, fichiers, vocaux) - plus grand
-const PADDED_MEDIA_SIZE = 1024 * 1024; // 1MB max inline
 
 // ============================================
 // STOCKAGE LOCAL CHIFFRÉ
@@ -102,7 +73,13 @@ async function secureGet(key: string): Promise<string | null> {
     const raw = await AsyncStorage.getItem(key);
     if (!raw) return null;
     try {
-      if (raw.startsWith('enc1:') && !isEncryptionEnabled()) {
+      // FIX migration: utiliser hasAnyEncryptionKey() (PIN OR hardware) au lieu
+      // de isEncryptionEnabled() (PIN only). Sans ça, après un import de
+      // migration sans PIN, hardwareKey est en RAM mais encryptionKey est null
+      // → ce guard retournait null sur TOUTES les entrées chiffrées → messages
+      // invisibles, envoi/réception cassés. Voir hasAnyEncryptionKey() pour
+      // l'historique complet.
+      if (raw.startsWith('enc1:') && !hasAnyEncryptionKey()) {
         return null; // Clé pas encore disponible (startup avant unlock)
       }
       return decryptIfNeeded(raw);
@@ -559,10 +536,6 @@ export function invalidateAvatarCacheForAllSessions(): void {
 // UTILITAIRES
 // ============================================
 
-function generateAnonymousDeviceId(): string {
-  return encodeBase64(getRandomBytes(16));
-}
-
 /**
  * Ajoute un jitter de ±30% à un intervalle pour éviter le fingerprinting temporel.
  * Utilise CSPRNG pour que le jitter soit imprévisible.
@@ -969,92 +942,62 @@ async function sendInnerPayload(
   }
 }
 
-/**
- * v25.0: Prépare un chunk pour envoi SANS l'enqueuer.
- *
- * Effectue le pipeline complet (hint → padding → encrypt → seal) et retourne
- * la fonction RPC prête à être enqueued dans le constantTraffic.
- *
- * IMPORTANT: Le chiffrement Triple Ratchet AVANCE le ratchet state.
- * Cette fonction DOIT être appelée séquentiellement pour chaque chunk
- * (l'ordre des chunks détermine l'ordre du ratchet).
- *
- * @returns La fonction RPC, ou null en cas d'erreur
- */
-async function prepareChunkRpcFunction(
-  sessionId: string,
-  innerPayload: InnerPayload,
-  session: StoredSession
-): Promise<(() => Promise<any>) | null> {
-  try {
-    // senderHint
-    const seed = deriveTagSeed(
-      session.myIdentityKeyFingerprint,
-      session.theirIdentityKeyFingerprint
-    );
-    const tag = getDirectionalSendTag(seed, session.myIdentityKeyFingerprint, session.theirIdentityKeyFingerprint);
-    
-    const _hintInput = new TextEncoder().encode(session.myIdentityKeyFingerprint + ':' + tag);
-    const _hintHash = sha256(_hintInput);
-    const _senderHint = Array.from(_hintHash.slice(0, 8))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
-    
-    const payloadWithHint = { ...innerPayload, _senderHint };
-    const payloadJsonWithHint = JSON.stringify(payloadWithHint);
-    
-    // Padding uniforme
-    const paddedPayload = addUniformPadding(payloadJsonWithHint);
-    
-    // Chiffrement Triple Ratchet (fait avancer le ratchet — DOIT être séquentiel)
-    const encryptedJson = await sessionService.encryptMessageForSession(sessionId, paddedPayload);
-    
-    // Enveloppe v3
-    const sealedPayload: SealedPayload = {
-      type: 'triple_ratchet_v3',
-      version: 3,
-      data: encryptedJson,
-    };
-    const sealedPayloadStr = JSON.stringify(sealedPayload);
-    
-    // Sealed Sender — attendre le bootstrap (PoW + certificat)
-    if (!isSealedSenderReady()) {
-      const ready = await Promise.race([
-        ensureSealedSenderBootstrap(),
-        new Promise<boolean>(resolve => setTimeout(() => resolve(false), 45000)),
-      ]);
-      if (!ready) return null;
-    }
-    
-    const envelope = createSealedSenderEnvelope(tag, sealedPayloadStr);
-    
-    // Retourner la fonction RPC SANS l'exécuter
-    return async () => {
-      // Push blob: chiffré pour le Push Proxy, ou aléatoire si pas de token pair
-      // v28.0: blob aléatoire si le pair a muté → aucun push
-      const pushBlob = isPeerMuteRequested(sessionId)
-        ? generateRandomPushBlob()
-        : await createPushBlobForPeer(sessionId, false);
-      const result = await secureRpc('send_sealed_message', {
-        p_tag: envelope.tag,
-        p_sealed_content: envelope.sealedContent,
-        p_version: envelope.version,
-        p_push_blob: pushBlob,
-      });
-      if (result.data?.[0]?.id) {
-        recentlySentIds.add(result.data[0].id);
-        await markIdAsProcessed(sessionId, result.data[0].id);
-      }
-      return result;
-    };
-    
-  } catch (error) {
-    __DEV__ && console.error('[api1to1] ❌ prepareChunkRpcFunction error:', error);
-    return null;
-  }
+// ════════════════════════════════════════════════════════════════════════════
+// SEALED SENDER GATE POUR LES CHEMINS D'ENVOI
+// ════════════════════════════════════════════════════════════════════════════
+// HISTORIQUE — Avant la refonte, ce helper faisait une mini retry-loop
+// foreground (3 × 15s avec `resetSealedSenderBootstrap` entre chaque
+// tentative). Cette logique de retry est désormais INTERNE au bootstrap
+// (sealedSender.ts), supprimant les races avec le bootstrap background.
+//
+// COMPORTEMENT ACTUEL :
+//   1. Fast path : `isSealedSenderReady()` → true → retour immédiat (zéro await)
+//   2. Sinon : délégation à `waitForSealedSenderReady` qui :
+//        - déclenche `ensureSealedSenderBootstrap` (idempotent, partage
+//          la promesse en cours s'il y en a une)
+//        - observe l'état observable
+//        - retourne true dès que ready, false sur timeout/failed
+//
+// SÉCURITÉ :
+//   Invariant "no plaintext leaves without sealing" préservé : on ne
+//   retourne `true` que si `isSealedSenderReady()` est vrai à la fin.
+//   En cas d'échec, l'appelant ne procède PAS à l'envoi. `secureRpc`
+//   (relayTransport.ts) refuse en plus tout payload non-scellé en
+//   defense-in-depth.
+//
+// ORDONNANCEMENT TRIPLE RATCHET :
+//   Ce helper est appelé APRÈS `sessionService.encryptMessageForSession`,
+//   donc le ratchet est déjà avancé. Si l'envoi échoue, le chain step est
+//   consommé — le destinataire compensera via skipped-message-keys
+//   (Triple Ratchet supporte le hors-ordre).
+// ════════════════════════════════════════════════════════════════════════════
+// Budget total d'attente pour les envois. Cohérent avec les écrans à 60s.
+// NB : la retry est désormais INTERNE au bootstrap (sealedSender.ts), donc
+// ce timeout n'inclut plus de boucle externe — il borne juste le temps
+// pendant lequel un envoi est prêt à patienter.
+// Sur Hermes, le PoW SHA-256 itératif est 3-10× plus lent que sur V8 ; un
+// premier bootstrap peut donc prendre 30-45s avec contention CPU. 60s
+// couvre largement, tout en limitant l'attente pour un user qui voit son
+// envoi en "sending" trop longtemps.
+const SEND_BOOTSTRAP_TIMEOUT_MS = 60_000;
+
+async function waitForSealedSenderForSend(): Promise<boolean> {
+  // Fast path : déjà prêt → retour immédiat sans toucher aux promesses partagées
+  if (isSealedSenderReady()) return true;
+
+  __DEV__ && console.warn('[api1to1] ⚠️ Sealed sender not ready, awaiting bootstrap...');
+
+  // Délégation à waitForSealedSenderReady (observateur passif).
+  // Le bootstrap (avec ses propres retries internes) est déclenché par cet
+  // appel s'il n'est pas déjà en cours.
+  return waitForSealedSenderReady({
+    timeoutMs: SEND_BOOTSTRAP_TIMEOUT_MS,
+  });
 }
 
 /**
+ * v25.0: Prépare un chunk pour envoi SANS l'enqueuer.
+ *
  * Envoie un seul payload (chunk ou message complet) via le pipeline complet.
  * Fonction interne extraite de l'ancien sendInnerPayload monolithique.
  *
@@ -1067,8 +1010,6 @@ async function sendSingleChunk(
   priority: 'normal' | 'urgent' | 'deferred' = 'normal'
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
   try {
-    const payloadJson = JSON.stringify(innerPayload);
-    
     // FIX 0.2: Injecter le _senderHint DANS le payload avant chiffrement
     const seed = deriveTagSeed(
       session.myIdentityKeyFingerprint,
@@ -1105,19 +1046,17 @@ async function sendSingleChunk(
     const sealedPayloadStr = JSON.stringify(sealedPayload);
     __DEV__ && console.log('[api1to1] Sealed payload:', Math.round(sealedPayloadStr.length / 1024), 'KB');
     
-    // Sealed Sender OBLIGATOIRE — attendre le bootstrap
-    if (!isSealedSenderReady()) {
-      __DEV__ && console.warn('[api1to1] ⚠️ Sealed sender not ready, awaiting bootstrap...');
-      const ready = await Promise.race([
-        ensureSealedSenderBootstrap(),
-        new Promise<boolean>(resolve => setTimeout(() => resolve(false), 45000)),
-      ]);
-      if (!ready) {
-        return {
-          success: false,
-          error: 'SEALED_SENDER_REQUIRED: Envoi anonyme impossible.',
-        };
-      }
+    // Sealed Sender OBLIGATOIRE — attendre le bootstrap.
+    // Mini retry-loop pour absorber les échecs transitoires de bootstrap.
+    // Cf. waitForSealedSenderForSend pour le rationale complet (notamment
+    // l'edge case où un send arrivait pile pendant un échec de bootstrap
+    // background et tombait en 'failed' alors qu'un retry réussissait 2s après).
+    const sealedReady = await waitForSealedSenderForSend();
+    if (!sealedReady) {
+      return {
+        success: false,
+        error: 'SEALED_SENDER_REQUIRED: Envoi anonyme impossible.',
+      };
     }
     
     const envelope = createSealedSenderEnvelope(tag, sealedPayloadStr);
@@ -1157,11 +1096,26 @@ async function sendSingleChunk(
       const pushBlob = shouldPush
         ? await createPushBlobForPeer(sessionId, isCallOffer(innerPayload), callCancel, missedCall)
         : generateRandomPushBlob();
+      // P0-A4: Signaler au gateway si ce message est URGENT (signal d'appel) pour qu'il
+      // applique un jitter court (200-1500ms) au push proxy au lieu du jitter standard
+      // (1000-8000ms). Sans ça, l'UX d'appel est dégradée (ring delay perceptible).
+      //
+      // IMPORTANT: on ne signale "urgent" QUE si on envoie effectivement un push réel
+      // (shouldPush). Sinon (decoy ou peer mute), pushBlob est aléatoire et le gateway
+      // verrait inutilement "ce client signale un appel" alors qu'il n'y a aucun push.
+      //
+      // Trade-off privacy: le gateway apprend qu'un message est "urgent" (binaire). Mais
+      // les patterns temporels d'appel (rafale offer → answer → hangup) sont déjà
+      // distinguables de messages normaux par observation du timing. On formalise donc
+      // un signal déjà inférable, sans nouvelle fuite d'information.
+      const isCallSignalType = innerPayload.type === 'call_signal';
+      const isUrgentCallSignal = shouldPush && (isCallSignalType || isCallOffer(innerPayload) || isCallTermination(innerPayload));
       const result = await secureRpc('send_sealed_message', {
         p_tag: envelope.tag,
         p_sealed_content: envelope.sealedContent,
         p_version: envelope.version,
         p_push_blob: pushBlob,
+        p_urgent: isUrgentCallSignal,
       });
       if (result.data?.[0]?.id) {
         recentlySentIds.add(result.data[0].id);
@@ -1457,7 +1411,7 @@ export async function sendVoice1to1(
   const localMessage: Message1to1 = {
     id: messageId,
     sessionId,
-    content: `[Message vocal ${Math.round(duration)}s]`,
+    content: `${i18n.t('messages.voiceMessagePlaceholder', { seconds: Math.round(duration) })}`,
     timestamp,
     isMine: true,
     displayName: myProfile.displayName,
@@ -1475,7 +1429,7 @@ export async function sendVoice1to1(
   
   const innerPayload: InnerPayload = {
     type: 'voice',
-    content: `[Message vocal ${Math.round(duration)}s]`,
+    content: `${i18n.t('messages.voiceMessagePlaceholder', { seconds: Math.round(duration) })}`,
     senderFingerprint: myFingerprint,
     displayName: myProfile.displayName,
     senderAvatarBase64: myProfile.avatarBase64,
@@ -1563,7 +1517,7 @@ export async function sendMediaRef1to1(
   // Contenu textuel selon le type
   const contentText = metadata.content 
     || (mediaType === 'image' ? '[Image]' 
-    : mediaType === 'voice' ? `[Message vocal ${Math.round(metadata.voiceDuration || 0)}s]`
+    : mediaType === 'voice' ? `${i18n.t('messages.voiceMessagePlaceholder', { seconds: Math.round(metadata.voiceDuration || 0) })}`
     : `[Fichier: ${metadata.fileName || 'fichier'}]`);
   
   // ── Message local (sender) — conserve les données complètes ──
@@ -2122,10 +2076,16 @@ async function doFetchMessages1to1(
     const realTagSet = new Set(allRealTags);
     __DEV__ && console.log(`[api1to1] 🔍 DIAG SESSION POLL directional tags: ${allRealTags.map(t => t.slice(0,16)+'...').join(', ')} | myFP: ${session.myIdentityKeyFingerprint} | theirFP: ${session.theirIdentityKeyFingerprint} | p_since: ${lastPoll?.toISOString() || 'null'}`);
     
-    // ACTION 06: K-ANONYMITY RENFORCÉE — TOUJOURS 50 tags exactement
+    // ACTION 06 + P1-B2: K-ANONYMITY RENFORCÉE — TOUJOURS 15 tags exactement
     // Le serveur ne peut plus déduire le nombre de conversations.
     // Decoys purement aléatoires (les HKDF-persistants sont statistiquement identifiables).
-    const FIXED_POLLING_TAG_COUNT = 50;
+    //
+    // P1-B2 (50 → 15): chaque poll déclenchait 50 UPSERT sur rate_limits Supabase.
+    // À 1000 users actifs, 600K UPSERT/min saturait la DB. 15 reste largement
+    // suffisant pour la k-anonymity (log2(15) ≈ 3.9 bits d'incertitude vs 5.6 à 50,
+    // négligeable face aux 256 bits d'entropie des tags rotatifs).
+    // Comparable à Signal qui n'a pas de tag rotation/decoys du tout.
+    const FIXED_POLLING_TAG_COUNT = 15;
     const decoysNeeded = Math.max(0, FIXED_POLLING_TAG_COUNT - allRealTags.length);
     const randomDecoys: string[] = [];
     for (let i = 0; i < decoysNeeded; i++) {
@@ -2660,17 +2620,105 @@ const PENDING_CALL_SIGNAL_TTL_MS = 90_000; // 90s — aligné sur CALL_RING_TIME
 
 let _pendingCallSignals: PendingCallSignal[] = [];
 
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX P1: Tracking des callIds terminés (hangup/decline/busy reçus en background)
+// ═══════════════════════════════════════════════════════════════════════════
+// PROBLÈME RÉSOLU:
+//   Quand l'app est killed/background, les signaux sont buffés en attendant
+//   que React monte. Si l'appelant raccroche AVANT que l'utilisateur ouvre
+//   l'app, le hangup est traité directement (stopRinging + missed call notif)
+//   mais l'OFFER reste dans le buffer. Au mount, l'offer périmé était traité
+//   → l'écran d'appel entrant s'affichait pour un appel déjà terminé.
+//
+// SOLUTION:
+//   1. Marquer le callId comme terminé dès la réception du hangup en background
+//   2. Purger l'offer correspondant du buffer (cas: hangup arrive APRÈS offer)
+//   3. Refuser tout offer ultérieur pour ce callId (cas: hangup AVANT offer)
+//   4. Filtrer au consume pour double-sécurité
+//   5. TTL aligné sur le buffer pour cleanup automatique
+// ═══════════════════════════════════════════════════════════════════════════
+const _endedCallIds = new Map<string, number>();  // callId -> timestamp d'enregistrement
+const ENDED_CALL_TTL_MS = 90_000;  // Aligné sur PENDING_CALL_SIGNAL_TTL_MS
+
+// FIX P6: Compteurs de diagnostic pour traçabilité en production
+const _callDebugStats = {
+  offersBuffered: 0,
+  offersDroppedAlreadyEnded: 0,    // Hangup arrivé avant offer
+  offersPurgedAfterHangup: 0,      // Hangup arrivé après buffer
+  signalsConsumedFromBuffer: 0,
+  signalsExpiredInBuffer: 0,
+  signalsFilteredEnded: 0,         // Filtrés au consume car callId terminé
+  hangupsHandledInBackground: 0,
+};
+
+/**
+ * Purge les entrées expirées de _endedCallIds.
+ * Appelé en début de consumePendingCallSignals() et au cleanup.
+ */
+function _purgeExpiredEndedCallIds(now: number): void {
+  for (const [cid, ts] of _endedCallIds) {
+    if (now - ts > ENDED_CALL_TTL_MS) _endedCallIds.delete(cid);
+  }
+}
+
+/**
+ * FIX P4: Permet à call1to1Service.startCall() de s'assurer qu'un callId
+ * fraîchement généré n'est pas accidentellement bloqué par un marquage
+ * "ended" précédent. Sécurité défensive (collision astronomiquement improbable
+ * sur 160 bits aléatoires, mais coût zéro).
+ */
+export function clearEndedCallTracking(callId: string): void {
+  _endedCallIds.delete(callId);
+}
+
+/**
+ * FIX P6: Expose les stats de diagnostic (lecture seule).
+ * Utile pour debugger en production et qualifier l'occurrence des bugs.
+ */
+export function getCallDebugStats(): Readonly<typeof _callDebugStats> {
+  return { ..._callDebugStats };
+}
+
 /**
  * Consomme les signaux d'appel reçus pendant que React n'était pas monté.
  * Appelé par Call1to1Provider au montage. Vide le buffer.
+ *
+ * FIX P1: Filtre aussi les signaux dont le callId a déjà été marqué comme
+ * terminé (hangup/decline/busy reçu en background). Évite l'affichage
+ * fantôme d'un écran d'appel entrant pour un appel déjà raccroché.
  */
 export function consumePendingCallSignals(): PendingCallSignal[] {
   const now = Date.now();
-  // Filtrer les signaux expirés (l'appelant a probablement raccroché)
-  const valid = _pendingCallSignals.filter(s => now - s.bufferedAt < PENDING_CALL_SIGNAL_TTL_MS);
+
+  // Purge anti-fuite mémoire
+  _purgeExpiredEndedCallIds(now);
+
+  const valid: PendingCallSignal[] = [];
+  let expired = 0;
+  let endedFiltered = 0;
+
+  for (const s of _pendingCallSignals) {
+    if (now - s.bufferedAt >= PENDING_CALL_SIGNAL_TTL_MS) {
+      expired++;
+      continue;
+    }
+    if (_endedCallIds.has(s.signal.callId)) {
+      endedFiltered++;
+      continue;
+    }
+    valid.push(s);
+  }
+
   _pendingCallSignals = [];
-  if (valid.length > 0) {
-    __DEV__ && console.log(`[api1to1] 📞 consumePendingCallSignals: ${valid.length} signal(s) buffered`);
+  _callDebugStats.signalsConsumedFromBuffer += valid.length;
+  _callDebugStats.signalsExpiredInBuffer += expired;
+  _callDebugStats.signalsFilteredEnded += endedFiltered;
+
+  if (valid.length > 0 || expired > 0 || endedFiltered > 0) {
+    __DEV__ && console.log(
+      `[api1to1] 📞 consumePendingCallSignals: ${valid.length} valid, ` +
+      `${expired} expired, ${endedFiltered} filtered (call ended)`
+    );
   }
   return valid;
 }
@@ -2728,17 +2776,6 @@ function notifyReaction(sessionId: string, targetMessageId: string, emoji: strin
   }
 }
 
-function notifyNewMessage(sessionId: string, message: Message1to1) {
-  const callbacks = messageCallbacks.get(sessionId) || [];
-  for (const cb of callbacks) {
-    try {
-      cb(message);
-    } catch (e) {
-      __DEV__ && console.error('[api1to1] Message callback error:', e);
-    }
-  }
-}
-
 // v5.0: Callback global pour les signaux d'appel
 export function onCallSignal(callback: CallSignalCallback): () => void {
   globalCallSignalCallback = callback;
@@ -2786,6 +2823,34 @@ function notifyCallSignal(
     // (qui affiche un contenu générique). Aucune donnée E2E n'est exposée.
     // ════════════════════════════════════════════════════════════════════
     if (signal.type === 'hangup' || signal.type === 'decline' || signal.type === 'busy') {
+      // ════════════════════════════════════════════════════════════════════
+      // FIX P1: Marquer le callId comme terminé AVANT toute opération async.
+      //
+      // Cette opération DOIT être synchrone (avant le import dynamique) pour
+      // bloquer toute race condition où un offer pour le même callId arriverait
+      // via un autre notifyCallSignal() concurrent.
+      //
+      // Effet:
+      //   1. Tout offer ultérieur pour ce callId sera rejeté (cas: signaux
+      //      réordonnés par le réseau, ou polls qui se croisent)
+      //   2. Tout offer DÉJÀ buffé pour ce callId est purgé immédiatement
+      //   3. Au montage de React, consumePendingCallSignals() filtrera aussi
+      //      par sécurité supplémentaire
+      // ════════════════════════════════════════════════════════════════════
+      _endedCallIds.set(signal.callId, Date.now());
+      _callDebugStats.hangupsHandledInBackground++;
+
+      // Purger les signaux déjà buffés pour ce callId (cas: hangup APRÈS offer)
+      const beforeLen = _pendingCallSignals.length;
+      _pendingCallSignals = _pendingCallSignals.filter(p => p.signal.callId !== signal.callId);
+      const purgedCount = beforeLen - _pendingCallSignals.length;
+      if (purgedCount > 0) {
+        _callDebugStats.offersPurgedAfterHangup += purgedCount;
+        __DEV__ && console.log(
+          `[api1to1] 📞 Purged ${purgedCount} buffered signal(s) for ended call ${signal.callId.slice(0, 16)}`
+        );
+      }
+
       import('./pushNotificationService').then(({ stopRinging, showMissedCallNotification }) => {
         // PAS de guard isRinging() — l'état JS ne reflète pas l'état natif
         // en contexte headless (background task après kill)
@@ -2821,6 +2886,17 @@ function notifyCallSignal(
     // le bref intervalle entre le push et le montage complet de React.
     // ════════════════════════════════════════════════════════════════════
     if (signal.type === 'offer' || signal.type === 'answer' || signal.type === 'crypto') {
+      // FIX P1: Refuser le buffering si le callId est déjà marqué comme terminé.
+      // Couvre le cas où le hangup est arrivé AVANT l'offer (réordonnancement
+      // réseau, ou polls qui se croisent en background).
+      if (_endedCallIds.has(signal.callId)) {
+        _callDebugStats.offersDroppedAlreadyEnded++;
+        __DEV__ && console.log(
+          `[api1to1] 📞 Dropping ${signal.type} — call already ended (callId=${signal.callId.slice(0, 16)})`
+        );
+        return;
+      }
+
       // Limiter la taille du buffer (protection anti-flood)
       if (_pendingCallSignals.length < PENDING_CALL_SIGNAL_MAX) {
         _pendingCallSignals.push({
@@ -2830,6 +2906,7 @@ function notifyCallSignal(
           senderAvatarBase64,
           bufferedAt: Date.now(),
         });
+        if (signal.type === 'offer') _callDebugStats.offersBuffered++;
         __DEV__ && console.log(`[api1to1] 📞 Buffered ${signal.type} signal for later (${_pendingCallSignals.length} pending)`);
       } else {
         __DEV__ && console.warn(`[api1to1] 📞 Pending call signal buffer full — dropping ${signal.type}`);
@@ -2956,8 +3033,10 @@ export async function pollAllSessions(): Promise<void> {
   // BUG FIX: Collecter TOUS les tags de TOUTES les sessions en un seul batch.
   // Avant ce fix, chaque session faisait un appel RPC séparé avec 50 tags,
   // ce qui permettait au serveur de compter le nombre de conversations.
-  
-  const FIXED_POLLING_TAG_COUNT = 50;
+  //
+  // P1-B2 (50 → 15): voir commentaire dans la fonction de polling foreground.
+  // -70% load Supabase, k-anonymity log2(15)=3.9 bits encore largement suffisante.
+  const FIXED_POLLING_TAG_COUNT = 15;
   
   // 1. Construire le mapping tag → sessionId pour dispatcher les résultats
   const tagToSessionId = new Map<string, string>();
@@ -3055,12 +3134,7 @@ export async function pollAllSessions(): Promise<void> {
         __DEV__ && console.log('[api1to1] 🔍 DIAG batch: server returned 0 messages');
         continue;
       }
-      
-      // DIAGNOSTIC: Log all returned message tags
-      for (const row of (data as ServerMessage[])) {
-        const matched = tagToSessionId.has(row.tag);
-      }
-      
+
       // 4. Dispatcher les résultats par session
       const messagesBySession = new Map<string, ServerMessage[]>();
       
@@ -3945,7 +4019,7 @@ async function _retryBlobMedia(
     if (!rawBase64) {
       __DEV__ && console.error(`[api1to1] ❌ Retry: no local data for ${mediaType} message`);
       await updateSingleMessageStatus1to1(sessionId, messageId, 'failed');
-      return { success: false, error: `Données ${mediaType} introuvables localement` };
+      return { success: false, error: `${mediaType} data not found locally` };
     }
     
     __DEV__ && console.log(`[api1to1] 🔄 Re-uploading ${mediaType} blob (${Math.round(rawBase64.length / 1024)}KB)...`);
@@ -4065,6 +4139,67 @@ export async function clearLocalMessages1to1(sessionId: string): Promise<void> {
   }
 }
 
+/**
+ * Nettoie UNIQUEMENT l'état de transport d'une session, en PRÉSERVANT
+ * l'historique des messages, les réactions, les médias téléchargés et les
+ * préférences utilisateur (mute).
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * RATIONALE — bug "nouvelle conversation après re-handshake" (mai 2026)
+ * ════════════════════════════════════════════════════════════════════════════
+ * Avant : `Join1to1Screen.processInviteReplace` appelait `clearLocalMessages1to1`
+ * lors du re-scan d'un QR code d'un contact existant (déclenché automatiquement
+ * par la détection EXISTING_SESSION dans `acceptInvite`). Cela effaçait
+ * l'historique complet de la conversation côté scanner, alors que :
+ *   - Le sessionId est déterministe (`session_v2_<sortedFingerprints>`) → la
+ *     conversation EST la même
+ *   - L'autre côté (`finalizeSession`) ne fait PAS de clearLocalMessages → il
+ *     garde son historique
+ *
+ * Conséquence : asymétrie inattendue où un re-handshake faisait perdre
+ * l'historique à un seul des deux participants. Du point de vue utilisateur,
+ * la conversation paraissait "nouvelle" alors qu'elle correspond bel et bien
+ * à la même personne (même clés d'identité long-terme).
+ *
+ * Cette fonction garde les vraies données utilisateur et ne reset que les
+ * caches techniques liés au transport :
+ *   - `PROCESSED_IDS_PREFIX` : cache des UUIDs de messages déjà traités.
+ *     Reset volontaire — si jamais un UUID se répète (improbable), on veut
+ *     que le nouveau message passe. Le re-traitement d'un message ancien est
+ *     dédupliqué par d'autres mécanismes (messageId dans le payload interne).
+ *   - `LAST_POLL_PREFIX` : timestamp de dernier poll. Reset pour permettre
+ *     un re-poll élargi si on craint des messages en transit.
+ *
+ * Ce qu'on PRÉSERVE :
+ *   - Messages (`MESSAGES_1TO1_PREFIX`)
+ *   - Réactions (`REACTIONS_STORAGE_KEY`)
+ *   - Statuts delivery/read (`STATUS_PREFIX`)
+ *   - Unread count (`UNREAD_COUNT_PREFIX`)
+ *   - Médias locaux (deleteSessionMedia NON appelé)
+ *   - Préférences mute
+ *   - Pending invites (l'inviteur est OK, c'est seulement les invites EXPIRÉES
+ *     qui doivent être nettoyées — c'est fait ailleurs par cleanupExpired())
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+export async function clearTransportState1to1(sessionId: string): Promise<void> {
+  try {
+    const processedKey = PROCESSED_IDS_PREFIX + sessionId;
+    await AsyncStorage.removeItem(processedKey);
+    _clearProcessedIdsCache(sessionId);
+    
+    const pollKey = LAST_POLL_PREFIX + sessionId;
+    await AsyncStorage.removeItem(pollKey);
+    
+    __DEV__ && console.log(
+      `[api1to1] 🧹 Transport cache reset for session ${sessionId.slice(0, 12)}... ` +
+      '(history preserved)'
+    );
+  } catch (error) {
+    __DEV__ && console.error('[api1to1] Error clearing transport state:', error);
+  }
+}
+
+
 async function getLastPollTime(sessionId: string): Promise<Date | null> {
   try {
     const key = LAST_POLL_PREFIX + sessionId;
@@ -4163,7 +4298,10 @@ export async function clearAll1to1Data(): Promise<void> {
     // v25.0: Nettoyer les buffers d'assemblage de chunks média
     clearAllAssemblyBuffers();
     clearAvatarHashCache();
-    clearAllMediaFiles();
+    // FIX: clearAllMediaFiles est async — sans await, le nettoyage peut se
+    // poursuivre AFTER nuclearReset retourne, et l'app peut être tuée avec
+    // des fichiers média en clair encore sur disque dans documentDirectory.
+    await clearAllMediaFiles();
     
     // CORRECTION: Nettoyer le cache mémoire des mutes
     const { clearAllMuteCache } = await import('./muteService');
@@ -4326,252 +4464,577 @@ const globalPollState: GlobalPollState = {
  * + constant-rate traffic (decoys automatiques toutes les ~90s)
  * À appeler au démarrage de l'app
  */
-// FIX: Boostrap du sealed sender extrait dans une fonction réutilisable.
-// Peut être appelée tôt (dès l'init de l'app) pour éviter l'attente
-// au moment de créer une invitation.
-let _sealedSenderBootstrapStarted = false;
-let _sealedSenderBootstrapPromise: Promise<boolean> | null = null;
 
-// ============================================
+// ════════════════════════════════════════════════════════════════════════════
 // POW PRE-COMPUTATION
-// ============================================
+// ════════════════════════════════════════════════════════════════════════════
 // Le PoW est du pur CPU (~1-2s à 18 bits). Il n'a AUCUNE dépendance
 // (ni relay, ni session, ni réseau). On le lance dès que possible
 // pour qu'il tourne en parallèle avec sessionService.initialize() et initRelay().
+// ════════════════════════════════════════════════════════════════════════════
 
 let _precomputedPowPromise: Promise<{ pow: any; difficulty: number }> | null = null;
+let _powStartedAt: number | null = null; // pour diagnostic : null = pas en cours
 
 /**
  * Lance le calcul du PoW immédiatement, en arrière-plan.
  * À appeler dès le début de l'init de l'app (avant sessionService.initialize).
- * Le résultat sera attendu plus tard par ensureSealedSenderBootstrap.
+ * Le résultat sera attendu plus tard par le fetcher sealed sender.
+ *
+ * IDEMPOTENT : si un PoW est déjà en cours ou résolu, ne fait rien.
  */
 export function precomputePoW(): void {
   if (_precomputedPowPromise) return;
+
+  const myStart = Date.now();
+  _powStartedAt = myStart;
   __DEV__ && console.log('[api1to1] ⛏️ Pre-computing PoW in background...');
-  
+
   _precomputedPowPromise = (async () => {
-    const { computeProofOfWork, POW_DIFFICULTY_BITS } = await import('./proofOfWork');
-    const pow = await computeProofOfWork(POW_DIFFICULTY_BITS);
-    __DEV__ && console.log(`[api1to1] ⛏️ PoW pre-computed: nonce=${pow.nonce}, difficulty=${POW_DIFFICULTY_BITS}`);
-    return { pow, difficulty: POW_DIFFICULTY_BITS };
+    try {
+      const { computeProofOfWork, POW_DIFFICULTY_BITS } = await import('./proofOfWork');
+      const pow = await computeProofOfWork(POW_DIFFICULTY_BITS);
+      const elapsed = Date.now() - myStart;
+      __DEV__ && console.log(
+        `[api1to1] ⛏️ PoW pre-computed in ${elapsed}ms: nonce=${pow.nonce}, difficulty=${POW_DIFFICULTY_BITS}`
+      );
+      return { pow, difficulty: POW_DIFFICULTY_BITS };
+    } finally {
+      // Disarme le watchdog (que ce soit succès ou exception)
+      // Garde anti-race : ne clear que SI on est encore le PoW courant
+      // (un nouveau precomputePoW pourrait avoir démarré entre-temps si
+      // notre promesse a été consommée et invalidée).
+      if (_powStartedAt === myStart) {
+        _powStartedAt = null;
+      }
+    }
   })();
-}
 
-export function ensureSealedSenderBootstrap(): Promise<boolean> {
-  if (_sealedSenderBootstrapPromise) return _sealedSenderBootstrapPromise;
-  _sealedSenderBootstrapStarted = true;
-  
-  __DEV__ && console.log('[api1to1] 🛡️ Starting sealed sender bootstrap...');
-  
-  _sealedSenderBootstrapPromise = bootstrapSealedSender(async (): Promise<SenderCertificate | null> => {
-    // Récupérer le PoW pré-calculé (ou le calculer maintenant si pas encore lancé)
-    if (!_precomputedPowPromise) {
-      precomputePoW();
+  // Watchdog diagnostic : si le PoW met >20s, c'est anormal (contention CPU).
+  // Le `myStart === _powStartedAt` garantit qu'on ne warn pas un autre PoW
+  // ni un PoW déjà résolu.
+  setTimeout(() => {
+    if (_powStartedAt === myStart) {
+      const elapsed = Date.now() - myStart;
+      console.warn(
+        `[api1to1] ⚠️ PoW still computing after ${elapsed}ms — likely CPU contention. ` +
+        `Bootstrap will block until PoW completes.`
+      );
     }
-    
-    let { pow, difficulty } = await _precomputedPowPromise!;
-    
-    // FIX REPLAY: Invalider le PoW pré-calculé après consommation.
-    // Sans ça, _precomputedPowPromise reste une promesse résolue avec le même PoW.
-    // Si un second bootstrap (ou sendSingleChunk → ensureSealedSenderBootstrap)
-    // lit cette promesse avant que resetSealedSenderBootstrap() ne la nullifie,
-    // le même PoW est soumis deux fois → gateway 403 replay_detected.
-    _precomputedPowPromise = null;
-    
-    // FIX: Check PoW freshness — if computed >3 min ago, recompute.
-    // The gateway rejects PoW older than 5 min (POW_TIMESTAMP_WINDOW_MS).
-    // The pre-computed PoW can become stale because:
-    //   - PoW computation competes with OTPK generation for CPU
-    //   - sessionService.initialize() and relay bootstrap add delay
-    //   - Total time from PoW.timestamp to submission can exceed 5 min
-    const POW_MAX_AGE_MS = 3 * 60 * 1000; // 3 min (safe margin before 5 min server window)
-    if (Date.now() - pow.timestamp > POW_MAX_AGE_MS) {
-      __DEV__ && console.log(`[api1to1] ⛏️ Pre-computed PoW is stale (${Math.round((Date.now() - pow.timestamp) / 1000)}s old), recomputing...`);
-      const { computeProofOfWork } = await import('./proofOfWork');
-      pow = await computeProofOfWork(difficulty);
-      __DEV__ && console.log(`[api1to1] ⛏️ Fresh PoW computed: nonce=${pow.nonce}, age=0s`);
-    }
-    
-    const MAX_RETRIES = 2;
-    
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (attempt > 0) {
-        // Retry: always recompute fresh PoW (previous one was submitted and is now replay-marked)
-        const { computeProofOfWork } = await import('./proofOfWork');
-        pow = await computeProofOfWork(difficulty);
-        __DEV__ && console.log(`[api1to1] ⛏️ PoW re-computed: nonce=${pow.nonce}, difficulty=${difficulty} (retry #${attempt})`);
-      }
-      
-      __DEV__ && console.log(`[api1to1] 🔐 Submitting PoW: ts=${pow.timestamp}, age=${Math.round((Date.now() - pow.timestamp) / 1000)}s, nonce=${pow.nonce}, difficulty=${pow.difficulty}`);
-
-      // Obtenir le certificat anonyme via le relay OHTTP (with PoW)
-      const { data, error } = await secureRpc('get_sealed_certificate', { pow });
-      
-      // ACTION 8: Handle adaptive difficulty — server may require higher PoW during surge
-      if (error && typeof error === 'object' && 'requiredDifficulty' in error) {
-        const serverDifficulty = (error as any).requiredDifficulty;
-        if (typeof serverDifficulty === 'number' && serverDifficulty > difficulty && attempt < MAX_RETRIES) {
-          __DEV__ && console.log(`[api1to1] ⛏️ Server requires difficulty ${serverDifficulty} (surge mode), retrying...`);
-          difficulty = serverDifficulty;
-          continue;
-        }
-      }
-      
-      if (error || !data) {
-        __DEV__ && console.warn('[api1to1] ❌ Failed to get sealed certificate:', error?.message || error);
-        return null;
-      }
-      return data as SenderCertificate;
-    }
-    
-    return null;
-  }).then(ready => {
-    if (ready) {
-      __DEV__ && console.log('[api1to1] 🛡️ Sealed sender ACTIVE — messages are anonymous');
-    } else {
-      __DEV__ && console.error('[api1to1] ❌ Sealed sender FAILED — all sends BLOCKED until bootstrap succeeds');
-    }
-    return ready;
-  }).catch(() => false);
-  
-  return _sealedSenderBootstrapPromise;
+  }, 20_000);
 }
 
 /**
- * Reset l'état du bootstrap sealed sender pour forcer un nouveau cycle.
- * À appeler si le bootstrap a échoué et qu'on veut retenter.
+ * Attend la fin du PoW pré-calculé sans le consommer.
+ *
+ * Utilisation : appelé sur le SplashScreen AVANT d'afficher le LockScreen
+ * pour garantir que :
+ *   (1) Le thread JS ne sera pas bloqué par les batches SHA-256 (50k
+ *       itérations par batch, 30-100ms par batch) pendant la saisie du PIN
+ *       → clavier fluide, pas de lag
+ *   (2) Au moment de handleUnlock, le fetcher trouvera le PoW immédiatement
+ *       disponible → pas d'attente supplémentaire
+ *
+ * Important : cette fonction NE CONSOMME PAS le PoW (ne null pas la
+ * promesse). Le consommateur réel reste `_fetchSealedCertificate` qui
+ * invalide `_precomputedPowPromise` AVANT l'await pour l'anti-replay.
+ *
+ * Si le PoW n'a pas encore été lancé, il est lancé automatiquement.
+ * Ne throw jamais — si le PoW échoue, le flow normal s'occupera d'un retry.
+ */
+export async function waitForPrecomputedPoW(): Promise<void> {
+  if (!_precomputedPowPromise) {
+    precomputePoW();
+  }
+  try {
+    await _precomputedPowPromise;
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] waitForPrecomputedPoW error (non-fatal):', e);
+    // Invalider la promesse en erreur pour que le prochain precomputePoW()
+    // puisse relancer un calcul propre au moment de la consommation réelle.
+    _precomputedPowPromise = null;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SEALED SENDER CERTIFICATE FETCHER — injecté dans sealedSender.ts
+// ════════════════════════════════════════════════════════════════════════════
+// Cette fonction encapsule la logique PoW + secureRpc qui n'appartient pas
+// à sealedSender.ts (couplage indésirable). Elle est injectée une seule fois
+// au module load via setSealedSenderCertificateFetcher.
+//
+// CORRECTIONS APPLIQUÉES VS ANCIENNE VERSION :
+//   BUG #2 (PoW double-consommé) — L'invalidation `_precomputedPowPromise = null`
+//   se fait MAINTENANT avant l'await, pas après. Conséquence : si deux
+//   fetchers concurrents se présentent, l'un capture la promesse et nullify
+//   atomiquement, l'autre voit null et précompute un nouveau PoW.
+//   Plus jamais de soumission du même nonce deux fois.
+//
+//   SUPPORT ABORT — La fonction honore l'AbortSignal entre chaque étape
+//   (await PoW, freshness recompute, await secureRpc, retry). Permet à
+//   `clearSealedSenderState()` d'annuler proprement un bootstrap en cours
+//   lors d'un lock immédiat.
+//
+//   NOTE : `_precomputedPowPromise` reste dans api1to1.ts (et pas dans
+//   sealedSender.ts) parce qu'il appartient à l'init pipeline de l'app
+//   (lancé par App.tsx, LockScreen, post-unlock) qui est tout en api1to1.
+// ════════════════════════════════════════════════════════════════════════════
+
+async function _fetchSealedCertificate(signal: AbortSignal): Promise<SenderCertificate | null> {
+  const fetcherStartedAt = Date.now();
+  __DEV__ && console.log('[api1to1] 🔐 _fetchSealedCertificate START');
+
+  // Assurer qu'un PoW est en cours (idempotent : no-op si déjà lancé)
+  if (!_precomputedPowPromise) {
+    __DEV__ && console.log('[api1to1] 🔐 No PoW in flight — starting one now');
+    precomputePoW();
+  }
+
+  // FIX BUG #2 (anti-replay PoW) :
+  //   Capture la promesse PUIS invalide la référence module-level AVANT
+  //   l'await. JS étant single-threaded, deux fetchers concurrents ne
+  //   peuvent pas voir la même promesse non-null entre ces deux lignes :
+  //   le premier la capture et la nullify dans le même tour synchrone, le
+  //   second voit null et appelle precomputePoW() qui crée une nouvelle
+  //   promesse fraîche. Impossible que deux callers consomment le même nonce.
+  const powPromise = _precomputedPowPromise!;
+  _precomputedPowPromise = null;
+  // _powStartedAt reste défini : la promesse est consommée mais le calcul tourne toujours
+
+  let pow: any;
+  let difficulty: number;
+
+  const powAwaitStart = Date.now();
+  __DEV__ && console.log('[api1to1] 🔐 Awaiting PoW promise...');
+
+  try {
+    ({ pow, difficulty } = await powPromise);
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] Pre-computed PoW failed, computing fresh...', e);
+    if (signal.aborted) return null;
+    const { computeProofOfWork, POW_DIFFICULTY_BITS } = await import('./proofOfWork');
+    pow = await computeProofOfWork(POW_DIFFICULTY_BITS);
+    difficulty = POW_DIFFICULTY_BITS;
+  }
+
+  const powAwaitElapsed = Date.now() - powAwaitStart;
+  __DEV__ && console.log(
+    `[api1to1] 🔐 PoW available after ${powAwaitElapsed}ms wait (nonce=${pow.nonce}, difficulty=${difficulty})`
+  );
+
+  if (signal.aborted) {
+    __DEV__ && console.log('[api1to1] 🔐 Aborted after PoW await');
+    return null;
+  }
+
+  // FIX: Check PoW freshness — if computed >3 min ago, recompute.
+  // Le gateway rejette PoW vieux de plus de 5 min (POW_TIMESTAMP_WINDOW_MS).
+  // 3 min = marge de sécurité.
+  const POW_MAX_AGE_MS = 3 * 60 * 1000;
+  const powAge = Date.now() - pow.timestamp;
+  if (powAge > POW_MAX_AGE_MS) {
+    __DEV__ && console.log(
+      `[api1to1] ⛏️ Pre-computed PoW is stale (${Math.round(powAge / 1000)}s old), recomputing...`
+    );
+    const { computeProofOfWork } = await import('./proofOfWork');
+    const recomputeStart = Date.now();
+    pow = await computeProofOfWork(difficulty);
+    if (signal.aborted) return null;
+    __DEV__ && console.log(
+      `[api1to1] ⛏️ Fresh PoW computed in ${Date.now() - recomputeStart}ms: nonce=${pow.nonce}, age=0s`
+    );
+  }
+
+  // Soumission avec retries sur adaptive difficulty (surge mode).
+  // NB : ces retries sont DIFFÉRENTS du retry de bootstrap (sealedSender.ts).
+  // Ils gèrent le cas "le serveur réclame une difficulté plus forte" — strictement
+  // interne au protocole PoW, pas une retry de réseau.
+  const MAX_DIFFICULTY_RETRIES = 2;
+
+  for (let attempt = 0; attempt <= MAX_DIFFICULTY_RETRIES; attempt++) {
+    if (signal.aborted) return null;
+
+    if (attempt > 0) {
+      // Retry : toujours recomputer un PoW frais (le précédent a été soumis
+      // et marqué replay-prone côté serveur)
+      const { computeProofOfWork } = await import('./proofOfWork');
+      const recomputeStart = Date.now();
+      pow = await computeProofOfWork(difficulty);
+      if (signal.aborted) return null;
+      __DEV__ && console.log(
+        `[api1to1] ⛏️ PoW re-computed in ${Date.now() - recomputeStart}ms: ` +
+        `nonce=${pow.nonce}, difficulty=${difficulty} (difficulty-retry #${attempt})`
+      );
+    }
+
+    __DEV__ && console.log(
+      `[api1to1] 🔐 Submitting PoW: ts=${pow.timestamp}, age=${Math.round((Date.now() - pow.timestamp) / 1000)}s, nonce=${pow.nonce}, difficulty=${pow.difficulty}`
+    );
+
+    const rpcStart = Date.now();
+    const { data, error } = await secureRpc('get_sealed_certificate', { pow });
+    __DEV__ && console.log(
+      `[api1to1] 🔐 RPC get_sealed_certificate completed in ${Date.now() - rpcStart}ms`
+    );
+
+    if (signal.aborted) return null;
+
+    // ACTION 8: Handle adaptive difficulty — server may require higher PoW during surge
+    if (error && typeof error === 'object' && 'requiredDifficulty' in error) {
+      const serverDifficulty = (error as any).requiredDifficulty;
+      if (
+        typeof serverDifficulty === 'number' &&
+        serverDifficulty > difficulty &&
+        attempt < MAX_DIFFICULTY_RETRIES
+      ) {
+        __DEV__ && console.log(
+          `[api1to1] ⛏️ Server requires difficulty ${serverDifficulty} (surge mode), retrying...`
+        );
+        difficulty = serverDifficulty;
+        continue;
+      }
+    }
+
+    if (error || !data) {
+      __DEV__ && console.warn(
+        '[api1to1] ❌ Failed to get sealed certificate:',
+        (error as any)?.message || error
+      );
+      return null;
+    }
+
+    const totalElapsed = Date.now() - fetcherStartedAt;
+    __DEV__ && console.log(
+      `[api1to1] 🔐 _fetchSealedCertificate SUCCESS in ${totalElapsed}ms`
+    );
+    return data as SenderCertificate;
+  }
+
+  return null;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// CÂBLAGE : injecter le fetcher dans sealedSender.ts UNE SEULE FOIS.
+// Exécuté au module load de api1to1.ts (qui est importé tôt par App.tsx).
+// Aucun risque de duplication : setSealedSenderCertificateFetcher est idempotent
+// (overwrite simple) et api1to1.ts est un module ES qui ne s'exécute qu'une
+// fois grâce au cache Metro.
+// ───────────────────────────────────────────────────────────────────────────
+setSealedSenderCertificateFetcher(_fetchSealedCertificate);
+
+// ════════════════════════════════════════════════════════════════════════════
+// PUBLIC API — Bootstrap orchestration
+// ════════════════════════════════════════════════════════════════════════════
+// Avec la nouvelle architecture, ces fonctions sont de simples ré-exports
+// de sealedSender.ts. Elles existent ici pour préserver la surface d'API
+// publique et éviter de toucher tous les call-sites (App.tsx, screens, etc.).
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Déclenche (ou rejoint) un cycle de bootstrap sealed sender.
+ * Idempotent. Retry interne (3 tentatives, backoff exponentiel, ~15s max).
+ *
+ * @returns true si le sealed sender est opérationnel à la résolution.
+ */
+export function ensureSealedSenderBootstrap(): Promise<boolean> {
+  return _ssEnsureBootstrap();
+}
+
+/**
+ * Force l'abandon du cycle de bootstrap courant. Le prochain
+ * `ensureSealedSenderBootstrap()` redémarrera un cycle propre.
+ *
+ * NB : avec la nouvelle architecture, vous n'avez quasi JAMAIS besoin
+ * d'appeler ça. Le bootstrap se reset automatiquement à la fin de chaque
+ * cycle (succès comme échec). Cette fonction reste exposée pour les cas
+ * où App.tsx veut explicitement casser un cycle (cleanup défensif).
  */
 export function resetSealedSenderBootstrap(): void {
-  _sealedSenderBootstrapStarted = false;
-  _sealedSenderBootstrapPromise = null;
-  _precomputedPowPromise = null;
+  _ssResetBootstrap();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// WAIT FOR SEALED SENDER READY — Observateur passif
+// ════════════════════════════════════════════════════════════════════════════
+// CORRECTIONS APPLIQUÉES VS ANCIENNE VERSION :
+//   BUG #1 (cascade de bootstraps concurrents) — Cette fonction n'appelle
+//   JAMAIS `resetSealedSenderBootstrap()`. Elle ne fait QU'OBSERVER l'état :
+//     - Si déjà ready → fast path
+//     - Sinon → trigger le bootstrap (fire-and-forget, partage promesse)
+//       puis s'abonne à l'état observable.
+//     - Sort sur 'ready', 'failed', timeout, ou abort.
+//
+//   Comme le retry est INTERNE au bootstrap (sealedSender.ts), il n'y a plus
+//   besoin de "maxAttempts" externes. Le paramètre est conservé en interface
+//   pour compat ascendante (ignoré).
+//
+//   AVANT : la modal Cancel + retry interactif déclenchaient des resets qui
+//   tuaient le bootstrap background en vol. APRÈS : Cancel ferme juste la
+//   modal, le bootstrap continue paisiblement, prêt pour le prochain tap.
+//
+// CONTRAT :
+//   Retourne `true` UNIQUEMENT si `isSealedSenderReady()` répond `true` à la
+//   sortie. L'invariant "no send without sealed sender" est préservé.
+//   En cas de `false`, l'appelant DOIT refuser l'envoi (secureRpc fait
+//   défense en profondeur côté gateway).
+// ════════════════════════════════════════════════════════════════════════════
+
+export interface WaitForSealedSenderOptions {
+  /** Budget total max (ms). Default: 30000. */
+  timeoutMs?: number;
+  /**
+   * @deprecated Le retry est désormais interne au bootstrap (sealedSender.ts).
+   *   Conservé pour compat ascendante, ignoré.
+   */
+  maxAttempts?: number;
+  /** Callback appelé à chaque changement d'étape (pour status UI). */
+  onStatus?: (message: string) => void;
+  /** AbortSignal pour annuler proprement (ex: unmount d'écran). */
+  signal?: AbortSignal;
+  /** Messages personnalisés (par défaut, utilise les clés i18n appBoot). */
+  statusMessages?: {
+    connecting?: string;
+    retrying?: string;
+  };
 }
 
 /**
- * Attend que le bootstrap sealed sender soit terminé (PoW + certificat).
- * Boucle avec retries : si le bootstrap échoue, reset et relance.
- * Ne retourne true que quand sealed sender est réellement opérationnel.
- * 
- * @param onStatus - Callback optionnel pour afficher le statut sur le splash
- * @param maxRetries - Nombre max de tentatives (default: 5)
- * @returns true si sealed sender est prêt, false après épuisement des retries
+ * Attend que le sealed sender soit opérationnel.
+ *
+ * @returns `true` si prêt, `false` sinon (timeout, bootstrap failed, ou abort).
+ *
+ * USAGE :
+ * ```ts
+ * const ctrl = new AbortController();
+ * const ready = await waitForSealedSenderReady({
+ *   timeoutMs: 30_000,
+ *   onStatus: setStatusMessage,
+ *   signal: ctrl.signal,
+ * });
+ * if (!ready) {
+ *   // afficher erreur "connexion sécurisée impossible"
+ *   return;
+ * }
+ * // procéder en sachant que SS est prêt
+ * ```
  */
-export async function waitForSealedSender(
-  onStatus?: (msg: string) => void,
-  maxRetries: number = 5
+export async function waitForSealedSenderReady(
+  options: WaitForSealedSenderOptions = {}
 ): Promise<boolean> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    // S'assurer que le bootstrap est lancé
-    const bootstrapPromise = ensureSealedSenderBootstrap();
-    
-    if (attempt === 1) {
-      onStatus?.('Préparation de la connexion sécurisée…');
-    } else {
-      onStatus?.(`Nouvelle tentative de connexion (${attempt}/${maxRetries})…`);
-      __DEV__ && console.log(`[api1to1] 🔄 Sealed sender bootstrap retry ${attempt}/${maxRetries}`);
+  const { timeoutMs = 30_000, onStatus, signal, statusMessages } = options;
+
+  // Fast path : déjà prêt → retour immédiat, aucun side-effect
+  if (isSealedSenderReady()) return true;
+
+  // Abort déjà signalé : sortie immédiate
+  if (signal?.aborted) return false;
+
+  // Déclenche le bootstrap (idempotent : partage la promesse en cours s'il y en a une).
+  // Fire-and-forget : on ne consomme PAS la promesse ici, on observe l'état.
+  // Cela permet d'unifier le path "déjà en cours en background" et "à déclencher".
+  ensureSealedSenderBootstrap().catch(() => {
+    /* errors are reflected in observable state */
+  });
+
+  const connectingMsg =
+    statusMessages?.connecting ?? i18n.t('appBoot.preparingSecureConnection');
+  onStatus?.(connectingMsg);
+
+  return new Promise<boolean>((resolve) => {
+    let resolved = false;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    let unsubscribe: (() => void) | null = null;
+    let abortHandler: (() => void) | null = null;
+    let firstEmit = true;
+
+    const finish = (value: boolean) => {
+      if (resolved) return;
+      resolved = true;
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+      }
+      if (unsubscribe) {
+        try { unsubscribe(); } catch { /* noop */ }
+        unsubscribe = null;
+      }
+      if (abortHandler && signal) {
+        try { signal.removeEventListener('abort', abortHandler); } catch { /* noop */ }
+        abortHandler = null;
+      }
+      resolve(value);
+    };
+
+    // Timeout global
+    timeoutHandle = setTimeout(() => {
+      __DEV__ && console.warn(
+        `[api1to1] ⏱️ waitForSealedSenderReady timeout after ${Math.round(timeoutMs / 1000)}s`
+      );
+      finish(false);
+    }, timeoutMs);
+
+    // Abort
+    if (signal) {
+      abortHandler = () => finish(false);
+      signal.addEventListener('abort', abortHandler, { once: true });
     }
-    
-    const result = await bootstrapPromise;
-    
-    if (result && isSealedSenderReady()) {
-      __DEV__ && console.log(`[api1to1] ✅ Sealed sender ready (attempt ${attempt})`);
-      return true;
-    }
-    
-    // Bootstrap a échoué — reset pour permettre un nouveau cycle
-    if (attempt < maxRetries) {
-      __DEV__ && console.warn(`[api1to1] ⚠️ Sealed sender bootstrap failed (attempt ${attempt}/${maxRetries}), retrying...`);
-      resetSealedSenderBootstrap();
-      precomputePoW(); // Relancer le PoW aussi
-      await new Promise(r => setTimeout(r, 2000)); // Pause 2s entre retries
-    }
-  }
-  
-  __DEV__ && console.error(`[api1to1] ❌ Sealed sender bootstrap FAILED after ${maxRetries} attempts`);
-  return false;
+
+    // Observe l'état du sealed sender. La fonction subscribe émet
+    // immédiatement l'état courant ; on l'ignore (déjà checké via le fast
+    // path isSealedSenderReady ci-dessus) et on n'agit que sur les
+    // transitions SUIVANTES.
+    unsubscribe = subscribeSealedSenderState((state) => {
+      if (firstEmit) {
+        firstEmit = false;
+        // Le bootstrap vient d'être déclenché → l'état devrait être
+        // 'bootstrapping' à ce point. On n'a rien à faire, on attend.
+        return;
+      }
+
+      if (state === 'ready' && isSealedSenderReady()) {
+        finish(true);
+      } else if (state === 'failed') {
+        __DEV__ && console.warn('[api1to1] waitForSealedSenderReady: state → failed');
+        finish(false);
+      }
+      // 'bootstrapping' (retry interne) ou 'idle' (clearSealedSenderState
+      // pendant l'attente) → on continue d'attendre. En cas de 'idle', le
+      // timeout finira par fire ou un nouveau bootstrap repassera à
+      // 'bootstrapping' puis 'ready'.
+    });
+  });
 }
 
-// ============================================
-// v25.1: SESSION-TARGETED DECOY
-// ============================================
-//
-// Pendant le drain de chunks média, les decoys interleaved sont envoyés
-// au MÊME tag de session que les chunks réels. Le serveur ne peut plus
-// distinguer les decoys des vrais chunks par le tag de routage.
-//
-// Le destinataire reçoit le message, tente le déchiffrement Triple Ratchet,
-// échoue (ciphertext aléatoire) → drop silencieux. Le ratchet n'avance pas
-// sur un échec de déchiffrement (lecture seule des chaînes de réception).
-//
-// AVANT: 37 chunks → tag X, 13 decoys → tags uniques → 100% distinguable
-// APRÈS: 37 chunks → tag X, 13 decoys → tag X aussi → 0% distinguable
-//
-
-async function sendSessionDecoy(sessionId: string): Promise<void> {
-  try {
-    const session = sessionService.getSession(sessionId);
-    if (!session) return;
-    
-    // Obtenir le vrai tag de session (identique à celui des chunks)
-    const tag = getSessionTag(session);
-    
-    // Générer un payload medium-tier (même taille que les chunks)
-    const payload = generateSizedPayload('medium');
-    
-    // Emballer dans une enveloppe sealed sender avec le VRAI tag
-    if (!isSealedSenderReady()) return;
-    const envelope = createSealedSenderEnvelope(tag, payload);
-    
-    await secureRpc('send_sealed_message', {
-      p_tag: envelope.tag,
-      p_sealed_content: envelope.sealedContent,
-      p_version: envelope.version,
-      p_push_blob: generateRandomPushBlob(),
-    });
-    
-    __DEV__ && console.log('[api1to1] 👻🎯 Session-targeted decoy sent to', sessionId.slice(0, 8) + '...');
-    
-  } catch (e) {
-    // Decoy failures are silent
-  }
+// ════════════════════════════════════════════════════════════════════════════
+// LEGACY WRAPPER — `waitForSealedSender(onStatus?, maxRetries?)` pour App.tsx
+// ════════════════════════════════════════════════════════════════════════════
+// Conservé pour ne pas toucher tous les call-sites d'App.tsx d'un coup.
+// Wrapper trivial autour d'`ensureSealedSenderBootstrap`. Les paramètres
+// `onStatus` et `maxRetries` sont conservés mais largement vestigiaux :
+//   - onStatus : émet un seul status au début
+//   - maxRetries : IGNORÉ — le retry est interne au bootstrap
+// ════════════════════════════════════════════════════════════════════════════
+export async function waitForSealedSender(
+  onStatus?: (msg: string) => void,
+  _maxRetries: number = 5  // eslint-disable-line @typescript-eslint/no-unused-vars
+): Promise<boolean> {
+  if (isSealedSenderReady()) return true;
+  if (onStatus) onStatus(i18n.t('appBoot.preparingSecureConnection'));
+  return ensureSealedSenderBootstrap();
 }
 
 export function startGlobalPolling1to1(): void {
   if (globalPollState.isRunning) return;
-  
+
   globalPollState.isRunning = true;
   __DEV__ && console.log('[api1to1] 🌍 Starting global polling + constant-rate traffic');
-  
-  // PERF A1: Ne re-bootstrapper que si le certificat est expiré ou absent.
-  // Au retour de background, le certificat peut encore être valide (conservé en mémoire
-  // par la suppression du resetSealedSenderBootstrap dans stop). Cela économise 2-5s
-  // de PoW + RPC OHTTP à chaque retour d'app.
-  if (!isSealedSenderReady()) {
+
+  // ════════════════════════════════════════════════════════════════════════
+  // ORDONNANCEMENT COLD START — Bootstrap AVANT polling pour libérer le PoW
+  // ════════════════════════════════════════════════════════════════════════
+  // CONTEXTE :
+  //   Sur Hermes (RN), le SHA-256 itératif du PoW est 3-10× plus lent que
+  //   sur V8. Si on lance les polls (constant traffic + global poll + push
+  //   token) en même temps que le bootstrap sealed sender, chaque poll
+  //   (~150-300ms de CPU JS + AsyncStorage + crypto OHTTP) interrompt le
+  //   PoW via les setTimeout(0) yields. Résultat : un PoW qui devrait
+  //   prendre 5-7s prend 30-60s, et waitForSealedSenderReady time out.
+  //
+  // SOLUTION :
+  //   On lance le bootstrap IMMÉDIATEMENT, mais on défère le polling
+  //   jusqu'à ce que SS soit prêt (état 'ready') OU 12s écoulées —
+  //   selon ce qui arrive en premier. Pendant cette fenêtre, le PoW a
+  //   un CPU largement déchargé et complete en ~3-6s même sur Hermes.
+  //
+  // IMPACT SÉCURITÉ — ZÉRO :
+  //   • Le polling sert UNIQUEMENT à découvrir les messages entrants.
+  //     Différer de 5-12s ne crée aucune faille (les messages restent
+  //     côté gateway, on les récupère au prochain poll).
+  //   • Aucune obligation cryptographique de polling continu.
+  //   • L'inviteWatcher fonctionne sur son propre timer indépendant
+  //     (démarré par App.tsx) et continue normalement.
+  //
+  // IMPACT UX :
+  //   • L'utilisateur voit ses conversations en RAM instantanément
+  //     (déjà chargées par sessionService.initialize).
+  //   • Les nouveaux messages arrivent avec 5-12s de retard au cold
+  //     start (acceptable, on est en train de finaliser l'auth).
+  //   • Les retours de background : si SS est déjà ready, polling
+  //     démarre immédiatement (path else ci-dessous). Aucune régression.
+  // ════════════════════════════════════════════════════════════════════════
+
+  const needsBootstrap = !isSealedSenderReady();
+
+  if (needsBootstrap) {
     __DEV__ && console.log('[api1to1] 🛡️ Sealed sender expired/absent — bootstrapping...');
     ensureSealedSenderBootstrap();
   } else {
     __DEV__ && console.log('[api1to1] 🛡️ Sealed sender still valid — skipping bootstrap');
   }
-  
-  // Démarrer le constant-rate traffic en arrière-plan
-  // 1 decoy par slot (~30s), poll toutes les ~45s
-  startConstantTraffic(
-    () => sendSingleDecoy(),            // Decoy normal (70% small, 30% medium)
-    () => performGlobalPoll(),           // Fonction poll (récupère les messages)
-    () => sendSingleDecoyMediumTier()    // v25.0: Decoy medium-tier pour interleaving chunks
-    // v25.2: session-targeted decoys retirés — causaient des erreurs de
-    // déchiffrement chez le destinataire (ratchet tentait de décrypter du random)
-  );
-  
-  // Premier poll immédiat
-  performGlobalPoll();
-  
-  // v28.0: Charger les préférences de mute des pairs (pour le push blob routing)
-  loadPeerMutePreferences().catch(() => {});
-  
-  // Push notifications: envoyer notre token aux pairs via E2E
-  sendPushTokenToAllPeers().catch(() => {});
+
+  const launchPollingActivity = () => {
+    // Re-check au moment du lancement : si stopGlobalPolling1to1 a été appelé
+    // entre-temps (background app), on ne démarre pas le traffic.
+    if (!globalPollState.isRunning) {
+      __DEV__ && console.log('[api1to1] 🌍 Polling activity cancelled before launch');
+      return;
+    }
+
+    // Démarrer le constant-rate traffic en arrière-plan
+    // 1 decoy par slot (~30s), poll toutes les ~45s
+    startConstantTraffic(
+      () => sendSingleDecoy(),            // Decoy normal (70% small, 30% medium)
+      () => performGlobalPoll(),           // Fonction poll (récupère les messages)
+      () => sendSingleDecoyMediumTier()    // v25.0: Decoy medium-tier pour interleaving chunks
+    );
+
+    // Premier poll immédiat
+    performGlobalPoll();
+
+    // v28.0: Charger les préférences de mute des pairs (pour le push blob routing)
+    loadPeerMutePreferences().catch(() => {});
+
+    // Push notifications: envoyer notre token aux pairs via E2E
+    sendPushTokenToAllPeers().catch(() => {});
+  };
+
+  if (needsBootstrap) {
+    // Défère le démarrage du polling jusqu'à la résolution du bootstrap
+    // (ou 12s, le premier des deux) pour ne pas starver le PoW sur Hermes.
+    const POLLING_DEFER_MAX_MS = 12_000;
+    const deferStartedAt = Date.now();
+    let launched = false;
+
+    const launchOnce = (reason: string) => {
+      if (launched) return;
+      launched = true;
+      const elapsed = Date.now() - deferStartedAt;
+      __DEV__ && console.log(
+        `[api1to1] 🌍 Launching deferred polling activity (${reason}, deferred ${elapsed}ms)`
+      );
+      launchPollingActivity();
+    };
+
+    // Observateur : dès que SS atteint 'ready' OU 'failed', on lance le polling.
+    // Plus de raison de différer une fois le bootstrap terminé (succès ou échec).
+    const unsubscribe = subscribeSealedSenderState((state) => {
+      if (state === 'ready' || state === 'failed') {
+        try { unsubscribe(); } catch { /* noop */ }
+        launchOnce(state === 'ready' ? 'ss-ready' : 'ss-failed');
+      }
+    });
+
+    // Filet de sécurité : si le bootstrap est anormalement lent (>12s),
+    // on lance le polling quand même. On ne veut pas bloquer la réception
+    // de messages indéfiniment sur un PoW mort.
+    setTimeout(() => {
+      try { unsubscribe(); } catch { /* noop */ }
+      launchOnce('defer-timeout');
+    }, POLLING_DEFER_MAX_MS);
+  } else {
+    // SS déjà prêt (cas warm reopen) → démarrer le polling immédiatement.
+    launchPollingActivity();
+  }
 }
 
 /**

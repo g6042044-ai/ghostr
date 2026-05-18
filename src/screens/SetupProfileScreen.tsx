@@ -1,36 +1,58 @@
 // src/screens/SetupProfileScreen.tsx
 // Modern identity creation — full-screen layout, elements fill space when keyboard closed
 
-import React, { useState, useRef, useEffect } from 'react';
-import {
-  View, Text, StyleSheet, TextInput, KeyboardAvoidingView, Platform,
-  Image, TouchableOpacity, Animated, Alert, ActivityIndicator, StatusBar,
-  Keyboard,
-} from 'react-native';
+import { useState, useRef, useEffect } from 'react';
+import { View, Text, StyleSheet, TextInput, KeyboardAvoidingView, Platform, Image, TouchableOpacity, Animated, Alert, ActivityIndicator, StatusBar, Keyboard, BackHandler } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useTranslation } from 'react-i18next';
 import * as ImagePicker from 'expo-image-picker';
-import * as ImageManipulator from 'expo-image-manipulator';
 import { suppressLock, releaseLock } from '../services/lockGuard';
+import { ensureCameraPermission, ensureMediaLibraryPermission } from '../services/permissions';
 import { setGlobalDisplayName, setGlobalAvatar } from '../services/storage';
 import { sessionService } from '../services/tripleRatchet';
-import { theme, Button } from '../components/ui';
+import { Button, useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
+import { ImageCropper } from '../components/ImageCropper';
 import { AVATAR_COLORS } from '../services/crypto';
 import { Ionicons } from '@expo/vector-icons';
 import { SplashScreen } from './SplashScreen';
 
-interface SetupProfileScreenProps { onComplete: () => void; }
+interface SetupProfileScreenProps {
+  onComplete: () => void;
+  /**
+   * Callback optionnel pour revenir au WelcomeScreen.
+   * Quand fourni, un bouton retour discret apparaît en haut à gauche.
+   * Non fourni → pas de bouton retour (ex: si l'utilisateur a déjà créé
+   * un compte et arrive ici via une autre route).
+   *
+   * UX : on autorise le retour sur l'écran d'initialisation pour permettre
+   * à l'utilisateur de relire le carrousel d'onboarding s'il a cliqué trop
+   * vite. Aucune donnée n'est encore persistée à ce stade — pas de risque
+   * de perte. Le retour matériel Android est aussi câblé sur ce callback.
+   */
+  onBack?: () => void;
+}
 
 const AVATAR_FULL = 120;
 const AVATAR_SMALL = 72;
 
-export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
+export function SetupProfileScreen({ onComplete, onBack }: SetupProfileScreenProps) {
   const insets = useSafeAreaInsets();
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
   const [displayName, setDisplayName] = useState('');
   const [avatarUri, setAvatarUri] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [processingImage, setProcessingImage] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [kbVisible, setKbVisible] = useState(false);
+
+  // ─── In-app cropper state ──────────────────────────────────────────────────
+  // Replaces ImagePicker's `allowsEditing: true` OS editor (poor contrast on
+  // dark images, especially on Android OEM skins). When non-null, the cropper
+  // modal is mounted with sourceUri and intercepts UI until confirm/cancel.
+  const [cropperSource, setCropperSource] = useState<string | null>(null);
+  const [cropperVisible, setCropperVisible] = useState(false);
 
   const avatarSizeAnim = useRef(new Animated.Value(AVATAR_FULL)).current;
   const headerOpacity = useRef(new Animated.Value(1)).current;
@@ -39,6 +61,23 @@ export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
   useEffect(() => {
     Animated.timing(contentOpacity, { toValue: 1, duration: 400, useNativeDriver: true }).start();
   }, []);
+
+  // ════════════════════════════════════════════════════════════════════════
+  // RETOUR MATÉRIEL ANDROID
+  // ════════════════════════════════════════════════════════════════════════
+  // Si onBack est fourni → on l'invoque (retour vers WelcomeScreen).
+  // Sinon → on bloque (true) pour empêcher la sortie accidentelle de l'app
+  // au milieu de l'init du profil.
+  // Pendant un loading/processingImage critique, on bloque toujours.
+  // ════════════════════════════════════════════════════════════════════════
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (loading || processingImage) return true;  // bloqué pendant les ops cryptos
+      if (onBack) { onBack(); return true; }
+      return true;  // pas de onBack → on bloque la sortie de l'app
+    });
+    return () => sub.remove();
+  }, [loading, processingImage, onBack]);
 
   // Keyboard listeners — shrink avatar, hide decorative text
   useEffect(() => {
@@ -74,60 +113,82 @@ export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
     for (let i = 0; i < name.length; i++) h = ((h << 5) - h) + name.charCodeAt(i);
     return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
   };
-  const processImage = async (uri: string): Promise<string> => {
-    const compressed = await ImageManipulator.manipulateAsync(
-      uri,
-      [{ resize: { width: 120, height: 120 } }],
-      { compress: 0.3, format: ImageManipulator.SaveFormat.JPEG, base64: true }
-    );
-    return `data:image/jpeg;base64,${compressed.base64}`;
-  };
+  // processImage() has been removed: the in-app ImageCropper now handles the
+  // resize → JPEG-compress → base64 pipeline as part of confirm(), so the
+  // value passed to setAvatarUri is already a ready-to-store data: URI.
 
+  // ─── Photo ──
+  // After picking, we open our in-app ImageCropper (which has the contrast
+  // controls + rotate/flip our code controls). `allowsEditing: false` skips
+  // the OS native editor that produced the readability issue.
+  // We request `quality: 1` so the cropper sees a clean image; final
+  // compression happens in the cropper's confirm step (matches the previous
+  // 120×120 @ 0.3 JPEG pipeline byte-for-byte).
   const handlePickGallery = async () => {
+    // PERM FIX : le service gère suppressLock/releaseLock + Alert + Settings.
+    const perm = await ensureMediaLibraryPermission();
+    if (perm.status !== 'granted') return;
+
     suppressLock();
     try {
-      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (status !== 'granted') { Alert.alert('Permission requise', "Autorisez l'accès à la galerie."); return; }
       setProcessingImage(true);
       const r = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["images"], allowsEditing: true, aspect: [1, 1], quality: 0.1,
+        mediaTypes: ["images"], allowsEditing: false, quality: 1,
       });
       if (!r.canceled && r.assets[0]) {
-        setAvatarUri(await processImage(r.assets[0].uri));
+        // Hand off to in-app cropper. State updates batch into one render so
+        // the cropper modal opens in the same frame that processingImage
+        // clears — no visible gap.
+        setCropperSource(r.assets[0].uri);
+        setCropperVisible(true);
       }
     } catch {
     } finally { setProcessingImage(false); releaseLock(); }
   };
   const handleTakePhoto = async () => {
+    // PERM FIX : voir handlePickGallery.
+    const perm = await ensureCameraPermission();
+    if (perm.status !== 'granted') return;
+
     suppressLock();
     try {
-      const { status } = await ImagePicker.requestCameraPermissionsAsync();
-      if (status !== 'granted') { Alert.alert('Permission requise', "Autorisez l'accès à la caméra."); return; }
       setProcessingImage(true);
       const r = await ImagePicker.launchCameraAsync({
-        allowsEditing: true, aspect: [1, 1], quality: 0.1,
+        allowsEditing: false, quality: 1,
       });
       if (!r.canceled && r.assets[0]) {
-        setAvatarUri(await processImage(r.assets[0].uri));
+        setCropperSource(r.assets[0].uri);
+        setCropperVisible(true);
       }
     } catch {
     } finally { setProcessingImage(false); releaseLock(); }
   };
+  const handleCropConfirm = (dataUri: string) => {
+    // dataUri is a fully-processed `data:image/jpeg;base64,…` ready to store.
+    setCropperVisible(false);
+    setCropperSource(null);
+    setAvatarUri(dataUri);
+  };
+  const handleCropCancel = () => {
+    setCropperVisible(false);
+    setCropperSource(null);
+    // Avatar state unchanged — same UX as cancelling the OS editor before.
+  };
   const handleAvatarPress = () => {
     Keyboard.dismiss();
-    Alert.alert('Photo de profil', undefined, [
-      { text: 'Annuler', style: 'cancel' },
-      { text: 'Prendre une photo', onPress: handleTakePhoto },
-      { text: 'Choisir dans la galerie', onPress: handlePickGallery },
-      avatarUri ? { text: 'Supprimer', onPress: () => setAvatarUri(null), style: 'destructive' } : null,
+    Alert.alert(t('setupProfile.photoOptions'), undefined, [
+      { text: t('common.cancel'), style: 'cancel' },
+      { text: t('setupProfile.takePhoto'), onPress: handleTakePhoto },
+      { text: t('setupProfile.chooseGallery'), onPress: handlePickGallery },
+      avatarUri ? { text: t('setupProfile.removePhoto'), onPress: () => setAvatarUri(null), style: 'destructive' } : null,
     ].filter(Boolean) as any);
   };
 
   const handleContinue = async () => {
     Keyboard.dismiss();
     const trimmed = displayName.trim();
-    if (!trimmed) { setError('Veuillez entrer un pseudo'); return; }
-    if (trimmed.length < 2) { setError('Minimum 2 caractères'); return; }
+    if (!trimmed) { setError(t('setupProfile.errorEnterName')); return; }
+    if (trimmed.length < 2) { setError(t('setupProfile.errorMinChars')); return; }
     setLoading(true); setError(null);
     await new Promise<void>(resolve => setTimeout(resolve, 80));
     try {
@@ -135,19 +196,49 @@ export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
       if (avatarUri) await setGlobalAvatar(avatarUri);
       await sessionService.updateMyProfileDirect({ displayName: trimmed, avatarBase64: avatarUri || undefined });
       onComplete();
-    } catch (e) { console.error('[SetupProfile] Error:', e); setError('Erreur lors de la sauvegarde'); setLoading(false); }
+    } catch (e) { console.error('[SetupProfile] Error:', e); setError(t('setupProfile.errorSaveFailed')); setLoading(false); }
   };
 
   const canContinue = displayName.trim().length > 0 && !loading && !processingImage;
   const remaining = 30 - displayName.length;
 
   // Full-screen loading states
-  if (processingImage) return <SplashScreen statusMessage="Traitement de la photo…" />;
-  if (loading) return <SplashScreen statusMessage="Création de votre profil…" />;
+  if (processingImage) return <SplashScreen statusMessage={t('setupProfile.processingPhoto')} />;
+  if (loading) return <SplashScreen statusMessage={t('setupProfile.creatingProfile')} />;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
+
+      {/* ═══════════════════════════════════════════════════════════════════
+          BOUTON RETOUR — uniquement si onBack est fourni ET clavier fermé
+          ═══════════════════════════════════════════════════════════════════
+          Discret, en haut à gauche. Désactivé pendant loading/processing
+          pour éviter un retour pendant la création du profil (qui sauvegarde
+          en chiffré + register KT). hitSlop élargi pour le confort tactile.
+          Masqué quand le clavier est ouvert pour ne pas entrer en conflit
+          visuel avec l'avatar réduit. */}
+      {onBack && !kbVisible && (
+        <TouchableOpacity
+          style={[styles.backButton, { top: insets.top + 8 }]}
+          onPress={() => {
+            if (loading || processingImage) return;
+            Keyboard.dismiss();
+            onBack();
+          }}
+          disabled={loading || processingImage}
+          hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          accessibilityLabel={t('common.back')}
+          accessibilityRole="button"
+        >
+          <Ionicons
+            name="chevron-back"
+            size={26}
+            color={(loading || processingImage) ? colors.textMuted : colors.text}
+          />
+        </TouchableOpacity>
+      )}
+
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
@@ -161,8 +252,8 @@ export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
           <Animated.View style={[styles.header, { opacity: headerOpacity }]}>
             {!kbVisible && (
               <>
-                <Text style={styles.stepLabel}>VOTRE PROFIL</Text>
-                <Text style={styles.title}>Créez votre identité</Text>
+                <Text style={styles.stepLabel}>{t('setupProfile.stepLabel')}</Text>
+                <Text style={styles.title}>{t('setupProfile.title')}</Text>
               </>
             )}
           </Animated.View>
@@ -182,11 +273,11 @@ export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
                 alignItems: 'center',
                 justifyContent: 'center',
                 borderWidth: 3,
-                borderColor: theme.colors.primary,
+                borderColor: colors.primary,
                 backgroundColor: avatarUri ? 'transparent' : getAvatarColor(displayName),
               }}>
                 {processingImage ? (
-                  <ActivityIndicator size="large" color={theme.colors.primary} />
+                  <ActivityIndicator size="large" color={colors.primary} />
                 ) : avatarUri ? (
                   <Image source={{ uri: avatarUri }} style={StyleSheet.absoluteFill} resizeMode="cover" />
                 ) : (
@@ -201,7 +292,7 @@ export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
             </TouchableOpacity>
             <Animated.View style={{ opacity: headerOpacity }}>
               {!kbVisible && (
-                <Text style={styles.avatarHint}>Appuyez pour ajouter une photo</Text>
+                <Text style={styles.avatarHint}>{t('setupProfile.tapToAddPhoto')}</Text>
               )}
             </Animated.View>
           </View>
@@ -212,9 +303,9 @@ export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
               <TextInput
                 style={styles.input}
                 value={displayName}
-                onChangeText={t => { setDisplayName(t); setError(null); }}
-                placeholder="Votre pseudo"
-                placeholderTextColor={theme.colors.placeholder}
+                onChangeText={(txt) => { setDisplayName(txt); setError(null); }}
+                placeholder={t('setupProfile.namePlaceholder')}
+                placeholderTextColor={colors.placeholder}
                 maxLength={30}
                 returnKeyType="done"
                 blurOnSubmit
@@ -225,11 +316,11 @@ export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
             </View>
             {error && <Text style={styles.errorText}>{error}</Text>}
             <Animated.View style={{ opacity: headerOpacity }}>
-              {!kbVisible && <Text style={styles.inputHint}>Ce pseudo sera visible par vos contacts</Text>}
+              {!kbVisible && <Text style={styles.inputHint}>{t('setupProfile.nameVisibleHint')}</Text>}
             </Animated.View>
 
             <View style={styles.buttonWrap}>
-              <Button title="Continuer" onPress={handleContinue} variant="primary" size="large" fullWidth loading={loading} disabled={!canContinue} />
+              <Button title={t('setupProfile.continue')} onPress={handleContinue} variant="primary" size="large" fullWidth loading={loading} disabled={!canContinue} />
             </View>
           </View>
 
@@ -241,17 +332,46 @@ export function SetupProfileScreen({ onComplete }: SetupProfileScreenProps) {
         {/* Footer */}
         {!kbVisible && (
           <View style={[styles.footer, { paddingBottom: insets.bottom + 20 }]}>
-            <Text style={styles.footerText}>Chiffrement de bout en bout</Text>
+            <Text style={styles.footerText}>{t('setupProfile.endToEndFooter')}</Text>
           </View>
         )}
       </KeyboardAvoidingView>
+
+      {/* ─── In-app cropper ─── replaces the OS native image editor.
+          Mounted as a sibling so it overlays the entire screen when
+          visible. When sourceUri is null and visible is false, it returns
+          early and renders nothing. */}
+      <ImageCropper
+        visible={cropperVisible}
+        sourceUri={cropperSource}
+        onConfirm={handleCropConfirm}
+        onCancel={handleCropCancel}
+      />
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: theme.colors.background },
+const makeStyles = (colors: ColorPalette) => ({
+  container: { flex: 1, backgroundColor: colors.background },
   flex: { flex: 1 },
+
+  // Bouton retour — positionnement absolu pour ne pas perturber le flex layout
+  // existant (topSpacer flex: 2, bottomSpacer flex: 3). z-index élevé pour
+  // rester au-dessus de l'avatar et du formulaire en cas de chevauchement
+  // sur petit écran.
+  backButton: {
+    position: 'absolute',
+    left: 12,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: colors.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 10,
+    elevation: 3,
+  },
+
   mainContent: {
     flex: 1,
     paddingHorizontal: 32,
@@ -269,11 +389,11 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
   },
   stepLabel: {
-    fontSize: 12, fontWeight: '700', color: theme.colors.primary,
+    fontSize: 12, fontWeight: '700', color: colors.primary,
     letterSpacing: 1.5, marginBottom: 8,
   },
   title: {
-    fontSize: 26, fontWeight: '700', color: theme.colors.text,
+    fontSize: 26, fontWeight: '700', color: colors.text,
     textAlign: 'center', letterSpacing: -0.5,
   },
 
@@ -285,15 +405,15 @@ const styles = StyleSheet.create({
   cameraBadge: {
     position: 'absolute', bottom: 2, right: 2,
     width: 36, height: 36, borderRadius: 18,
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
     alignItems: 'center', justifyContent: 'center',
-    borderWidth: 3, borderColor: theme.colors.background,
+    borderWidth: 3, borderColor: colors.background,
   },
   cameraBadgeSmall: {
     width: 26, height: 26, borderRadius: 13, bottom: 0, right: 0,
   },
   avatarHint: {
-    fontSize: 13, color: theme.colors.textMuted, marginTop: 12,
+    fontSize: 13, color: colors.textMuted, marginTop: 12,
   },
   avatarInitials: {
     fontSize: 42, fontWeight: '600', color: '#FFF', letterSpacing: 1,
@@ -308,22 +428,22 @@ const styles = StyleSheet.create({
   },
   inputRow: {
     flexDirection: 'row', alignItems: 'center',
-    backgroundColor: theme.colors.surface,
-    borderRadius: 14, borderWidth: 1.5, borderColor: theme.colors.border,
+    backgroundColor: colors.surface,
+    borderRadius: 14, borderWidth: 1.5, borderColor: colors.border,
     paddingRight: 14,
   },
   inputRowError: {
-    borderColor: theme.colors.danger,
+    borderColor: colors.danger,
   },
   input: {
     flex: 1, paddingHorizontal: 18,
     paddingVertical: Platform.OS === 'ios' ? 16 : 14,
-    fontSize: 17, color: theme.colors.text,
+    fontSize: 17, color: colors.text,
   },
-  counter: { fontSize: 12, color: theme.colors.textMuted, fontWeight: '500' },
-  counterWarn: { color: theme.colors.warning },
-  errorText: { fontSize: 13, color: theme.colors.danger, marginTop: 8, marginLeft: 4 },
-  inputHint: { fontSize: 13, color: theme.colors.textMuted, marginTop: 8, marginLeft: 4 },
+  counter: { fontSize: 12, color: colors.textMuted, fontWeight: '500' },
+  counterWarn: { color: colors.warning },
+  errorText: { fontSize: 13, color: colors.danger, marginTop: 8, marginLeft: 4 },
+  inputHint: { fontSize: 13, color: colors.textMuted, marginTop: 8, marginLeft: 4 },
   buttonWrap: {
     marginTop: 24,
   },
@@ -334,8 +454,8 @@ const styles = StyleSheet.create({
     paddingTop: 8,
   },
   footerText: {
-    fontSize: 13, fontWeight: '500', color: theme.colors.primary, opacity: 0.6,
+    fontSize: 13, fontWeight: '500', color: colors.primary, opacity: 0.6,
   },
-});
+}) as const;
 
 export default SetupProfileScreen;

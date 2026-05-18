@@ -20,11 +20,10 @@
       "bundleIdentifier": "com.ghostr.app",
       "buildNumber": "1",
       "infoPlist": {
-        "NSCameraUsageDescription": "Ghostr uses the camera to scan QR codes for joining conversations and verifying safety numbers.",
-        "NSFaceIDUsageDescription": "Use Face ID to unlock Ghostr",
-        "NSMicrophoneUsageDescription": "Ghostr needs microphone access for voice calls.",
-        "NSPhotoLibraryUsageDescription": "Ghostr needs access to your photos to send images in conversations.",
-        "NSPhotoLibraryAddUsageDescription": "Ghostr needs permission to save images to your photo library.",
+        "NSCameraUsageDescription": "Ghostr uses the camera so you can scan a contact's QR code to start an encrypted conversation, scan a safety number to verify a contact's identity, take a photo to send inside a conversation (for example, sharing a picture with a friend), and set or update your profile picture.",
+        "NSMicrophoneUsageDescription": "Ghostr uses the microphone so you can make end-to-end encrypted voice calls with your contacts and record voice messages to send inside a conversation.",
+        "NSPhotoLibraryUsageDescription": "Ghostr accesses your photo library when you choose to send an image inside a conversation, for example sharing a vacation picture with a friend, or when you select an image as your profile picture.",
+        "NSPhotoLibraryAddUsageDescription": "Ghostr saves images to your photo library when you tap Save on a photo you received in a conversation, so you can keep it on your device.",
         "UIBackgroundModes": [
           "audio",
           "remote-notification"
@@ -34,7 +33,10 @@
       "entitlements": {
         "aps-environment": "production",
         "com.apple.developer.usernotifications.time-sensitive": true
-      }
+      },
+      "associatedDomains": [
+        "applinks:theghostr.com"
+      ]
     },
     "android": {
       "softwareKeyboardLayoutMode": "resize",
@@ -51,20 +53,46 @@
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.WRITE_EXTERNAL_STORAGE",
         "android.permission.READ_MEDIA_IMAGES",
-        "android.permission.VIBRATE",
-        "android.permission.USE_BIOMETRIC",
-        "android.permission.USE_FINGERPRINT",
-        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
-        "android.permission.ACCESS_MEDIA_LOCATION",
         "android.permission.READ_MEDIA_VIDEO",
         "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.ACCESS_MEDIA_LOCATION",
+        "android.permission.VIBRATE",
         "android.permission.MODIFY_AUDIO_SETTINGS",
-        "android.permission.USE_FULL_SCREEN_INTENT",
         "android.permission.POST_NOTIFICATIONS",
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_PHONE_CALL",
-        "android.permission.WAKE_LOCK",
-        "android.permission.DISABLE_KEYGUARD"
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "android.permission.WAKE_LOCK"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "https",
+              "host": "theghostr.com",
+              "pathPrefix": "/i"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        },
+        {
+          "action": "VIEW",
+          "data": [
+            {
+              "scheme": "ghostr"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
       ]
     },
     "plugins": [
@@ -81,41 +109,32 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Allow Ghostr to access your camera for QR code scanning."
+          "cameraPermission": "Ghostr uses the camera to scan QR codes for joining conversations and verifying contacts, to take photos you choose to send inside a conversation, and to set or update your profile picture."
         }
       ],
       [
         "expo-media-library",
         {
-          "photosPermission": "Allow Ghostr to access your photos to share images.",
-          "savePhotosPermission": "Allow Ghostr to save images to your photo library.",
+          "photosPermission": "Ghostr accesses your photos when you choose to send an image inside a conversation or set a profile picture.",
+          "savePhotosPermission": "Ghostr saves images to your photo library when you tap Save on a photo received in a conversation.",
           "isAccessMediaLocationEnabled": true
         }
       ],
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow Ghostr to access your photos to send images in conversations."
+          "photosPermission": "Ghostr accesses your photos when you choose to send an image inside a conversation or set a profile picture."
         }
       ],
       [
         "expo-av",
         {
-          "microphonePermission": "Allow Ghostr to access your microphone for voice calls."
-        }
-      ],
-      [
-        "expo-local-authentication",
-        {
-          "faceIDPermission": "Allow Ghostr to use Face ID to unlock the app."
+          "microphonePermission": "Ghostr uses the microphone for end-to-end encrypted voice calls and to record voice messages you send inside a conversation."
         }
       ],
       "expo-secure-store",
-      "expo-font",
-      "@siteed/expo-audio-studio",
       "@mykin-ai/expo-audio-stream",
       "./plugins/withRingbackTone",
-      "./plugins/withIncomingCallFix",
       "./plugins/withCallNotification",
       "./plugins/withInsistentRingtone",
       "./plugins/withSpeakerRoute"
@@ -124,6 +143,7 @@
       "eas": {
         "projectId": "ef1bbfeb-0938-4269-94b6-891e6f15053a"
       }
-    }
+    },
+    "scheme": "ghostr"
   }
 }

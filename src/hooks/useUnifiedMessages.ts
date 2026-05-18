@@ -6,32 +6,9 @@
 
 import * as React from 'react';
 import { sessionService, StoredSession } from '../services/tripleRatchet';
-import {
-  sendMessage1to1,
-  sendReaction1to1,
-  sendReadReceipt1to1,
-  fetchMessages1to1,
-  subscribe1to1,
-  getLocalMessages1to1,
-  clearLocalMessages1to1,
-  clearUnreadCount,
-  onStatusChange,
-  onReaction,
-  pollAllSessions,
-  Message1to1,
-  loadReactions,
-  toggleReactionStorage,
-  StoredReaction,
-  retryFailedMessage1to1,
-  deleteFailedMessage1to1,
-} from '../services/api1to1';
-import {
-  sendImageMessage1to1,
-  sendFileMessage1to1,
-  sendVoiceMessage1to1,
-} from '../services/media1to1';
-import { getDeviceId, getGlobalDisplayName } from '../services/storage';
-import { LocalMessage } from '../services/storage';
+import i18n from '../i18n';
+import { sendMessage1to1, sendReaction1to1, sendReadReceipt1to1, fetchMessages1to1, subscribe1to1, getLocalMessages1to1, clearLocalMessages1to1, clearUnreadCount, onStatusChange, onReaction, Message1to1, loadReactions, toggleReactionStorage, retryFailedMessage1to1, deleteFailedMessage1to1 } from '../services/api1to1';
+import { sendImageMessage1to1, sendFileMessage1to1, sendVoiceMessage1to1 } from '../services/media1to1';
 import { MessageStatus } from '../services/messageStatus';
 
 // ============================================
@@ -225,7 +202,7 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
       
       const sess = sessionService.getSession(conversationId);
       if (!sess) {
-        setError('Session non trouvée. Veuillez recréer la conversation.');
+        setError(i18n.t('messages.errors.sessionNotFound'));
         setLoading(false);
         return;
       }
@@ -254,7 +231,7 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
       
     } catch (e) {
       console.error('[useUnifiedMessages] Init 1:1 error:', e);
-      setError('Erreur lors du chargement des messages');
+      setError(i18n.t('messages.errors.loadFailed'));
       setLoading(false);
     }
   }, [conversationId]);
@@ -269,15 +246,9 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
   // ==========================================
   
   React.useEffect(() => {
-    let isMounted = true;
-    
     if (conversationType === '1to1') {
       initialize1to1();
     }
-    
-    return () => {
-      isMounted = false;
-    };
   }, [conversationId, conversationType]);
 
   // ==========================================
@@ -385,7 +356,7 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
           setMessages(prev => prev.filter(m => 
             m.id !== tempId && m.id !== result.messageId
           ));
-          setError(result.error || 'Échec de l\'envoi');
+          setError(result.error || i18n.t('messages.errors.sendFailed'));
           return false;
         }
         
@@ -561,7 +532,7 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
       const result = await sendVoiceMessage1to1(conversationId, voiceUri, duration);
       
       if (!result.success) {
-        setError(result.error || 'Échec de l\'envoi du vocal');
+        setError(result.error || i18n.t('messages.errors.sendVoiceFailed'));
         return false;
       }
       
@@ -577,7 +548,7 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
       
     } catch (e) {
       console.error('[useUnifiedMessages] Send voice error:', e);
-      setError('Erreur lors de l\'envoi du vocal');
+      setError(i18n.t('messages.errors.sendVoiceErrorAlt'));
       return false;
     } finally {
       setSending(false);
@@ -712,7 +683,7 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
         setMessages(prev => prev.map(m => 
           m.id === messageId ? { ...m, status: 'failed' as any } : m
         ));
-        setError(result.error || 'Échec du renvoi');
+        setError(result.error || i18n.t('messages.errors.resendFailed'));
         return false;
       }
     } catch (e) {
@@ -800,9 +771,9 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
     return {
       type: '1to1' as const,
       id: conversationId,
-      name: 'Chargement...',
+      name: i18n.t('messages.contactPlaceholder'),
       isSecure: false,
-      protocol: 'Initialisation...',
+      protocol: i18n.t('messages.contactPlaceholderProtocol'),
     };
   }, [conversationId, session]);
 

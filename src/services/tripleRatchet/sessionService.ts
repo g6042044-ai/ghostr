@@ -17,83 +17,25 @@
 
 import * as SecureStore from 'expo-secure-store';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import i18n from '../../i18n';
 
-import {
-  IdentityKeyPair,
-  SignedPreKey,
-  OneTimePreKey,
-  Ed25519PublicKey,
-  X25519PublicKey,
-  SymmetricKey,
-} from './types';
+import { IdentityKeyPair, SignedPreKey, OneTimePreKey, Ed25519PublicKey } from './types';
 
-import {
-  generateIdentityKeyPair,
-  generateSignedPreKey,
-  generateOneTimePreKey,
-  generateOneTimePreKeys,
-  serializePublicKey,
-  deserializeEd25519PublicKey,
-  deserializeX25519PublicKey,
-  bytesToHex,
-  hexToBytes,
-  encodeBase64,
-  decodeBase64,
-  zeroize,
-  zeroizeAll,
-  getSecureRandomBytes,
-} from './primitives';
+import { generateIdentityKeyPair, generateSignedPreKey, generateOneTimePreKeys, serializePublicKey, deserializeEd25519PublicKey, deserializeX25519PublicKey, bytesToHex, hexToBytes, encodeBase64, decodeBase64, zeroize, getSecureRandomBytes } from './primitives';
 
 // PQXDH imports
-import {
-  PQSignedKey,
-  PQPreKeyBundle,
-  PQXDHInitialMessage,
-  generatePQSignedKey,
-  createPQPreKeyBundle,
-  serializePQPreKeyBundle,
-  deserializePQPreKeyBundle,
-  pqxdhInitiator,
-  pqxdhResponder,
-  validatePQPreKeyBundle,
-  serializePQXDHMessage,
-  deserializePQXDHMessage,
-} from './pqxdh';
+import { PQSignedKey, PQXDHInitialMessage, generatePQSignedKey, createPQPreKeyBundle, serializePQPreKeyBundle, deserializePQPreKeyBundle, pqxdhInitiator, pqxdhResponder, validatePQPreKeyBundle, serializePQXDHMessage, deserializePQXDHMessage } from './pqxdh';
 
 // Triple Ratchet imports
-import {
-  TripleRatchetState,
-  TripleRatchetMessage,
-  TripleRatchetConfig,
-  initializeTripleRatchetInitiator,
-  initializeTripleRatchetResponder,
-  tripleRatchetEncrypt,
-  tripleRatchetDecrypt,
-  serializeTripleRatchetState,
-  deserializeTripleRatchetState,
-  cleanupTripleRatchetState,
-  SerializedTripleRatchetState,
-} from './tripleRatchet';
+import { TripleRatchetState, TripleRatchetMessage, TripleRatchetConfig, initializeTripleRatchetInitiator, initializeTripleRatchetResponder, tripleRatchetEncrypt, tripleRatchetDecrypt, serializeTripleRatchetState, deserializeTripleRatchetState, cleanupTripleRatchetState, SerializedTripleRatchetState } from './tripleRatchet';
 
 import { DEFAULT_SPQR_CONFIG } from './spqr';
 
 // ACTION 01 (CRITIQUE-04): Key Transparency — safety numbers + key pinning
-import {
-  verifyAndPinKey,
-  computeSafetyNumber,
-  markKeyAsVerified as markKeyAsVerifiedKT,
-  getKeyVerificationStatus as getKeyVerificationStatusKT,
-  KeyVerificationResult,
-  KeyChangeAction,
-} from '../keyTransparency';
+import { verifyAndPinKey, computeSafetyNumber, markKeyAsVerified as markKeyAsVerifiedKT, getKeyVerificationStatus as getKeyVerificationStatusKT, KeyVerificationResult, KeyChangeAction } from '../keyTransparency';
 
 // P0: Key Transparency — Merkle tree verification
-import {
-  registerMyKey,
-  verifyKeyInTransparencyLog,
-  isMyKeyRegistered,
-  KTVerificationResult,
-} from '../keyTransparencyMerkle';
+import { registerMyKey, verifyKeyInTransparencyLog, isMyKeyRegistered, KTVerificationResult } from '../keyTransparencyMerkle';
 
 // FIX: Import statique au lieu de dynamic import() dans createInvite/acceptInvite.
 // Les dynamic imports causent le re-bundling Metro en dev mode (500ms+ par module).
@@ -105,20 +47,8 @@ import { verifySendCounter, updateSendCounter, deleteSendCounter } from './monot
 // Static imports for modules previously loaded via dynamic import() on the init path.
 // Each dynamic import() triggered Metro lazy-bundling (~300-600ms each, 5-6 on init path = 2-3s wasted).
 // With static imports, these modules are bundled upfront and resolve instantly.
-import {
-  isEncryptionEnabled as localCryptoIsEnabled,
-  encrypt as localCryptoEncrypt,
-  decryptIfNeeded as localCryptoDecrypt,
-  setEncryptionKey as localCryptoSetKey,
-  generateEncryptionKey as localCryptoGenKey,
-  isEncrypted as localCryptoIsEncrypted,
-} from '../localCrypto';
-import {
-  getGlobalDisplayName,
-  getGlobalAvatar,
-  setGlobalDisplayName,
-  setGlobalAvatar,
-} from '../storage';
+import { isEncryptionEnabled as localCryptoIsEnabled, encrypt as localCryptoEncrypt, decryptIfNeeded as localCryptoDecrypt, setEncryptionKey as localCryptoSetKey, generateEncryptionKey as localCryptoGenKey, isEncrypted as localCryptoIsEncrypted, tryRecoverFromPreFixBug, hasAnyEncryptionKey as localCryptoHasAnyKey } from '../localCrypto';
+import { getGlobalDisplayName, getGlobalAvatar, setGlobalDisplayName, setGlobalAvatar, registerLockHook } from '../storage';
 import { pendingInviteStore } from '../pendingInvites';
 
 // ============================================
@@ -171,6 +101,21 @@ const DEVICE_ENCRYPTION_KEY = 'ghostr_device_encryption_key_v1';
  * 
  * Résultat : les sessions Triple Ratchet ne sont JAMAIS stockées en clair
  * dans AsyncStorage, même au premier lancement.
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * INVARIANT CRITIQUE — COUPLAGE AVEC localCrypto.transitionPinToHardware
+ * ════════════════════════════════════════════════════════════════════════════
+ * Cette fonction et `localCrypto.transitionPinToHardware` DOIVENT lire/écrire
+ * la MÊME clé sous la MÊME entrée SecureStore (DEVICE_ENCRYPTION_KEY =
+ * 'ghostr_device_encryption_key_v1'). Si elles divergent, le scénario
+ * "active PIN → désactive PIN → relance app" rend toutes les données
+ * AsyncStorage illisibles (clé re-chiffrement ≠ clé chargée au boot).
+ *
+ * En particulier, NE PAS modifier ici sans vérifier l'autre côté :
+ *   - Nom de la clé SecureStore
+ *   - Options keychainAccessible (doivent matcher)
+ *   - Format de la valeur (Base64 d'un Uint8Array de 32 bytes)
+ * ════════════════════════════════════════════════════════════════════════════
  */
 async function ensureDeviceLevelEncryption(): Promise<void> {
   // Static imports used (no dynamic import latency)
@@ -193,6 +138,31 @@ async function ensureDeviceLevelEncryption(): Promise<void> {
     let deviceKeyB64 = await SecureStore.getItemAsync(DEVICE_ENCRYPTION_KEY);
     
     if (!deviceKeyB64) {
+      // ──────────────────────────────────────────────────────────────────────
+      // RÉCUPÉRATION POST-BUG (mai 2026)
+      // ──────────────────────────────────────────────────────────────────────
+      // Avant de générer un nouveau deviceKey, vérifier si l'utilisateur est
+      // affecté par l'ancien bug de transitionPinToHardware (re-chiffrement
+      // vers hwKey sans création de DEVICE_ENCRYPTION_KEY). Si les données
+      // AsyncStorage existantes sont déchiffrables avec la hardwareKey
+      // (déjà chargée par initHardwareEncryptionAll), on l'adopte comme
+      // deviceKey pour préserver l'accès aux données.
+      //
+      // Si la récupération réussit, encryptionKey est déjà set et la clé est
+      // persistée — on peut return tout de suite.
+      // Si elle échoue (fresh install ou autre cas), on tombe sur la
+      // génération normale ci-dessous.
+      // ──────────────────────────────────────────────────────────────────────
+      try {
+        const recovered = await tryRecoverFromPreFixBug();
+        if (recovered) {
+          __DEV__ && console.log('[SessionService] 🔧 Recovered from pre-fix bug — adopted hardwareKey');
+          return;
+        }
+      } catch (e) {
+        __DEV__ && console.warn('[SessionService] Recovery attempt failed (non-fatal):', e);
+      }
+
       // Première utilisation : générer et stocker
       const deviceKey = localCryptoGenKey(); // 32 bytes random
       deviceKeyB64 = encodeBase64(deviceKey);
@@ -699,10 +669,41 @@ export class SessionService {
         this.nextPreKeyId = parseInt(nextIdStored, 10);
       }
       
-      // Replenish si nécessaire
-      if (this.oneTimePreKeys.size < 50) {
+      // ════════════════════════════════════════════════════════════════════
+      // PATCH 7 — REPLENISHMENT INTELLIGENT EN ARRIÈRE-PLAN
+      // ════════════════════════════════════════════════════════════════════
+      // Avant : `if (size < 50) await replenish()` bloquait toujours l'init
+      // pour générer 50+ paires X25519 (200-600 ms de JS bloqué) même quand
+      // le stock n'était pas critique.
+      //
+      // Maintenant, on tient compte de l'urgence :
+      //   • size === 0 (cold start absolu) : `replenishOneTimePreKeys` gère
+      //     déjà ce cas en générant 10 paires synchrone + schedulant 90
+      //     en background à T+30s. Garde ce comportement.
+      //   • size < 10 : stock critique. On bloque pour remonter à 100, sinon
+      //     l'utilisateur risque de ne plus pouvoir recevoir d'invitation
+      //     post-quantique le temps que le replenish termine.
+      //   • 10 <= size < 50 : stock dégradé mais opérationnel. On défère le
+      //     replenish à T+5s (UI déjà interactive) en fire-and-forget.
+      //
+      // SÉCURITÉ : aucun impact. Les OTPK ne sont consommées qu'à la
+      // réception d'une invitation entrante. Tant qu'il en reste >0, la
+      // sécurité du PQXDH initial est intacte. Le replenishment background
+      // remet le stock avant qu'il atteigne 0 dans tous les cas réalistes.
+      // ════════════════════════════════════════════════════════════════════
+      const otpkSize = this.oneTimePreKeys.size;
+      if (otpkSize < 10) {
+        // Stock critique (ou cold start absolu) → blocage nécessaire
         await this.replenishOneTimePreKeys();
+      } else if (otpkSize < 50) {
+        // Stock dégradé non critique → defer pour ne pas bloquer init
+        setTimeout(() => {
+          this.replenishOneTimePreKeys().catch(e =>
+            __DEV__ && console.warn('[SessionService] Background replenish failed:', e)
+          );
+        }, 5000);
       }
+      // size >= 50 : rien à faire
     } catch (error) {
       __DEV__ && console.error('[SessionService] Error loading PreKeys:', error);
       await this.rotateSignedPreKey();
@@ -1361,15 +1362,16 @@ export class SessionService {
       
       // BUG FIX: Le gateway attend une enveloppe sealed sender (NaCl box).
       // Sans ça, le gateway essaie nacl.box.open() sur du JSON brut → échec.
-      // FIX: Attendre que le bootstrap soit terminé (await la promise, pas polling aveugle).
+      // FIX: Utilise waitForSealedSenderReady (utilitaire unifié, timeout +
+      //      retries internes + AbortSignal-aware + status callback).
+      //      L'écran appelant (Create1to1Screen) a déjà fait son propre
+      //      pré-bootstrap, mais on conserve ce filet de sécurité au cas où
+      //      le certificat aurait été invalidé entre temps (cf. P6 quota).
       if (!isSealedSenderReady()) {
         __DEV__ && console.log('[SessionService] ⏳ Waiting for sealed sender bootstrap (upload)...');
         try {
-          const { ensureSealedSenderBootstrap } = await import('../api1to1');
-          const ready = await Promise.race([
-            ensureSealedSenderBootstrap(),
-            new Promise<boolean>(resolve => setTimeout(() => resolve(false), 45000)),
-          ]);
+          const { waitForSealedSenderReady } = await import('../api1to1');
+          const ready = await waitForSealedSenderReady({ timeoutMs: 60_000 });
           if (!ready || !isSealedSenderReady()) {
             throw new Error('Sealed sender bootstrap failed — cannot upload invitation anonymously');
           }
@@ -1509,7 +1511,18 @@ export class SessionService {
       if (parsed.v && parsed.t && !parsed.bundle) {
         __DEV__ && console.log('  - Tag: ' + parsed.t.substring(0, 12) + '...');
         __DEV__ && console.log('  - From: ' + (parsed.n || 'Unknown'));
-        
+
+        // Bug #3 fix (early): if this tag belongs to an invite we
+        // generated on this device, the user is trying to chat with
+        // themselves. Reject before the network fetch, before any
+        // crypto state is touched.
+        await pendingInviteStore.load();
+        if (pendingInviteStore.getByTag(parsed.t)) {
+          const err: any = new Error('SELF_INVITE');
+          err.isSelfInvite = true;
+          throw err;
+        }
+
         // Récupérer le bundle depuis le serveur
         inviteData = await this.fetchInviteFromServer(parsed.t);
       } else if (parsed.type === 'ghostr_invite_pq') {
@@ -1519,6 +1532,9 @@ export class SessionService {
         throw new Error('Unknown invite format');
       }
     } catch (error: any) {
+      // Don't wrap our typed self-invite error in the generic "invalid
+      // format" message — it must reach the screen as-is.
+      if (error?.isSelfInvite) throw error;
       __DEV__ && console.error('[SessionService] Failed to decode invite:', error);
       throw new Error('Invalid invite format - ' + (error.message || 'make sure you copied the complete code'));
     }
@@ -1534,7 +1550,7 @@ export class SessionService {
     // [Bug #6] Vérifier l'expiration de l'invitation (30 jours)
     const INVITE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
     if (inviteData.createdAt && (Date.now() - inviteData.createdAt > INVITE_MAX_AGE_MS)) {
-      throw new Error('Cette invitation a expiré. Demandez un nouveau QR code à votre contact.');
+      throw new Error(i18n.t('errors.invitationExpired'));
     }
     
     // Désérialiser le bundle PQXDH
@@ -1545,6 +1561,23 @@ export class SessionService {
     const validation = validatePQPreKeyBundle(bundle);
     if (!validation.valid) {
       throw new Error(`Invalid bundle: ${validation.error}`);
+    }
+
+    // Bug #3 fix (late): backstop the early tag check by comparing the
+    // inviter's identity key with our own. This covers:
+    //   - Long-format invites (no tag indirection through pendingInviteStore).
+    //   - Short-format invites whose tag is no longer in pendingInviteStore
+    //     (e.g., after a reinstall that wiped local invite state).
+    // Critically, this runs BEFORE pqxdhInitiator() consumes a one-time
+    // pre-key, so a self-invite leaves no crypto state behind.
+    if (this.identityKeyPair) {
+      const myKeyB64 = serializePublicKey(this.identityKeyPair.publicKey);
+      const theirKeyB64Compare = serializePublicKey(bundle.identityKey);
+      if (myKeyB64 === theirKeyB64Compare) {
+        const err: any = new Error('SELF_INVITE');
+        err.isSelfInvite = true;
+        throw err;
+      }
     }
 
     // P0: Verify the inviter's identity key is in the Key Transparency log.
@@ -1718,19 +1751,16 @@ export class SessionService {
       };
       
       // BUG FIX: Wrapper dans une enveloppe sealed sender
-      // FIX: Attendre que le bootstrap sealed sender soit terminé (PoW + certificat).
-      // AVANT: polling aveugle isSealedSenderReady() pendant 15s → timeout si le PoW
-      // prend plus de 15s (nonce=700K+ sur devices lents → 30s+).
-      // APRÈS: on await la promise du bootstrap qui résout quand le PoW est fini.
+      // FIX: Utilise waitForSealedSenderReady (utilitaire unifié, timeout
+      //      30s, retries internes, AbortSignal-aware). L'écran Join1to1Screen
+      //      a déjà fait son pré-bootstrap, mais on garde ce filet pour le
+      //      cas où le certificat serait invalidé entre temps.
       if (!isSealedSenderReady()) {
         __DEV__ && console.log('[SessionService] ⏳ Waiting for sealed sender bootstrap (acceptInvite)...');
         try {
           // Import dynamique pour éviter la dépendance circulaire sessionService ↔ api1to1
-          const { ensureSealedSenderBootstrap } = await import('../api1to1');
-          const ready = await Promise.race([
-            ensureSealedSenderBootstrap(),
-            new Promise<boolean>(resolve => setTimeout(() => resolve(false), 45000)),
-          ]);
+          const { waitForSealedSenderReady } = await import('../api1to1');
+          const ready = await waitForSealedSenderReady({ timeoutMs: 60_000 });
           if (!ready || !isSealedSenderReady()) {
             return { success: false, error: 'Sealed sender bootstrap failed — cannot send accept anonymously' };
           }
@@ -1742,7 +1772,7 @@ export class SessionService {
       const payloadString = JSON.stringify(payload);
       const envelope = createSealedSenderEnvelope(tag, payloadString);
       
-      const { data, error } = await secureRpc('send_sealed_message', {
+      const { error } = await secureRpc('send_sealed_message', {
         p_tag: envelope.tag,
         p_sealed_content: envelope.sealedContent,
         p_version: envelope.version,
@@ -1763,10 +1793,19 @@ export class SessionService {
   
   /**
    * Accepte une invitation ET envoie automatiquement la réponse au serveur
-   * Flux simplifié pour le joigneur
+   * Flux simplifié pour le joigneur.
+   *
+   * FIX: Si l'envoi de la réponse échoue (sealed sender HS, réseau, etc.),
+   * on rollback la session locale pour éviter un état orphelin :
+   *   - Le pair inviteur n'a JAMAIS reçu la réponse → il pense que personne
+   *     n'a accepté son invitation → il peut la régénérer.
+   *   - Sans rollback, le joigneur croit avoir une session établie mais
+   *     l'inviteur ne le verra jamais → messages partiraient dans le vide.
+   * En cas d'échec, on throw avec `wasRollback: true` pour que l'UI puisse
+   * afficher un message clair et inviter à réessayer.
    */
   async acceptInviteAndRespond(inviteString: string): Promise<AcceptInviteResult> {
-    // 1. Accepter l'invitation (crée la session localement)
+    // 1. Accepter l'invitation (crée la session localement, consomme l'OTPK)
     const result = await this.acceptInvite(inviteString);
     
     // 2. Envoyer automatiquement la réponse au serveur
@@ -1777,8 +1816,25 @@ export class SessionService {
       );
       
       if (!sendResult.success) {
-        __DEV__ && console.warn('[SessionService] Failed to send auto-response:', sendResult.error);
-        // On continue quand même - la session est créée localement
+        __DEV__ && console.warn(
+          '[SessionService] ❌ Failed to send auto-response, rolling back local session:',
+          sendResult.error
+        );
+        // Rollback : supprimer la session locale orpheline. On garde l'OTPK
+        // consommée comme « brûlée » côté sécurité (le ratchet a avancé),
+        // mais on retire la session pour que le joigneur puisse réessayer
+        // proprement (en re-scannant le QR par exemple).
+        try {
+          await this.deleteSession(result.session.id);
+        } catch (delErr) {
+          __DEV__ && console.error('[SessionService] Rollback deleteSession failed:', delErr);
+        }
+        const err: any = new Error(
+          sendResult.error || 'Failed to confirm join with peer'
+        );
+        err.wasRollback = true;
+        err.code = 'JOIN_SEND_FAILED';
+        throw err;
       }
     }
     
@@ -1789,6 +1845,25 @@ export class SessionService {
    * [Bug #2] Remplace une session existante et accepte une nouvelle invitation
    * Appelé quand l'utilisateur confirme "Reconnecter" après détection de doublon.
    * Supprime proprement l'ancienne session avant d'en créer une nouvelle.
+   *
+   * ⚠️ EDGE CASE — échec d'envoi de la réponse :
+   *   Si `acceptInviteAndRespond` throw `JOIN_SEND_FAILED` (la réponse n'a
+   *   pas pu être envoyée au pair → rollback de la nouvelle session locale),
+   *   l'utilisateur se retrouve avec NI l'ancienne session (déjà supprimée
+   *   ici) NI la nouvelle (rollback). C'est intentionnel et préférable à
+   *   l'alternative : garder une session locale orpheline alors que le pair
+   *   ne sait pas qu'on a accepté son invitation.
+   *
+   *   Le pré-bootstrap SealedSender effectué par Join1to1Screen avant cet
+   *   appel rend cet edge case très rare (le SS est vérifié prêt avant
+   *   toute mutation d'état). Si malgré tout l'envoi échoue (ex: certificat
+   *   expiré entre temps, réseau coupé pile au mauvais moment), l'utilisateur
+   *   verra le message `errors.joinSendFailed` et pourra re-scanner le QR
+   *   du contact pour réessayer proprement.
+   *
+   *   Restauration impossible : `deleteSession` supprime les états Triple
+   *   Ratchet de façon irréversible (zeroize des clés). Il n'y a pas de
+   *   chemin pour "annuler" la suppression sans re-scanner.
    */
   async acceptInviteAndReplace(
     inviteString: string,
@@ -1799,10 +1874,14 @@ export class SessionService {
     __DEV__ && console.log(`[SessionService] 🔄 Replacing session ${existingSessionId}`);
     
     // 1. Supprimer proprement l'ancienne session
+    //    (Obligatoire avant l'accept car le nouveau sessionId est déterministe
+    //    et peut entrer en collision avec l'ancien — cf. Bug #1.)
     await this.deleteSession(existingSessionId);
     __DEV__ && console.log(`[SessionService] 🗑 Old session deleted`);
     
     // 2. Accepter normalement (plus de conflit possible)
+    //    Si l'envoi échoue, JOIN_SEND_FAILED remonte à Join1to1Screen qui
+    //    affichera errors.joinSendFailed. Cf. note edge case ci-dessus.
     return this.acceptInviteAndRespond(inviteString);
   }
   
@@ -2229,10 +2308,34 @@ export class SessionService {
       if (stored) {
         let idsJson: string;
         if (stored.startsWith('enc1:')) {
+          // FIX migration: si la clé n'est pas (encore) en RAM, NE PAS tenter
+          // le déchiffrement (qui throw) et NE PAS toucher au stockage. La
+          // recovery via tryRecoverFromPreFixBug ou la promotion explicite
+          // (promoteHardwareKeyToDeviceKey) interviendra ensuite. Avant ce
+          // fix, le catch global laissait passer sans removeItem, donc OK,
+          // mais le warning ci-dessous rend le diagnostic explicite.
+          if (!localCryptoHasAnyKey()) {
+            __DEV__ && console.warn(
+              '[SessionService] ⏳ Sessions index encrypted but no key in RAM — ' +
+              'deferring load (will be retried after key bootstrap)'
+            );
+            return;
+          }
           // Static import used (localCryptoDecrypt)
           idsJson = localCryptoDecrypt(stored);
         } else if (await wasLockEverConfigured()) {
-          // PIN was set → plaintext data should not exist → corrupt/tampered
+          // PIN was set → plaintext data should not exist → corrupt/tampered.
+          // FIX migration: on n'agit que si on a la clé en RAM (preuve qu'on
+          // est dans un état "unlocked stable", pas un boot incomplet). Sans
+          // ce garde-fou, un faux positif du cache `_lockConfiguredCache` post-
+          // nuclearReset pouvait conduire à la suppression de données valides.
+          if (!localCryptoHasAnyKey()) {
+            __DEV__ && console.warn(
+              '[SessionService] Plaintext sessions index found but no key in RAM ' +
+              'and PIN cache says configured — refusing to delete (likely stale cache)'
+            );
+            return;
+          }
           __DEV__ && console.error('[SessionService] ❌ REJECTED unencrypted session index (PIN was configured)');
           await AsyncStorage.removeItem(STORAGE_KEYS.SESSIONS);
           return;
@@ -2266,9 +2369,29 @@ export class SessionService {
         let sessionJson: string;
         
         if (stored.startsWith('enc1:')) {
+          // FIX migration: garde explicite — si aucune clé en RAM, on diffère.
+          // Sans ce check, `localCryptoDecrypt` throw → tombe dans le catch
+          // global → log seulement (pas de removeItem, OK), mais le diagnostic
+          // est meilleur ici.
+          if (!localCryptoHasAnyKey()) {
+            __DEV__ && console.warn(
+              `[SessionService] ⏳ Session ${sessionId.slice(0, 12)}... encrypted ` +
+              'but no key in RAM — deferring load'
+            );
+            return;
+          }
           // Static import used (localCryptoDecrypt)
           sessionJson = localCryptoDecrypt(stored);
         } else if (await wasLockEverConfigured()) {
+          // FIX migration: protection contre faux positif du cache _lockConfiguredCache
+          // (cf. loadSessionsIndex pour le rationale complet).
+          if (!localCryptoHasAnyKey()) {
+            __DEV__ && console.warn(
+              `[SessionService] Plaintext session ${sessionId.slice(0, 12)}... ` +
+              'with PIN-configured cache but no key in RAM — refusing to delete'
+            );
+            return;
+          }
           // PIN was set → plaintext session = corrupt/tampered
           __DEV__ && console.error(`[SessionService] ❌ REJECTED unencrypted session ${sessionId} (PIN was configured)`);
           await AsyncStorage.removeItem(STORAGE_KEYS.SESSION_PREFIX + sessionId);
@@ -2367,8 +2490,6 @@ export class SessionService {
    * Les invites expirées sont nettoyées automatiquement par cleanupExpired().
    */
   async deleteSession(sessionId: string): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    
     // Cleanup du ratchet state
     const state = this.ratchetStates.get(sessionId);
     if (state) {
@@ -2552,7 +2673,7 @@ export class SessionService {
     
     try {
       // Cleanup de tous les états de ratchet
-      for (const [sessionId, state] of this.ratchetStates) {
+      for (const state of this.ratchetStates.values()) {
         cleanupTripleRatchetState(state);
       }
       
@@ -2651,7 +2772,7 @@ export class SessionService {
     }
     
     // 3. v19.0: Recherche par originalUserId (pour sessions créées via PQXDH bundle)
-    for (const [sessionId, session] of this.sessions) {
+    for (const session of this.sessions.values()) {
       if (session.originalUserId && session.originalUserId === userId) {
         return session;
       }
@@ -2886,7 +3007,7 @@ export class SessionService {
     }
     
     // 2. Each session
-    for (const [sessionId, session] of this.sessions) {
+    for (const sessionId of this.sessions.keys()) {
       const key = STORAGE_KEYS.SESSION_PREFIX + sessionId;
       const stored = await AsyncStorage.getItem(key);
       if (stored && !localCryptoIsEncrypted(stored)) {
@@ -2923,3 +3044,11 @@ export class SessionService {
 // ============================================
 
 export const sessionService = new SessionService();
+
+// Enregistrer lockMemory() pour qu'il soit appelé automatiquement par
+// storage.clearEncryptionKey() au verrouillage de l'app. Fait ici (et non dans
+// le constructor) pour garantir que le singleton est complet et que la méthode
+// est bien liée avant l'enregistrement.
+registerLockHook(() => {
+  sessionService.lockMemory();
+});

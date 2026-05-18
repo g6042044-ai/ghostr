@@ -15,44 +15,29 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  ScrollView,
-  Alert,
-  ActivityIndicator,
-  Image,
-} from 'react-native';
+import { View, Text, TouchableOpacity, ScrollView, Alert, ActivityIndicator } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { useTranslation } from 'react-i18next';
 import { sessionService } from '../services/tripleRatchet/sessionService';
 import { clearLocalMessages1to1, clearUnreadCount } from '../services/api1to1';
 import { useCall1to1 } from '../hooks/useCall1to1';
 import { isInCall1to1 } from '../services/call1to1Service';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { theme } from '../components/ui/theme';
+import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 import { Avatar } from '../components/Avatar';
-import { generateAvatarInitials } from '../services/crypto';
 import { loadMuteState, setSessionMuted } from '../services/muteService';
+import { getActiveLanguage } from '../i18n';
 
-const COLORS = {
-  primary: theme.colors.primary,
-  accent: theme.colors.accent,
-  background: theme.colors.background,
-  surface: theme.colors.surface,
-  surfaceLight: theme.colors.surfaceLight,
-  text: theme.colors.text,
-  textSecondary: theme.colors.textSecondary,
-  textTertiary: theme.colors.textMuted,
-  danger: theme.colors.danger,
-  dangerLight: theme.colors.danger + '1F',
-  border: theme.colors.border,
-};
+// NOTE: previous versions defined a local COLORS object that mirrored
+// theme.colors with a few renames. We now consume `colors` directly from
+// `useTheme()` so the screen flips live on theme change. Keys mapped:
+//   colors.textMuted  → colors.textMuted
+//   (colors.danger + "1F")   → colors.danger + '1F'
+// All other keys were identical to the global palette.
 
 type RootStackParamList = { 
   ContactInfo: { sessionId: string };
@@ -80,6 +65,9 @@ export const ContactInfoScreen: React.FC = () => {
   const route = useRoute<ContactInfoRouteProp>();
   const { sessionId } = route.params;
   const insets = useSafeAreaInsets();
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
 
   const [contact, setContact] = useState<ContactData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -99,7 +87,7 @@ export const ContactInfoScreen: React.FC = () => {
       const session = sessionService.getSession(sessionId);
       if (session) {
         setContact({
-          displayName: session.theirProfile?.displayName || session.displayName || 'Contact',
+          displayName: session.theirProfile?.displayName || session.displayName || t('common.contact'),
           avatarBase64: session.theirProfile?.avatarBase64,
           fingerprint: session.theirIdentityKeyFingerprint || sessionId.slice(0, 32),
           createdAt: session.createdAt || Date.now(),
@@ -138,11 +126,11 @@ export const ContactInfoScreen: React.FC = () => {
       setIsCallingAudio(true);
       const result = await startCall(sessionId, contact.displayName);
       if (!result.success) {
-        Alert.alert('Erreur', result.error || 'Impossible de démarrer l\'appel');
+        Alert.alert(t('common.error'), result.error || t('contactInfo.callError'));
       }
     } catch (error) {
       console.error('[ContactInfo] Call error:', error);
-      Alert.alert('Erreur', 'Une erreur est survenue lors du démarrage de l\'appel');
+      Alert.alert(t('common.error'), t('contactInfo.callGenericError'));
     } finally {
       setIsCallingAudio(false);
     }
@@ -163,16 +151,16 @@ export const ContactInfoScreen: React.FC = () => {
 
   const handleDelete = () => {
     if (isInCall1to1()) {
-      Alert.alert('Appel en cours', 'Terminez l\'appel avant de supprimer la conversation.');
+      Alert.alert(t('conversationList.callInProgressTitle'), t('conversationList.callInProgressMessage'));
       return;
     }
     Alert.alert(
-      'Supprimer la conversation',
-      'Tous les messages seront supprimés. Cette action est irréversible.',
+      t('contactInfo.deleteConversation'),
+      t('contactInfo.deleteConfirmMessage'),
       [
-        { text: 'Annuler', style: 'cancel' },
+        { text: t('common.cancel'), style: 'cancel' },
         {
-          text: 'Supprimer',
+          text: t('common.delete'),
           style: 'destructive',
           onPress: async () => {
             try {
@@ -183,7 +171,7 @@ export const ContactInfoScreen: React.FC = () => {
               navigation.goBack();
               navigation.goBack();
             } catch (error) {
-              Alert.alert('Erreur', 'Impossible de supprimer');
+              Alert.alert(t('common.error'), t('contactInfo.deleteFailed'));
             }
           },
         },
@@ -198,7 +186,7 @@ export const ContactInfoScreen: React.FC = () => {
   if (loading) {
     return (
       <View style={styles.centered}>
-        <ActivityIndicator size="large" color={COLORS.primary} />
+        <ActivityIndicator size="large" color={colors.primary} />
       </View>
     );
   }
@@ -206,7 +194,7 @@ export const ContactInfoScreen: React.FC = () => {
   if (!contact) {
     return (
       <View style={styles.centered}>
-        <Text style={styles.errorText}>Contact non trouvé</Text>
+        <Text style={styles.errorText}>{t('contactInfo.notFound')}</Text>
       </View>
     );
   }
@@ -216,7 +204,7 @@ export const ContactInfoScreen: React.FC = () => {
   return (
     <View style={styles.container}>
       <LinearGradient
-        colors={[avatarColor + '30', COLORS.background]}
+        colors={[avatarColor + '30', colors.background]}
         style={styles.gradient}
         start={{ x: 0.5, y: 0 }}
         end={{ x: 0.5, y: 0.5 }}
@@ -224,7 +212,7 @@ export const ContactInfoScreen: React.FC = () => {
 
       <SafeAreaView edges={['top']} style={styles.safeHeader}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Ionicons name="chevron-back" size={28} color={COLORS.text} />
+          <Ionicons name="chevron-back" size={28} color={colors.text} />
         </TouchableOpacity>
       </SafeAreaView>
 
@@ -241,30 +229,30 @@ export const ContactInfoScreen: React.FC = () => {
           />
           <Text style={styles.name}>{contact.displayName}</Text>
           <View style={styles.statusRow}>
-            <Ionicons name="lock-closed" size={14} color={COLORS.primary} />
-            <Text style={styles.statusText}>Chiffré de bout en bout</Text>
+            <Ionicons name="lock-closed" size={14} color={colors.primary} />
+            <Text style={styles.statusText}>{t('contactInfo.encryptedE2E')}</Text>
           </View>
         </View>
 
         {/* Quick Actions — CORRIGÉ: notification retirée (reste dans Paramètres), vidéo désactivée */}
         <View style={styles.quickActions}>
-          <QuickAction icon="call" label="Audio" onPress={handleCall} />
-          <QuickAction icon="videocam" label="Vidéo" onPress={handleVideoCall} disabled />
-          <QuickAction icon="search" label="Recherche" onPress={handleSearch} />
+          <QuickAction icon="call" label={t('contactInfo.audio')} onPress={handleCall} />
+          <QuickAction icon="videocam" label={t('contactInfo.video')} onPress={handleVideoCall} disabled />
+          <QuickAction icon="search" label={t('contactInfo.search')} onPress={handleSearch} />
         </View>
 
         {/* Security */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Sécurité</Text>
+          <Text style={styles.sectionTitle}>{t('contactInfo.securitySection')}</Text>
           <View style={styles.card}>
-            <Row icon="shield-checkmark" title="Chiffrement" subtitle="Triple Ratchet + ML-KEM-768" />
+            <Row icon="shield-checkmark" title={t('contactInfo.encryption')} subtitle="Triple Ratchet + ML-KEM-768" />
             <View style={styles.sep} />
             <Row 
               icon="finger-print" 
-              title="Empreinte" 
+              title={t('contactInfo.fingerprint')} 
               subtitle={formatFingerprint(contact.fingerprint)}
               mono
-              onPress={() => Alert.alert('Empreinte de sécurité', 'Comparez cette empreinte avec votre contact pour vérifier la sécurité.\n\n' + formatFingerprint(contact.fingerprint))}
+              onPress={() => Alert.alert(t('contactInfo.fingerprintTitle'), t('contactInfo.fingerprintMessage') + '\n\n' + formatFingerprint(contact.fingerprint))}
               chevron
             />
           </View>
@@ -272,12 +260,12 @@ export const ContactInfoScreen: React.FC = () => {
 
         {/* Paramètres — CORRIGÉ: un seul toggle notifications, état persisté */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Paramètres</Text>
+          <Text style={styles.sectionTitle}>{t('contactInfo.settingsSection')}</Text>
           <View style={styles.card}>
             <Row 
               icon={muted ? "notifications-off" : "notifications"} 
-              title="Notifications" 
-              subtitle={muted ? 'Désactivées' : 'Activées'}
+              title={t('contactInfo.notifications')} 
+              subtitle={muted ? t('contactInfo.notificationsOff') : t('contactInfo.notificationsOn')}
               toggle
               toggleValue={!muted}
               onToggle={() => handleToggleMute(!muted)}
@@ -287,12 +275,14 @@ export const ContactInfoScreen: React.FC = () => {
 
         {/* Supprimer la conversation */}
         <TouchableOpacity style={styles.dangerBtn} onPress={handleDelete}>
-          <Ionicons name="trash-outline" size={20} color={COLORS.danger} />
-          <Text style={styles.dangerBtnText}>Supprimer la conversation</Text>
+          <Ionicons name="trash-outline" size={20} color={colors.danger} />
+          <Text style={styles.dangerBtnText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.85}>
+            {t('contactInfo.deleteConversation')}
+          </Text>
         </TouchableOpacity>
 
         <Text style={styles.footer}>
-          Conversation créée le {new Date(contact.createdAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' })}
+          {t('contactInfo.createdOn', { date: new Date(contact.createdAt).toLocaleDateString(getActiveLanguage(), { day: 'numeric', month: 'long', year: 'numeric' }) })}
         </Text>
       </ScrollView>
     </View>
@@ -301,90 +291,121 @@ export const ContactInfoScreen: React.FC = () => {
 
 // --- Composants réutilisables ---
 
-const QuickAction = ({ icon, label, onPress, muted, disabled }: { icon: string; label: string; onPress: () => void; muted?: boolean; disabled?: boolean }) => (
-  <TouchableOpacity style={styles.quickAction} onPress={onPress} disabled={disabled}>
-    <View style={[styles.quickActionIcon, muted && styles.quickActionIconMuted, disabled && styles.quickActionIconDisabled]}>
-      <Ionicons name={icon as any} size={22} color={disabled ? COLORS.textTertiary : muted ? COLORS.textSecondary : COLORS.primary} />
-    </View>
-    <Text style={[styles.quickActionLabel, disabled && styles.quickActionLabelDisabled]}>{label}</Text>
-  </TouchableOpacity>
-);
+const QuickAction = ({ icon, label, onPress, muted, disabled }: { icon: string; label: string; onPress: () => void; muted?: boolean; disabled?: boolean }) => {
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  return (
+    <TouchableOpacity style={styles.quickAction} onPress={onPress} disabled={disabled}>
+      <View style={[styles.quickActionIcon, muted && styles.quickActionIconMuted, disabled && styles.quickActionIconDisabled]}>
+        <Ionicons name={icon as any} size={22} color={disabled ? colors.textMuted : muted ? colors.textSecondary : colors.primary} />
+      </View>
+      <Text
+        style={[styles.quickActionLabel, disabled && styles.quickActionLabelDisabled]}
+        numberOfLines={1}
+        adjustsFontSizeToFit
+        minimumFontScale={0.85}
+      >
+        {label}
+      </Text>
+    </TouchableOpacity>
+  );
+};
 
 const Row = ({ 
   icon, title, subtitle, mono, danger, toggle, toggleValue, onToggle, onPress, chevron, rightText 
 }: { 
   icon: string; title: string; subtitle?: string; mono?: boolean; danger?: boolean; 
   toggle?: boolean; toggleValue?: boolean; onToggle?: () => void; onPress?: () => void; chevron?: boolean; rightText?: string;
-}) => (
-  <TouchableOpacity style={styles.row} onPress={onPress || onToggle} disabled={!onPress && !onToggle}>
-    <View style={[styles.rowIcon, danger && styles.rowIconDanger]}>
-      <Ionicons name={icon as any} size={20} color={danger ? COLORS.danger : COLORS.primary} />
-    </View>
-    <View style={styles.rowContent}>
-      <Text style={[styles.rowTitle, danger && styles.rowTitleDanger]}>{title}</Text>
-      {subtitle && <Text style={[styles.rowSubtitle, mono && styles.mono]}>{subtitle}</Text>}
-    </View>
-    {toggle && (
-      <View style={[styles.toggle, !toggleValue && styles.toggleOff]}>
-        <View style={[styles.toggleKnob, !toggleValue && styles.toggleKnobOff]} />
+}) => {
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  return (
+    <TouchableOpacity style={styles.row} onPress={onPress || onToggle} disabled={!onPress && !onToggle}>
+      <View style={[styles.rowIcon, danger && styles.rowIconDanger]}>
+        <Ionicons name={icon as any} size={20} color={danger ? colors.danger : colors.primary} />
       </View>
-    )}
-    {chevron && <Ionicons name="chevron-forward" size={18} color={COLORS.textTertiary} />}
-    {rightText && <Text style={styles.rightText}>{rightText}</Text>}
-  </TouchableOpacity>
-);
+      <View style={styles.rowContent}>
+        <Text
+          style={[styles.rowTitle, danger && styles.rowTitleDanger]}
+          numberOfLines={2}
+        >
+          {title}
+        </Text>
+        {subtitle && (
+          <Text
+            style={[styles.rowSubtitle, mono && styles.mono]}
+            numberOfLines={mono ? 2 : 3}
+          >
+            {subtitle}
+          </Text>
+        )}
+      </View>
+      {toggle && (
+        <View style={[styles.toggle, !toggleValue && styles.toggleOff]}>
+          <View style={[styles.toggleKnob, !toggleValue && styles.toggleKnobOff]} />
+        </View>
+      )}
+      {chevron && <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />}
+      {rightText && <Text style={styles.rightText}>{rightText}</Text>}
+    </TouchableOpacity>
+  );
+};
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: COLORS.background },
+const makeStyles = (colors: ColorPalette) => ({
+  container: { flex: 1, backgroundColor: colors.background },
   gradient: { position: 'absolute', top: 0, left: 0, right: 0, height: 300 },
   safeHeader: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 },
   backBtn: { width: 40, height: 40, margin: 12, borderRadius: 20, backgroundColor: 'rgba(10,15,20,0.45)', justifyContent: 'center', alignItems: 'center' },
-  centered: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: COLORS.background },
-  errorText: { fontSize: 16, color: COLORS.textSecondary },
+  centered: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colors.background },
+  errorText: { fontSize: 16, color: colors.textSecondary },
   scroll: { flex: 1 },
   scrollContent: { paddingTop: 100 },
 
   profile: { alignItems: 'center', marginBottom: 24 },
-  avatar: { width: 110, height: 110, borderRadius: 55, justifyContent: 'center', alignItems: 'center', marginBottom: 16, borderWidth: 4, borderColor: COLORS.background },
-  avatarImage: { width: 110, height: 110, borderRadius: 55, marginBottom: 16, borderWidth: 4, borderColor: COLORS.background },
+  avatar: { width: 110, height: 110, borderRadius: 55, justifyContent: 'center', alignItems: 'center', marginBottom: 16, borderWidth: 4, borderColor: colors.background },
+  avatarImage: { width: 110, height: 110, borderRadius: 55, marginBottom: 16, borderWidth: 4, borderColor: colors.background },
   avatarText: { fontSize: 44, fontWeight: '700', color: '#FFF' },
-  name: { fontSize: 26, fontWeight: '700', color: COLORS.text, marginBottom: 8 },
+  name: { fontSize: 26, fontWeight: '700', color: colors.text, marginBottom: 8 },
   statusRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  statusText: { fontSize: 14, color: COLORS.textSecondary },
+  statusText: { fontSize: 14, color: colors.textSecondary },
 
   quickActions: { flexDirection: 'row', justifyContent: 'center', paddingHorizontal: 16, marginBottom: 28, gap: 8 },
-  quickAction: { alignItems: 'center', flex: 1, maxWidth: 80 },
-  quickActionIcon: { width: 52, height: 52, borderRadius: 16, backgroundColor: COLORS.surfaceLight, justifyContent: 'center', alignItems: 'center', marginBottom: 6 },
-  quickActionIconMuted: { backgroundColor: COLORS.surface },
-  quickActionIconDisabled: { backgroundColor: COLORS.surface, opacity: 0.4 },
-  quickActionLabel: { fontSize: 12, color: COLORS.textSecondary, fontWeight: '500' },
+  // maxWidth: 96 (vs 80 avant) pour absorber les langues à mots longs
+  // (DE "Suchen" passe, FR "Rechercher" passe, RU "Поиск" passe).
+  // Combiné à numberOfLines=1 + adjustsFontSizeToFit sur le label, on tient
+  // jusqu'à des chaînes ~12 chars sans dégradation visible.
+  quickAction: { alignItems: 'center', flex: 1, maxWidth: 96, paddingHorizontal: 4 },
+  quickActionIcon: { width: 52, height: 52, borderRadius: 16, backgroundColor: colors.surfaceLight, justifyContent: 'center', alignItems: 'center', marginBottom: 6 },
+  quickActionIconMuted: { backgroundColor: colors.surface },
+  quickActionIconDisabled: { backgroundColor: colors.surface, opacity: 0.4 },
+  quickActionLabel: { fontSize: 12, color: colors.textSecondary, fontWeight: '500', textAlign: 'center' },
   quickActionLabelDisabled: { opacity: 0.4 },
 
   section: { marginBottom: 20, paddingHorizontal: 16 },
-  sectionTitle: { fontSize: 13, fontWeight: '600', color: COLORS.textTertiary, textTransform: 'uppercase', marginBottom: 8, marginLeft: 4 },
-  card: { backgroundColor: COLORS.surface, borderRadius: 16, overflow: 'hidden' },
-  sep: { height: 1, backgroundColor: COLORS.border, marginLeft: 64 },
+  sectionTitle: { fontSize: 13, fontWeight: '600', color: colors.textMuted, textTransform: 'uppercase', marginBottom: 8, marginLeft: 4 },
+  card: { backgroundColor: colors.surface, borderRadius: 16, overflow: 'hidden' },
+  sep: { height: 1, backgroundColor: colors.border, marginLeft: 64 },
 
   row: { flexDirection: 'row', alignItems: 'center', padding: 14 },
-  rowIcon: { width: 36, height: 36, borderRadius: 10, backgroundColor: COLORS.surfaceLight, justifyContent: 'center', alignItems: 'center', marginRight: 14 },
-  rowIconDanger: { backgroundColor: COLORS.dangerLight },
+  rowIcon: { width: 36, height: 36, borderRadius: 10, backgroundColor: colors.surfaceLight, justifyContent: 'center', alignItems: 'center', marginRight: 14 },
+  rowIconDanger: { backgroundColor: (colors.danger + "1F") },
   rowContent: { flex: 1 },
-  rowTitle: { fontSize: 16, fontWeight: '500', color: COLORS.text },
-  rowTitleDanger: { color: COLORS.danger },
-  rowSubtitle: { fontSize: 13, color: COLORS.textSecondary, marginTop: 2 },
-  mono: { fontFamily: 'monospace', fontSize: 11, letterSpacing: 1, color: COLORS.textTertiary },
+  rowTitle: { fontSize: 16, fontWeight: '500', color: colors.text },
+  rowTitleDanger: { color: colors.danger },
+  rowSubtitle: { fontSize: 13, color: colors.textSecondary, marginTop: 2 },
+  mono: { fontFamily: 'monospace', fontSize: 11, letterSpacing: 1, color: colors.textMuted },
 
-  toggle: { width: 50, height: 30, borderRadius: 15, backgroundColor: COLORS.primary, padding: 3 },
-  toggleOff: { backgroundColor: COLORS.surfaceLight },
+  toggle: { width: 50, height: 30, borderRadius: 15, backgroundColor: colors.primary, padding: 3 },
+  toggleOff: { backgroundColor: colors.surfaceLight },
   toggleKnob: { width: 24, height: 24, borderRadius: 12, backgroundColor: '#FFF', alignSelf: 'flex-end' },
   toggleKnobOff: { alignSelf: 'flex-start' },
-  rightText: { fontSize: 14, color: COLORS.primary, fontWeight: '600' },
+  rightText: { fontSize: 14, color: colors.primary, fontWeight: '600' },
 
-  dangerBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginHorizontal: 16, marginBottom: 24, padding: 16, backgroundColor: COLORS.dangerLight, borderRadius: 16, gap: 10 },
-  dangerBtnText: { fontSize: 16, fontWeight: '600', color: COLORS.danger },
+  dangerBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginHorizontal: 16, marginBottom: 24, padding: 16, backgroundColor: (colors.danger + "1F"), borderRadius: 16, gap: 10 },
+  dangerBtnText: { fontSize: 16, fontWeight: '600', color: colors.danger },
 
-  footer: { textAlign: 'center', fontSize: 13, color: COLORS.textTertiary, paddingHorizontal: 20 },
-  footerTagline: { textAlign: 'center', fontSize: 12, fontWeight: '500', color: COLORS.primary, marginTop: 8, marginBottom: 20, opacity: 0.6 },
-});
+  footer: { textAlign: 'center', fontSize: 13, color: colors.textMuted, paddingHorizontal: 20 },
+  footerTagline: { textAlign: 'center', fontSize: 12, fontWeight: '500', color: colors.primary, marginTop: 8, marginBottom: 20, opacity: 0.6 },
+}) as const;
 
 export default ContactInfoScreen;

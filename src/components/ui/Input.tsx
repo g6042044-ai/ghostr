@@ -2,20 +2,11 @@
 // Composants d'entrée simples et robustes
 
 import React, { useState, useRef, useEffect } from 'react';
-import {
-  View,
-  TextInput,
-  Text,
-  StyleSheet,
-  Animated,
-  TouchableOpacity,
-  Platform,
-  TextInputProps,
-  ViewStyle,
-  ActivityIndicator,
-} from 'react-native';
+import { View, TextInput, Text, Animated, TouchableOpacity, Platform, TextInputProps, ViewStyle, ActivityIndicator } from 'react-native';
 import Svg, { Path } from 'react-native-svg';
-import { theme } from './theme';
+import { useTranslation } from 'react-i18next';
+import { useTheme, useThemedStyles } from './ThemeContext';
+import type { ColorPalette } from './theme';
 
 // ============================================
 // SEND ICON
@@ -89,6 +80,8 @@ export const Input: React.FC<InputProps> = ({
   secureTextEntry,
   ...props
 }) => {
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
   const [isFocused, setIsFocused] = useState(false);
 
   const handleFocus = (e: any) => {
@@ -131,7 +124,7 @@ export const Input: React.FC<InputProps> = ({
             rightIcon && styles.inputWithRightIcon,
             style,
           ]}
-          placeholderTextColor={theme.colors.placeholder}
+          placeholderTextColor={colors.placeholder}
           onFocus={handleFocus}
           onBlur={handleBlur}
           secureTextEntry={secureTextEntry}
@@ -164,6 +157,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   disabled = false,
   maxLength = 5000,
 }) => {
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
   const inputRef = useRef<TextInput>(null);
   const canSend = value.trim().length > 0 && !sending && !disabled;
 
@@ -176,7 +171,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
           value={value}
           onChangeText={onChangeText}
           placeholder={placeholder}
-          placeholderTextColor={theme.colors.placeholder}
+          placeholderTextColor={colors.placeholder}
           multiline
           maxLength={maxLength}
           editable={!disabled}
@@ -195,7 +190,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         {sending ? (
           <ActivityIndicator size="small" color="#FFFFFF" />
         ) : (
-          <SendIcon color={canSend ? '#FFFFFF' : theme.colors.textMuted} />
+          <SendIcon color={canSend ? '#FFFFFF' : colors.textMuted} />
         )}
       </TouchableOpacity>
     </View>
@@ -213,6 +208,8 @@ export const SearchInput: React.FC<SearchInputProps> = ({
   onClear,
   autoFocus = false,
 }) => {
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
   return (
     <View style={styles.searchContainer}>
       <View style={styles.searchIconWrapper}>
@@ -224,7 +221,7 @@ export const SearchInput: React.FC<SearchInputProps> = ({
         value={value}
         onChangeText={onChangeText}
         placeholder={placeholder}
-        placeholderTextColor={theme.colors.placeholder}
+        placeholderTextColor={colors.placeholder}
         autoFocus={autoFocus}
         returnKeyType="search"
       />
@@ -249,6 +246,7 @@ export const PINInput: React.FC<PINInputProps> = ({
   error = false,
   secure = true,
 }) => {
+  const styles = useThemedStyles(makeStyles);
   const inputRef = useRef<TextInput>(null);
   const shakeAnim = useRef(new Animated.Value(0)).current;
 
@@ -330,18 +328,22 @@ interface CodeInputProps {
 export const CodeInput: React.FC<CodeInputProps> = ({
   value,
   onChangeText,
-  placeholder = 'Entrez le code...',
+  placeholder,
   error,
   hint,
 }) => {
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
+  const resolvedPlaceholder = placeholder ?? t('input.enterCode');
   return (
     <View style={styles.codeInputContainer}>
       <TextInput
         style={[styles.codeInput, error && styles.codeInputError]}
         value={value}
         onChangeText={onChangeText}
-        placeholder={placeholder}
-        placeholderTextColor={theme.colors.placeholder}
+        placeholder={resolvedPlaceholder}
+        placeholderTextColor={colors.placeholder}
         multiline
         autoCapitalize="characters"
         autoCorrect={false}
@@ -361,7 +363,7 @@ export const CodeInput: React.FC<CodeInputProps> = ({
 // STYLES
 // ============================================
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   // Standard Input
   inputContainer: {
     marginBottom: 16,
@@ -369,28 +371,28 @@ const styles = StyleSheet.create({
   label: {
     fontSize: 14,
     fontWeight: '600',
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
     marginBottom: 8,
     marginLeft: 4,
   },
   labelError: {
-    color: theme.colors.danger,
+    color: colors.danger,
   },
   inputWrapper: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: theme.colors.inputBackground,
+    backgroundColor: colors.inputBackground,
     borderRadius: 16,
     borderWidth: 1.5,
-    borderColor: theme.colors.inputBorder,
+    borderColor: colors.inputBorder,
     minHeight: 48,
   },
   inputWrapperFocused: {
-    borderColor: theme.colors.primary,
-    backgroundColor: theme.colors.surfaceElevated,
+    borderColor: colors.primary,
+    backgroundColor: colors.surfaceElevated,
   },
   inputWrapperError: {
-    borderColor: theme.colors.danger,
+    borderColor: colors.danger,
   },
   input: {
     flex: 1,
@@ -398,7 +400,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 12,
     fontSize: 16,
-    color: theme.colors.text,
+    color: colors.text,
   },
   inputWithLeftIcon: {
     paddingLeft: 8,
@@ -414,12 +416,12 @@ const styles = StyleSheet.create({
   },
   hint: {
     fontSize: 12,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     marginTop: 6,
     marginLeft: 4,
   },
   errorText: {
-    color: theme.colors.danger,
+    color: colors.danger,
   },
 
   // Chat Input
@@ -430,10 +432,10 @@ const styles = StyleSheet.create({
   },
   chatInputWrapper: {
     flex: 1,
-    backgroundColor: theme.colors.inputBackground,
+    backgroundColor: colors.inputBackground,
     borderRadius: 24,
     borderWidth: 1,
-    borderColor: theme.colors.border,
+    borderColor: colors.border,
     paddingHorizontal: 16,
     paddingVertical: Platform.OS === 'ios' ? 10 : 6,
     minHeight: 48,
@@ -442,7 +444,7 @@ const styles = StyleSheet.create({
   },
   chatInput: {
     fontSize: 16,
-    color: theme.colors.text,
+    color: colors.text,
     maxHeight: 100,
     lineHeight: 22,
     paddingTop: 0,
@@ -456,17 +458,17 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   sendButtonActive: {
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
   },
   sendButtonInactive: {
-    backgroundColor: theme.colors.surfaceLight,
+    backgroundColor: colors.surfaceLight,
   },
 
   // Search Input
   searchContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: theme.colors.inputBackground,
+    backgroundColor: colors.inputBackground,
     borderRadius: 16,
     paddingHorizontal: 12,
     minHeight: 44,
@@ -481,7 +483,7 @@ const styles = StyleSheet.create({
   searchInput: {
     flex: 1,
     fontSize: 16,
-    color: theme.colors.text,
+    color: colors.text,
     paddingVertical: 10,
   },
   clearButton: {
@@ -489,7 +491,7 @@ const styles = StyleSheet.create({
   },
   clearIcon: {
     fontSize: 14,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
   },
 
   // PIN Input
@@ -502,32 +504,32 @@ const styles = StyleSheet.create({
     width: 48,
     height: 48,
     borderRadius: 12,
-    backgroundColor: theme.colors.inputBackground,
+    backgroundColor: colors.inputBackground,
     borderWidth: 2,
-    borderColor: theme.colors.inputBorder,
+    borderColor: colors.inputBorder,
     alignItems: 'center',
     justifyContent: 'center',
   },
   pinDotFilled: {
-    borderColor: theme.colors.primary,
-    backgroundColor: theme.colors.surfaceElevated,
+    borderColor: colors.primary,
+    backgroundColor: colors.surfaceElevated,
   },
   pinDotActive: {
-    borderColor: theme.colors.primary,
+    borderColor: colors.primary,
   },
   pinDotError: {
-    borderColor: theme.colors.danger,
+    borderColor: colors.danger,
   },
   pinDotInner: {
     width: 12,
     height: 12,
     borderRadius: 6,
-    backgroundColor: theme.colors.text,
+    backgroundColor: colors.text,
   },
   pinDotText: {
     fontSize: 20,
     fontWeight: '600',
-    color: theme.colors.text,
+    color: colors.text,
   },
   hiddenInput: {
     position: 'absolute',
@@ -540,29 +542,29 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   codeInput: {
-    backgroundColor: theme.colors.inputBackground,
+    backgroundColor: colors.inputBackground,
     borderRadius: 16,
     borderWidth: 1.5,
-    borderColor: theme.colors.inputBorder,
+    borderColor: colors.inputBorder,
     paddingHorizontal: 16,
     paddingVertical: 14,
     fontSize: 16,
-    color: theme.colors.text,
+    color: colors.text,
     minHeight: 100,
     textAlignVertical: 'top',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
   codeInputError: {
-    borderColor: theme.colors.danger,
+    borderColor: colors.danger,
   },
   codeHint: {
     fontSize: 12,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     marginTop: 8,
   },
   codeError: {
-    color: theme.colors.danger,
+    color: colors.danger,
   },
-});
+}) as const;
 
 export default Input;

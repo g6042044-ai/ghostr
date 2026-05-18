@@ -27,6 +27,7 @@
       <dict>
         <key>CFBundleURLSchemes</key>
         <array>
+          <string>ghostr</string>
           <string>com.ghostr.app</string>
         </array>
       </dict>
@@ -53,19 +54,15 @@
       <true/>
     </dict>
     <key>NSCameraUsageDescription</key>
-    <string>Allow Ghostr to access your camera for QR code scanning.</string>
+    <string>Ghostr uses the camera to scan QR codes for joining conversations and verifying contacts, to take photos you choose to send inside a conversation, and to set or update your profile picture.</string>
     <key>NSFaceIDUsageDescription</key>
-    <string>Allow Ghostr to use Face ID to unlock the app.</string>
+    <string>Allow $(PRODUCT_NAME) to access your Face ID biometric data.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Allow Ghostr to access your microphone for voice calls.</string>
+    <string>Ghostr uses the microphone for end-to-end encrypted voice calls and to record voice messages you send inside a conversation.</string>
     <key>NSPhotoLibraryAddUsageDescription</key>
-    <string>Allow Ghostr to save images to your photo library.</string>
+    <string>Ghostr saves images to your photo library when you tap Save on a photo received in a conversation.</string>
     <key>NSPhotoLibraryUsageDescription</key>
-    <string>Allow Ghostr to access your photos to share images.</string>
-    <key>NSUserNotificationAlertStyle</key>
-    <string>alert</string>
-    <key>NSUserNotificationsUsageDescription</key>
-    <string>Show recording notifications and controls</string>
+    <string>Ghostr accesses your photos when you choose to send an image inside a conversation or set a profile picture.</string>
     <key>RCTNewArchEnabled</key>
     <true/>
     <key>UIBackgroundModes</key>

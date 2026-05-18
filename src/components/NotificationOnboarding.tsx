@@ -20,20 +20,16 @@
 //   }} />
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import {
-  View, Text, TouchableOpacity, StyleSheet, Platform,
-  Animated, Easing,
-} from 'react-native';
-import * as Notifications from 'expo-notifications';
+import { View, Text, TouchableOpacity, StyleSheet, Animated, Easing } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useTranslation } from 'react-i18next';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
-import { theme } from './ui/theme';
-import {
-  hasCompletedNotificationOnboarding,
-  markNotificationOnboardingDone,
-  setPushEnabled,
-} from '../services/pushNotificationService';
+import { useTheme, useThemedStyles, type ColorPalette } from './ui';
+import { hasCompletedNotificationOnboarding, markNotificationOnboardingDone, setPushEnabled } from '../services/pushNotificationService';
+import { ensureNotificationPermission } from '../services/permissions';
+// PERM FIX : Notifications + suppressLock/releaseLock retirés — gérés par
+// ensureNotificationPermission dans le service permissions.
 
 // ============================================
 // TYPES
@@ -51,9 +47,12 @@ type Step = 'permission' | 'hidden';
 // ============================================
 
 export const NotificationOnboarding: React.FC<Props> = ({ onComplete }) => {
+  const { colors, isDark } = useTheme();
+  const styles = useThemedStyles(makeStyles);
   const [step, setStep] = useState<Step>('hidden');
   const [loading, setLoading] = useState(false);
   const insets = useSafeAreaInsets();
+  const { t } = useTranslation();
 
   // Animations
   const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -104,9 +103,17 @@ export const NotificationOnboarding: React.FC<Props> = ({ onComplete }) => {
   // ── Accepter les notifications ──
   const handleAccept = useCallback(async () => {
     setLoading(true);
+    // PERM FIX : ensureNotificationPermission gère :
+    //   - suppressLock/releaseLock pendant le dialog OS
+    //   - distinction granted/denied/blocked
+    //   - sur iOS, l'option provisional est gérée (allowProvisional: false)
+    //
+    // IMPORTANT : on désactive `showAlertOnFailure` car ce composant a son
+    // propre flux UX (animation de fade-out, marquer onboarding done, etc.).
+    // Le service ne doit pas pop un Alert par-dessus l'écran onboarding.
     try {
-      const { status } = await Notifications.requestPermissionsAsync();
-      if (status === 'granted') {
+      const perm = await ensureNotificationPermission({ showAlertOnFailure: false });
+      if (perm.status === 'granted') {
         // iOS + Android: terminé dès que la permission est accordée.
         // Pas d'étape "bannière persistante" — ce réglage iOS rend
         // TOUTES les notifications persistantes (messages inclus).
@@ -115,7 +122,11 @@ export const NotificationOnboarding: React.FC<Props> = ({ onComplete }) => {
         await markNotificationOnboardingDone();
         _animateOut(() => onComplete(true));
       } else {
-        // Permission refusée → fermer et ne plus montrer
+        // Permission refusée (denied OU blocked) → fermer et ne plus montrer
+        // l'onboarding. L'utilisateur peut toujours réactiver les notifs
+        // depuis les paramètres système plus tard. Sur Android, on pourrait
+        // re-prompter (canAskAgain=true) mais on respecte le choix initial
+        // pour ne pas être harcelant.
         await markNotificationOnboardingDone();
         await setPushEnabled(false);
         _animateOut(() => onComplete(false));
@@ -146,17 +157,35 @@ export const NotificationOnboarding: React.FC<Props> = ({ onComplete }) => {
     position: 'absolute' as const,
     width: size, height: size, borderRadius: size / 2,
     borderWidth: 1.5,
-    borderColor: theme.colors.primary,
+    borderColor: colors.primary,
     opacity: ring.interpolate({ inputRange: [0, 1], outputRange: [0.5, 0] }),
     transform: [{ scale: ring.interpolate({ inputRange: [0, 1], outputRange: [1, 2.5] }) }],
   });
 
   if (step === 'hidden') return null;
 
+  // Background gradient: subtle "depth" effect with edges slightly darker
+  // than the center. Was hardcoded to dark hex values in v1; now derived
+  // from the theme palette so the screen reads correctly in both modes.
+  //
+  // Implementation: dark theme uses the original three-tone near-black
+  // depth stack. Light theme uses a similar subtle stack but inverted —
+  // the center is faintly cooler/lighter than the edges, against an
+  // overall light substrate, so we preserve the "deep space" feel
+  // without literally drawing it in black.
+  //
+  // The `as const` + `[string, string, string, string, string]` cast is
+  // for expo-linear-gradient's strict tuple type — at least 2 string
+  // entries are required and our two branches each have exactly 5.
+  const gradientStops = (isDark
+    ? ['#070A0E', '#0A1018', '#0D1520', '#0A1018', '#070A0E']
+    : [colors.background, colors.surface, colors.surfaceLight, colors.surface, colors.background]
+  ) as readonly [string, string, string, string, string];
+
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim }]}>
       <LinearGradient
-        colors={['#070A0E', '#0A1018', '#0D1520', '#0A1018', '#070A0E']}
+        colors={gradientStops}
         locations={[0, 0.25, 0.5, 0.75, 1]}
         style={StyleSheet.absoluteFillObject}
       />
@@ -173,7 +202,7 @@ export const NotificationOnboarding: React.FC<Props> = ({ onComplete }) => {
               <Ionicons
                 name="notifications"
                 size={40}
-                color={theme.colors.primary}
+                color={colors.primary}
               />
             </View>
           </View>
@@ -184,16 +213,17 @@ export const NotificationOnboarding: React.FC<Props> = ({ onComplete }) => {
 
           {step === 'permission' && (
             <>
-              <Text style={styles.title}>Restez joignable</Text>
+              <Text style={styles.title}>{t('notificationOnboarding.stayReachable')}</Text>
               <Text style={styles.description}>
-                Activez les notifications pour être alerté des{' '}
-                <Text style={styles.highlight}>messages</Text> et{' '}
-                <Text style={styles.highlight}>appels entrants</Text>,
-                même quand l'application est fermée.
+                {t('notificationOnboarding.description1')}
+                <Text style={styles.highlight}>{t('notificationOnboarding.highlightMessages')}</Text>
+                {t('notificationOnboarding.descriptionAnd')}
+                <Text style={styles.highlight}>{t('notificationOnboarding.highlightCalls')}</Text>
+                {t('notificationOnboarding.description2')}
               </Text>
               <Text style={styles.privacy}>
-                <Ionicons name="shield-checkmark" size={13} color={theme.colors.success} />
-                {'  '}Le contenu reste chiffré et invisible dans les notifications.
+                <Ionicons name="shield-checkmark" size={13} color={colors.success} />
+                {'  '}{t('notificationOnboarding.privacyShort')}
               </Text>
             </>
           )}
@@ -210,14 +240,14 @@ export const NotificationOnboarding: React.FC<Props> = ({ onComplete }) => {
                 activeOpacity={0.8}
                 disabled={loading}
               >
-                <Ionicons name="notifications" size={20} color={theme.colors.textOnPrimary} />
+                <Ionicons name="notifications" size={20} color={colors.textOnPrimary} />
                 <Text style={styles.primaryBtnText}>
-                  {loading ? 'Chargement…' : 'Activer les notifications'}
+                  {loading ? t('common.loading') : t('notificationOnboarding.enableNotifications')}
                 </Text>
               </TouchableOpacity>
 
               <TouchableOpacity style={styles.skipBtn} onPress={handleDecline} activeOpacity={0.7}>
-                <Text style={styles.skipBtnText}>Pas maintenant</Text>
+                <Text style={styles.skipBtnText}>{t('notificationOnboarding.notNow')}</Text>
               </TouchableOpacity>
             </>
           )}
@@ -228,32 +258,12 @@ export const NotificationOnboarding: React.FC<Props> = ({ onComplete }) => {
 };
 
 // ============================================
-// STEP ITEM (iOS étape 2)
-// ============================================
-
-const StepItem: React.FC<{
-  num: string; text: string; icon: string; active?: boolean;
-}> = ({ num, text, icon, active }) => (
-  <View style={styles.stepRow}>
-    <View style={[styles.stepBadge, active && styles.stepBadgeActive]}>
-      <Text style={[styles.stepNum, active && styles.stepNumActive]}>{num}</Text>
-    </View>
-    <Text style={[styles.stepText, active && styles.stepTextActive]}>{text}</Text>
-    <Ionicons
-      name={icon as any}
-      size={17}
-      color={active ? theme.colors.primary : theme.colors.textMuted}
-    />
-  </View>
-);
-
-// ============================================
 // STYLES
 // ============================================
 
 const ICON_SIZE = 88;
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   container: {
     ...StyleSheet.absoluteFillObject,
     zIndex: 9999,
@@ -294,25 +304,25 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 28,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
     letterSpacing: -0.5,
     marginBottom: 14,
     textAlign: 'center',
   },
   description: {
     fontSize: 16,
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
     textAlign: 'center',
     lineHeight: 24,
     marginBottom: 16,
   },
   highlight: {
-    color: theme.colors.primary,
+    color: colors.primary,
     fontWeight: '600',
   },
   privacy: {
     fontSize: 13,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     textAlign: 'center',
     lineHeight: 18,
   },
@@ -320,7 +330,7 @@ const styles = StyleSheet.create({
   // Steps card (iOS step 2)
   stepsCard: {
     width: '100%',
-    backgroundColor: theme.colors.surfaceLight,
+    backgroundColor: colors.surfaceLight,
     borderRadius: 14,
     padding: 14,
     marginTop: 8,
@@ -333,7 +343,7 @@ const styles = StyleSheet.create({
   },
   stepDivider: {
     height: 1,
-    backgroundColor: theme.colors.divider,
+    backgroundColor: colors.divider,
     marginVertical: 9,
     marginLeft: 34,
   },
@@ -341,29 +351,29 @@ const styles = StyleSheet.create({
     width: 24,
     height: 24,
     borderRadius: 12,
-    backgroundColor: theme.colors.surfaceElevated,
+    backgroundColor: colors.surfaceElevated,
     alignItems: 'center',
     justifyContent: 'center',
   },
   stepBadgeActive: {
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
   },
   stepNum: {
     fontSize: 12,
     fontWeight: '700',
-    color: theme.colors.textSecondary,
+    color: colors.textSecondary,
   },
   stepNumActive: {
-    color: theme.colors.textOnPrimary,
+    color: colors.textOnPrimary,
   },
   stepText: {
     fontSize: 14,
-    color: theme.colors.text,
+    color: colors.text,
     flex: 1,
   },
   stepTextActive: {
     fontWeight: '600',
-    color: theme.colors.primary,
+    color: colors.primary,
   },
 
   // Actions
@@ -371,14 +381,14 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   primaryBtn: {
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
     borderRadius: 16,
     height: 54,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 10,
-    shadowColor: theme.colors.primary,
+    shadowColor: colors.primary,
     shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.3,
     shadowRadius: 16,
@@ -387,10 +397,10 @@ const styles = StyleSheet.create({
   primaryBtnText: {
     fontSize: 17,
     fontWeight: '700',
-    color: theme.colors.textOnPrimary,
+    color: colors.textOnPrimary,
   },
   doneBtn: {
-    backgroundColor: theme.colors.surfaceLight,
+    backgroundColor: colors.surfaceLight,
     borderRadius: 14,
     height: 48,
     flexDirection: 'row',
@@ -401,7 +411,7 @@ const styles = StyleSheet.create({
   doneBtnText: {
     fontSize: 15,
     fontWeight: '600',
-    color: theme.colors.primary,
+    color: colors.primary,
   },
   skipBtn: {
     height: 42,
@@ -410,8 +420,8 @@ const styles = StyleSheet.create({
   },
   skipBtnText: {
     fontSize: 14,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
   },
-});
+}) as const;
 
 export default NotificationOnboarding;

@@ -1,27 +1,30 @@
 // cloudflare-relay/sfu-worker.js
 // Whisper Anonymous Voice SFU - Cloudflare Worker + Durable Objects
-// Version 8.0 - AMÉLIORATIONS ROBUSTESSE:
+// Version 9.0 - P0-A6: 1-TO-1 ONLY (group calls = dead code)
+//   - v9.0: MAX_PARTICIPANTS=2 strict (1-to-1 uniquement)
+//   - v9.0: Suppression des broadcast loops inutiles (avec 2 peers, 1 seul "autre")
+//   - v9.0: Surface d'attaque réduite (pas de 3ème participant possible)
 //   - v8.0: Gestion robuste des messages non-JSON et binaires
 //   - v8.0: Validation stricte des messages entrants
-//   - v8.0: Meilleure gestion des erreurs sans crash
 //   - v8.0: Logging sécurisé (sans données sensibles)
-//   - v7.0: peer-left inclut senderToken pour identification côté client
-//   - v3.0: roomAuthToken pour authentifier les participants
 //
-// ARCHITECTURE:
-// - WebSocket pour chaque participant
+// ARCHITECTURE 1-to-1:
+// - WebSocket pour chaque participant (max 2)
 // - Durable Object par room (tag anonyme)
 // - Forward des paquets audio sans déchiffrement (E2E préservé)
 // - Aucune métadonnée stockée
-// - Support jusqu'à 20 participants par room
+// - SÉCURITÉ: Avec MAX_PARTICIPANTS=2, un attaquant ayant volé un token de room
+//   ne peut PAS rejoindre comme 3ème "écouteur silencieux" — la room est full.
 
 // ============================================
 // CONFIGURATION
 // ============================================
 
 const CONFIG = {
-  // Nombre maximum de participants par room
-  MAX_PARTICIPANTS: 20,
+  // P0-A6: 1-to-1 ONLY. Les appels de groupe sont du code mort dans Ghostr.
+  // Cette limite stricte ferme la fenêtre d'attaque "écouteur silencieux"
+  // (un attaquant avec le token de room ne peut plus rejoindre).
+  MAX_PARTICIPANTS: 2,
   // Timeout d'inactivité avant fermeture de la room (ms)
   INACTIVITY_TIMEOUT_MS: 3 * 60 * 1000,
   // Intervalle de ping/pong (ms)
@@ -33,7 +36,7 @@ const CONFIG = {
   // Durée de validité d'un token d'auth (ms)
   AUTH_TOKEN_VALIDITY_MS: 60 * 1000,
   // Version du protocole
-  VERSION: '8.0',
+  VERSION: '9.0',
 };
 
 // ============================================
@@ -391,7 +394,7 @@ export class VoiceRoom {
       return;
     }
     
-    // Vérifier la limite (race condition)
+    // P0-A6: Limite stricte 2 participants (1-to-1 only)
     if (this.peers.size >= CONFIG.MAX_PARTICIPANTS) {
       this.sendError(socket, 'Room full');
       socket.close(1013, 'Room full');
@@ -403,19 +406,23 @@ export class VoiceRoom {
       this.roomTag = roomTag.slice(0, 8);
     }
     
-    // Notifier les peers existants
-    for (const [existingPeerId, peer] of this.peers) {
-      // Notifier le nouveau peer des peers existants
+    // P0-A6: Avec 1-to-1, il y a au plus 1 autre peer existant.
+    // Pas besoin de boucle — accès direct via .values().next().
+    const existingPeer = this.peers.size > 0 ? this.peers.values().next().value : null;
+    const existingPeerId = this.peers.size > 0 ? this.peers.keys().next().value : null;
+
+    if (existingPeer && existingPeerId) {
+      // Notifier le nouveau peer du peer existant
       this.safeSend(socket, {
         type: 'peer-joined',
         peerId: existingPeerId,
-        senderToken: peer.senderTokenHash,
-        isMuted: peer.isMuted || false,
+        senderToken: existingPeer.senderTokenHash,
+        isMuted: existingPeer.isMuted || false,
         timestamp: Date.now(),
       });
-      
-      // Notifier les peers existants du nouveau
-      this.safeSend(peer.socket, {
+
+      // Notifier le peer existant du nouveau
+      this.safeSend(existingPeer.socket, {
         type: 'peer-joined',
         peerId: peerId,
         senderToken: senderToken,
@@ -448,7 +455,7 @@ export class VoiceRoom {
     
     peer.isMuted = message.muted || false;
     
-    // Notifier les autres peers
+    // P0-A6: Notifier l'autre peer (au plus 1 en 1-to-1).
     for (const [otherPeerId, otherPeer] of this.peers) {
       if (otherPeerId !== peerId) {
         this.safeSend(otherPeer.socket, {
@@ -457,6 +464,7 @@ export class VoiceRoom {
           muted: peer.isMuted,
           timestamp: Date.now(),
         });
+        break; // Avec 2 peers max, 1 seul "autre" possible
       }
     }
   }
@@ -493,7 +501,8 @@ export class VoiceRoom {
     // Supprimer le peer
     this.peers.delete(peerId);
     
-    // Notifier les autres peers avec le senderToken pour identification
+    // P0-A6: Notifier l'autre peer (au plus 1 en 1-to-1).
+    // Pas besoin de boucle — on break dès le premier.
     for (const [_, otherPeer] of this.peers) {
       this.safeSend(otherPeer.socket, {
         type: 'peer-left',
@@ -501,6 +510,7 @@ export class VoiceRoom {
         senderToken: senderToken,
         timestamp: Date.now(),
       });
+      break;
     }
     
     // Si la room est vide, nettoyer
@@ -522,7 +532,7 @@ export class VoiceRoom {
     
     this.stats.totalPackets++;
     
-    // Forward le paquet à tous les autres peers
+    // Forward le paquet à l'autre peer
     // Le serveur ne regarde PAS le contenu - juste forward (E2E préservé)
     const forwardMessage = {
       type: 'audio',
@@ -532,9 +542,13 @@ export class VoiceRoom {
       timestamp: message.timestamp || Date.now(),
     };
     
+    // P0-A6: 1-to-1 → un seul "autre peer" possible.
+    // Break dès le premier match au lieu de boucler inutilement.
+    // Sur 50 paquets/s, ça économise des comparaisons en hot path.
     for (const [peerId, peer] of this.peers) {
       if (peerId !== fromPeerId) {
         this.safeSend(peer.socket, forwardMessage);
+        break;
       }
     }
   }

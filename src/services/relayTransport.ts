@@ -16,10 +16,12 @@
 //   const result = await relayRpc('send_sealed_message', { p_tag, p_sealed_content, p_version });
 
 import nacl from 'tweetnacl';
-import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
+import { decodeBase64 } from 'tweetnacl-util';
 import { secureRandomInt } from './crypto';
+import i18n from '../i18n';
 // R-03: sha256 via @noble/hashes (crypto.subtle non disponible sur Hermes/React Native)
 import { sha256 } from '@noble/hashes/sha256';
+import { isMigrationFrozen } from './migrationState';
 
 // ============================================
 // CONFIGURATION
@@ -147,6 +149,9 @@ const ALLOWED_RPCS = [
   'download_blob',
   'delete_blob',
   // ACTION-01 (Phase 1 Security): Legacy media SUPPRIMÉ (P0-A2)
+  // App notice (kill-switch / deprecation banner) — payload signé Ed25519,
+  // vérification client-side, server non-confiance. Cf. src/services/appNotice.ts
+  'get_app_notice',
 ] as const;
 
 type AllowedRpc = typeof ALLOWED_RPCS[number];
@@ -182,6 +187,27 @@ const state: RelayState = {
 
 // ACTION 10: Refresh interval for gateway keys (1h)
 const KEY_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+
+// ════════════════════════════════════════════════════════════════════════════
+// SINGLETON GUARD POUR initRelay()
+// ════════════════════════════════════════════════════════════════════════════
+// Avant ce fix, plusieurs callers concurrents (bootstrapSealedSender en
+// background + fetchInviteFromServer après scan QR + secureRpc lazy-init)
+// pouvaient déclencher chacun un `initRelay` complet en parallèle :
+//   - Plusieurs fetch HTTPS du manifest
+//   - Plusieurs vérifications Ed25519 (CPU-bound)
+//   - Risque de race sur `state.gateways` (push concurrent)
+//   - Latence multipliée par N callers
+//
+// Avec le singleton :
+//   - Le 1er caller crée la promesse et tous les autres awaitent la MÊME promesse
+//   - 1 seul fetch + 1 seule vérification crypto, peu importe N
+//   - La promesse est nullifiée à la fin pour permettre le refresh à 1h
+//
+// SÉCURITÉ : aucun impact. La logique de validation Ed25519 + pinning reste
+// strictement identique. Le singleton n'affecte QUE la concurrence d'appel.
+// ════════════════════════════════════════════════════════════════════════════
+let _initRelayPromise: Promise<boolean> | null = null;
 
 // PERF A8: Timeout sur les requêtes réseau OHTTP.
 // Sans timeout, un fetch peut rester en attente 30-60s (timeout TCP de React Native)
@@ -226,8 +252,48 @@ async function fetchWithTimeout(
  * Fetch gateway public keys.
  * ACTION 09: Tries multi-gateway manifests first, falls back to single gateway.
  * ACTION 10: Auto-refreshes keys every hour.
+ *
+ * SINGLETON CONCURRENT-SAFE : si plusieurs callers concurrents appellent
+ * initRelay(), tous awaitent la MÊME promesse. Évite les fetch + vérifications
+ * Ed25519 redondants en cas de bootstrap parallèle (cf. _initRelayPromise).
  */
 export async function initRelay(): Promise<boolean> {
+  // Fast-path : initialisé + clé fraîche → retour immédiat sans toucher au lock.
+  // Évite de prendre le verrou de la promesse pour le cas le plus fréquent
+  // (toutes les requêtes après le 1er init réussi).
+  if (state.initialized && state.available
+      && Date.now() - state.lastKeyRefresh < KEY_REFRESH_INTERVAL_MS) {
+    return true;
+  }
+
+  // Si une init/refresh est déjà en cours, tous les callers convergent
+  // sur la même promesse. Le 2e, 3e... appel renvoie la promesse existante
+  // sans relancer le fetch ni les vérifications crypto.
+  if (_initRelayPromise) {
+    return _initRelayPromise;
+  }
+
+  // 1er caller : crée la promesse partagée et la stocke immédiatement
+  // (avant tout await) pour que les callers concurrents y atterrissent.
+  _initRelayPromise = _doInitRelay().finally(() => {
+    // Nullification une fois la promesse résolue/rejetée pour permettre :
+    //   - le refresh des clés après KEY_REFRESH_INTERVAL_MS (1h)
+    //   - une nouvelle tentative si l'init précédente a échoué
+    // SAFE : les callers qui ont déjà la promesse en main reçoivent toujours
+    // leur résultat. Les NOUVEAUX callers verront `_initRelayPromise === null`
+    // et relanceront un fetch (ce qui est le comportement voulu pour refresh
+    // ou retry).
+    _initRelayPromise = null;
+  });
+
+  return _initRelayPromise;
+}
+
+/**
+ * Implémentation interne de initRelay (anciennement le corps de initRelay).
+ * Ne pas appeler directement — passer par initRelay() pour le singleton.
+ */
+async function _doInitRelay(): Promise<boolean> {
   if (state.initialized && state.available) {
     // ACTION 10: Check if keys need refresh
     if (Date.now() - state.lastKeyRefresh < KEY_REFRESH_INTERVAL_MS) {
@@ -571,6 +637,32 @@ export async function secureRpc(
   rpc: string,
   params: Record<string, unknown>
 ): Promise<{ data: any; error: { message: string } | null }> {
+  // ╔════════════════════════════════════════════════════════════════════╗
+  // ║ MIGRATION FROZEN GUARD — defense in depth                          ║
+  // ╠════════════════════════════════════════════════════════════════════╣
+  // ║ When the device has exported its identity for migration, NO send   ║
+  // ║ may happen — otherwise the Triple Ratchet state on the new device  ║
+  // ║ becomes inconsistent (nonce reuse, DH ratchet divergence). The     ║
+  // ║ App.tsx boot guard prevents reaching normal app flow when frozen,  ║
+  // ║ but background tasks (timers, push handlers, AppState listeners)   ║
+  // ║ may still try to call secureRpc. This guard ensures none reach     ║
+  // ║ the network.                                                        ║
+  // ║                                                                     ║
+  // ║ Note: isMigrationFrozen() is sync and reads from a module-level    ║
+  // ║ cache populated by App.tsx's boot via loadMarkerFromDisk(). If     ║
+  // ║ called before that cache is loaded, returns false (fail-open with  ║
+  // ║ a warning — App.tsx's render guard catches it as the primary).     ║
+  // ╚════════════════════════════════════════════════════════════════════╝
+  if (isMigrationFrozen()) {
+    __DEV__ && console.warn(`[SecureRpc] 🚫 Migration frozen — rejecting ${rpc}`);
+    return {
+      data: null,
+      error: {
+        message: 'MIGRATION_FROZEN: device exported, all network operations are blocked',
+      },
+    };
+  }
+
   // Lazy init du relay (une seule fois)
   if (!state.initialized) {
     await initRelay();
@@ -581,8 +673,7 @@ export async function secureRpc(
     return {
       data: null,
       error: {
-        message: 'RELAY_UNAVAILABLE: Le relay OHTTP est indisponible. ' +
-          'Impossible d\'envoyer de manière anonyme. Vérifiez votre connexion.',
+        message: 'RELAY_UNAVAILABLE: ' + i18n.t('errors.relayUnavailable'),
       },
     };
   }
@@ -602,8 +693,7 @@ export async function secureRpc(
     return {
       data: null,
       error: {
-        message: `RELAY_ERROR: ${result.error.message}. ` +
-          'Le message n\'a pas été envoyé pour protéger votre anonymat.',
+        message: `RELAY_ERROR: ${result.error.message}. ` + i18n.t('errors.relayMessageBlocked'),
       },
     };
   } catch (e) {
@@ -611,8 +701,7 @@ export async function secureRpc(
     return {
       data: null,
       error: {
-        message: `RELAY_ERROR: ${String(e)}. ` +
-          'Le message n\'a pas été envoyé pour protéger votre anonymat.',
+        message: `RELAY_ERROR: ${String(e)}. ` + i18n.t('errors.relayMessageBlocked'),
       },
     };
   }

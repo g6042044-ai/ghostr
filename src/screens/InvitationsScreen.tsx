@@ -3,23 +3,17 @@
 // Accessible depuis le bandeau "X invitations en attente" de ConversationListScreen
 // Sections : "En attente" (pending uniquement, pas d'historique)
 
-import React, { useState, useEffect, useCallback } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  SectionList,
-  ActivityIndicator,
-} from 'react-native';
+import { useState, useEffect, useCallback } from 'react';
+import { View, Text, TouchableOpacity, SectionList, ActivityIndicator } from 'react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useTranslation } from 'react-i18next';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Ionicons } from '@expo/vector-icons';
 
 import { pendingInviteStore, PendingInvite } from '../services/pendingInvites';
 import { inviteWatcher } from '../services/inviteWatcher';
-import { theme } from '../components/ui';
+import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 
 type RootStackParamList = {
   ConversationList: undefined;
@@ -39,6 +33,9 @@ type Section = {
 export function InvitationsScreen() {
   const navigation = useNavigation<NavigationProp>();
   const insets = useSafeAreaInsets();
+  const { colors } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
 
   const [sections, setSections] = useState<Section[]>([]);
   const [loading, setLoading] = useState(true);
@@ -49,11 +46,11 @@ export function InvitationsScreen() {
     const pending = all.filter(i => i.status === 'pending');
 
     const newSections: Section[] = [];
-    if (pending.length > 0) newSections.push({ title: 'En attente', data: pending });
+    if (pending.length > 0) newSections.push({ title: t('invitations.pendingSection'), data: pending });
 
     setSections(newSections);
     setLoading(false);
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     refresh();
@@ -79,7 +76,7 @@ export function InvitationsScreen() {
   const formatTimeAgo = (ts: number): string => {
     const diff = Date.now() - ts;
     const min = Math.floor(diff / 60000);
-    if (min < 1) return "À l'instant";
+    if (min < 1) return t('inviteDetail.justNow');
     if (min < 60) return `${min} min`;
     const h = Math.floor(min / 60);
     if (h < 24) return `${h}h`;
@@ -102,7 +99,7 @@ export function InvitationsScreen() {
         activeOpacity={0.7}
       >
         <View style={[styles.rowIcon, { backgroundColor: 'rgba(0, 217, 166, 0.10)' }]}>
-          <Ionicons name="qr-code-outline" size={20} color={theme.colors.primary} />
+          <Ionicons name="qr-code-outline" size={20} color={colors.primary} />
         </View>
         <View style={styles.rowContent}>
           <Text style={styles.rowLabel} numberOfLines={1}>
@@ -111,11 +108,11 @@ export function InvitationsScreen() {
           <View style={styles.rowMeta}>
             <View style={styles.rowPulseDot} />
             <Text style={styles.rowMetaText}>
-              En attente · {formatTimeAgo(item.createdAt)}
+              {t('invitations.pendingTimeAgo', { time: formatTimeAgo(item.createdAt) })}
             </Text>
           </View>
         </View>
-        <Ionicons name="chevron-forward" size={16} color={theme.colors.textMuted} />
+        <Ionicons name="chevron-forward" size={16} color={colors.textMuted} />
       </TouchableOpacity>
     );
   };
@@ -123,11 +120,11 @@ export function InvitationsScreen() {
   const renderEmpty = () => (
     <View style={styles.emptyState}>
       <View style={styles.emptyIcon}>
-        <Ionicons name="qr-code-outline" size={32} color={theme.colors.primary} />
+        <Ionicons name="qr-code-outline" size={32} color={colors.primary} />
       </View>
-      <Text style={styles.emptyTitle}>Aucune invitation</Text>
+      <Text style={styles.emptyTitle}>{t('invitations.noInvitations')}</Text>
       <Text style={styles.emptySubtitle}>
-        Créez une invitation pour démarrer{'\n'}une conversation chiffrée.
+        {t('invitations.noInvitationsHint')}
       </Text>
     </View>
   );
@@ -135,7 +132,7 @@ export function InvitationsScreen() {
   if (loading) {
     return (
       <View style={[styles.container, styles.loadingContainer, { paddingTop: insets.top }]}>
-        <ActivityIndicator color={theme.colors.primary} />
+        <ActivityIndicator color={colors.primary} />
       </View>
     );
   }
@@ -149,9 +146,9 @@ export function InvitationsScreen() {
           onPress={() => navigation.goBack()}
           activeOpacity={0.7}
         >
-          <Ionicons name="chevron-back" size={20} color={theme.colors.text} />
+          <Ionicons name="chevron-back" size={20} color={colors.text} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Invitations</Text>
+        <Text style={styles.headerTitle} numberOfLines={1}>{t('invitations.title')}</Text>
         <View style={{ width: 36 }} />
       </View>
       <View style={styles.divider} />
@@ -176,17 +173,24 @@ export function InvitationsScreen() {
           onPress={() => navigation.navigate('Create1to1')}
           activeOpacity={0.8}
         >
-          <Text style={styles.createButtonText}>Créer une invitation</Text>
+          <Text
+            style={styles.createButtonText}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+            minimumFontScale={0.82}
+          >
+            {t('invitations.createInvitation')}
+          </Text>
         </TouchableOpacity>
       </View>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: ColorPalette) => ({
   container: {
     flex: 1,
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
   },
   loadingContainer: {
     alignItems: 'center',
@@ -205,7 +209,7 @@ const styles = StyleSheet.create({
     width: 36,
     height: 36,
     borderRadius: 18,
-    backgroundColor: theme.colors.surface,
+    backgroundColor: colors.surface,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -213,12 +217,12 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 20,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
     letterSpacing: -0.3,
   },
   divider: {
     height: 1,
-    backgroundColor: theme.colors.divider,
+    backgroundColor: colors.divider,
     marginHorizontal: 16,
   },
 
@@ -236,7 +240,7 @@ const styles = StyleSheet.create({
   sectionTitle: {
     fontSize: 12,
     fontWeight: '700',
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     textTransform: 'uppercase',
     letterSpacing: 1,
   },
@@ -262,7 +266,7 @@ const styles = StyleSheet.create({
   rowLabel: {
     fontSize: 16,
     fontWeight: '600',
-    color: theme.colors.text,
+    color: colors.text,
   },
   rowMeta: {
     flexDirection: 'row',
@@ -278,7 +282,7 @@ const styles = StyleSheet.create({
   },
   rowMetaText: {
     fontSize: 13,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
   },
 
   // Empty
@@ -300,19 +304,19 @@ const styles = StyleSheet.create({
   emptyTitle: {
     fontSize: 18,
     fontWeight: '700',
-    color: theme.colors.text,
+    color: colors.text,
     marginBottom: 8,
   },
   emptySubtitle: {
     fontSize: 14,
-    color: theme.colors.textMuted,
+    color: colors.textMuted,
     textAlign: 'center',
     lineHeight: 22,
   },
   emptyTagline: {
     fontSize: 12,
     fontWeight: '500',
-    color: theme.colors.primary,
+    color: colors.primary,
     marginTop: 16,
     opacity: 0.7,
   },
@@ -324,7 +328,7 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
   },
   createButton: {
-    backgroundColor: theme.colors.primary,
+    backgroundColor: colors.primary,
     borderRadius: 14,
     paddingVertical: 16,
     alignItems: 'center',
@@ -333,9 +337,9 @@ const styles = StyleSheet.create({
   createButtonText: {
     fontSize: 16,
     fontWeight: '700',
-    color: theme.colors.textOnPrimary,
+    color: colors.textOnPrimary,
     letterSpacing: -0.2,
   },
-});
+}) as const;
 
 export default InvitationsScreen;
