@@ -2,15 +2,15 @@
   "expo": {
     "name": "Ghostr",
     "slug": "whisper-app",
-    "version": "3.0.0",
+    "version": "1.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "splash": {
       "image": "./assets/splash.png",
       "resizeMode": "contain",
-      "backgroundColor": "#0f0f0f"
+      "backgroundColor": "#0A0F14"
     },
     "assetBundlePatterns": [
       "**/*"
@@ -18,7 +18,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.ghostr.app",
-      "buildNumber": "1",
+      "buildNumber": "7",
       "infoPlist": {
         "NSCameraUsageDescription": "Ghostr uses the camera so you can scan a contact's QR code to start an encrypted conversation, scan a safety number to verify a contact's identity, take a photo to send inside a conversation (for example, sharing a picture with a friend), and set or update your profile picture.",
         "NSMicrophoneUsageDescription": "Ghostr uses the microphone so you can make end-to-end encrypted voice calls with your contacts and record voice messages to send inside a conversation.",
@@ -38,12 +38,16 @@
         "applinks:theghostr.com"
       ]
     },
+    "androidStatusBar": {
+      "backgroundColor": "#0A0F14",
+      "barStyle": "light-content"
+    },
     "android": {
       "softwareKeyboardLayoutMode": "resize",
       "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#0f0f0f"
+        "backgroundColor": "#0A0F14"
       },
       "package": "com.ghostr.app",
       "versionCode": 1,
@@ -96,6 +100,22 @@
       ]
     },
     "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "compileSdkVersion": 35,
+            "targetSdkVersion": 35,
+            "minSdkVersion": 24,
+            "buildToolsVersion": "35.0.0",
+            "enableMinifyInReleaseBuilds": false,
+            "enableShrinkResourcesInReleaseBuilds": false
+          },
+          "ios": {
+            "deploymentTarget": "15.1"
+          }
+        }
+      ],
       [
         "expo-notifications",
         {
