@@ -10,12 +10,16 @@
  *   3. Vidéo: bouton désactivé visuellement (pas encore implémenté)
  *   4. Reset clés: supprimé (faux sentiment de sécurité, le Triple Ratchet
  *      se répare automatiquement via DH ratchet steps)
- *   5. Blocage: supprimé (cosmétique, n'empêchait rien — supprimer la
- *      conversation est la bonne réponse)
+ *   5. Blocage: RÉINTRODUIT avec une vraie sémantique (guideline App Store
+ *      1.2). « Bloquer et signaler » = signalement à la modération
+ *      (reportService) + liste noire de l'empreinte d'identité
+ *      (blockService, refuse toute future invitation de ce contact)
+ *      + suppression immédiate de la conversation. L'ancien bouton
+ *      purement cosmétique reste banni.
  */
 
-import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, Alert, ActivityIndicator } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import { View, Text, TouchableOpacity, ScrollView, ActivityIndicator } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
@@ -24,12 +28,15 @@ import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useTranslation } from 'react-i18next';
 import { sessionService } from '../services/tripleRatchet/sessionService';
 import { clearLocalMessages1to1, clearUnreadCount } from '../services/api1to1';
+import * as groupService from '../services/groupService';
 import { useCall1to1 } from '../hooks/useCall1to1';
 import { isInCall1to1 } from '../services/call1to1Service';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
+import { useTheme, useThemedStyles, getAvatarColor, type ColorPalette, showAlert, showConfirm } from '../components/ui';
 import { Avatar } from '../components/Avatar';
-import { loadMuteState, setSessionMuted } from '../services/muteService';
+import { loadMuteState, setSessionMuted, clearMuteState } from '../services/muteService';
+import { blockFingerprint } from '../services/blockService';
+import { ReportModal } from '../components/ReportModal';
 import { getActiveLanguage } from '../i18n';
 
 // NOTE: previous versions defined a local COLORS object that mirrored
@@ -46,12 +53,11 @@ type RootStackParamList = {
 type ContactInfoRouteProp = RouteProp<RootStackParamList, 'ContactInfo'>;
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
-const getAvatarColor = (id: string): string => {
-  const colors = ['#00D9A6', '#7B61FF', '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#F093FB', '#F5576C'];
-  let hash = 0;
-  for (let i = 0; i < id.length; i++) hash = id.charCodeAt(i) + ((hash << 5) - hash);
-  return colors[Math.abs(hash) % colors.length];
-};
+// Le `getAvatarColor` local a été supprimé : il portait une QUATRIÈME
+// palette (8 teintes, dont deux absentes partout ailleurs) et un hash
+// légèrement différent. Un contact affiché en violet dans sa fiche
+// apparaissait donc en vert dans la liste. On importe désormais la fonction
+// unique du design system.
 
 interface ContactData {
   displayName: string;
@@ -73,6 +79,12 @@ export const ContactInfoScreen: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [muted, setMuted] = useState(false);
   const [isCallingAudio, setIsCallingAudio] = useState(false);
+  const [showBlockReport, setShowBlockReport] = useState(false);
+  // Garde anti-double exécution de performBlock : le ReportModal appelle
+  // onClose PUIS onSubmitted lors d'une soumission, et performBlock fait
+  // deleteSession + deux goBack() — l'exécuter deux fois casserait la
+  // navigation.
+  const blockDoneRef = useRef(false);
 
   const { startCall, isInCall } = useCall1to1();
 
@@ -126,18 +138,14 @@ export const ContactInfoScreen: React.FC = () => {
       setIsCallingAudio(true);
       const result = await startCall(sessionId, contact.displayName);
       if (!result.success) {
-        Alert.alert(t('common.error'), result.error || t('contactInfo.callError'));
+        showAlert({ title: t('common.error'), message: result.error || t('contactInfo.callError') });
       }
     } catch (error) {
       console.error('[ContactInfo] Call error:', error);
-      Alert.alert(t('common.error'), t('contactInfo.callGenericError'));
+      showAlert({ title: t('common.error'), message: t('contactInfo.callGenericError') });
     } finally {
       setIsCallingAudio(false);
     }
-  };
-
-  const handleVideoCall = () => {
-    // Bouton désactivé — ne rien faire
   };
 
   const handleSearch = () => {
@@ -149,34 +157,95 @@ export const ContactInfoScreen: React.FC = () => {
     });
   };
 
-  const handleDelete = () => {
+  const handleDelete = async () => {
     if (isInCall1to1()) {
-      Alert.alert(t('conversationList.callInProgressTitle'), t('conversationList.callInProgressMessage'));
+      showAlert({ title: t('conversationList.callInProgressTitle'), message: t('conversationList.callInProgressMessage') });
       return;
     }
-    Alert.alert(
-      t('contactInfo.deleteConversation'),
-      t('contactInfo.deleteConfirmMessage'),
-      [
-        { text: t('common.cancel'), style: 'cancel' },
-        {
-          text: t('common.delete'),
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await clearLocalMessages1to1(sessionId);
-              await clearUnreadCount(sessionId);
-              try { await AsyncStorage.removeItem(`@ghostr_reactions_${sessionId}`); } catch {}
-              await sessionService.deleteSession(sessionId);
-              navigation.goBack();
-              navigation.goBack();
-            } catch (error) {
-              Alert.alert(t('common.error'), t('contactInfo.deleteFailed'));
-            }
-          },
-        },
-      ]
-    );
+    // `showConfirm` résout à `false` sur annulation ET sur fermeture par tap
+    // à l'extérieur : l'action destructrice ne part que sur un choix
+    // explicite. Le flux se lit en séquence au lieu d'être enfoui dans le
+    // callback d'un bouton.
+    const confirmed = await showConfirm({
+      title: t('contactInfo.deleteConversation'),
+      message: t('contactInfo.deleteConfirmMessage'),
+      confirmText: t('common.delete'),
+      cancelText: t('common.cancel'),
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    try {
+      await clearLocalMessages1to1(sessionId);
+      await clearUnreadCount(sessionId);
+      try { await AsyncStorage.removeItem(`@ghostr_reactions_${sessionId}`); } catch {}
+      // Si ce contact est membre d'un groupe, on PRÉSERVE la session
+      // (transport mesh du groupe) : on vide seulement la conversation
+      // 1:1. Sinon, supprimer la session briserait la messagerie de
+      // groupe vers lui (perte de données). La conversation vidée
+      // disparaît de la liste (filtre « vide + dans un groupe »).
+      const fp = sessionService.getSession(sessionId)?.theirIdentityKeyFingerprint;
+      if (!fp || !groupService.isContactInAnyGroup(fp)) {
+        await sessionService.deleteSession(sessionId);
+      }
+      navigation.goBack();
+      navigation.goBack();
+    } catch (error) {
+      void showAlert({ title: t('common.error'), message: t('contactInfo.deleteFailed') });
+    }
+  };
+
+  /**
+   * « Bloquer et signaler » — guideline App Store 1.2.
+   * Séquence : confirmation → ReportModal (catégorie + consentement) →
+   * envoi du signalement (best-effort) → blocage local (performBlock).
+   */
+  const handleBlockAndReport = async () => {
+    if (isInCall1to1()) {
+      showAlert({ title: t('conversationList.callInProgressTitle'), message: t('conversationList.callInProgressMessage') });
+      return;
+    }
+    const confirmed = await showConfirm({
+      title: t('contactInfo.blockAndReport'),
+      message: t('contactInfo.blockConfirmMessage', { name: contact?.displayName || t('common.contact') }),
+      confirmText: t('common.continue'),
+      cancelText: t('common.cancel'),
+      destructive: true,
+    });
+    if (!confirmed) return;
+    setShowBlockReport(true);
+  };
+
+  /**
+   * Blocage effectif, exécuté APRÈS le signalement (même si son envoi a
+   * échoué — la suppression locale doit être immédiate, guideline 1.2) :
+   *   1. Empreinte d'identité en liste noire → toute future invitation de ce
+   *      contact sera refusée par Join1to1Screen.
+   *   2. Suppression de la conversation (même flux que handleDelete).
+   */
+  const performBlock = async () => {
+    if (blockDoneRef.current) return;
+    blockDoneRef.current = true;
+    const session = sessionService.getSession(sessionId);
+    const fp = session?.theirIdentityKeyFingerprint;
+    try {
+      if (fp) {
+        await blockFingerprint(fp, contact?.displayName || '');
+      }
+      await clearLocalMessages1to1(sessionId);
+      await clearUnreadCount(sessionId);
+      await clearMuteState(sessionId);
+      try { await AsyncStorage.removeItem(`@ghostr_reactions_${sessionId}`); } catch {}
+      // Même règle que handleDelete : préserver la session si le contact est
+      // membre d'un groupe (transport mesh), sinon suppression complète.
+      if (!fp || !groupService.isContactInAnyGroup(fp)) {
+        await sessionService.deleteSession(sessionId);
+      }
+      navigation.goBack();
+      navigation.goBack();
+    } catch (error) {
+      void showAlert({ title: t('common.error'), message: t('contactInfo.deleteFailed') });
+    }
   };
 
   const formatFingerprint = (fp: string): string => {
@@ -234,10 +303,18 @@ export const ContactInfoScreen: React.FC = () => {
           </View>
         </View>
 
-        {/* Quick Actions — CORRIGÉ: notification retirée (reste dans Paramètres), vidéo désactivée */}
+        {/*
+          Quick Actions — notification retirée (elle reste dans Paramètres).
+
+          Le bouton « Vidéo » a été RETIRÉ, pas seulement grisé : l'appel
+          vidéo n'existe pas dans l'app. Une affordance visible mais morte
+          coûte plus cher qu'une absence — l'utilisateur essaie, rien ne se
+          passe, et il en déduit que l'app est cassée. Sur un produit dont
+          l'argument principal est la confiance, c'est le pire signal
+          possible. Le bouton reviendra le jour où la fonction existera.
+        */}
         <View style={styles.quickActions}>
           <QuickAction icon="call" label={t('contactInfo.audio')} onPress={handleCall} />
-          <QuickAction icon="videocam" label={t('contactInfo.video')} onPress={handleVideoCall} disabled />
           <QuickAction icon="search" label={t('contactInfo.search')} onPress={handleSearch} />
         </View>
 
@@ -252,7 +329,7 @@ export const ContactInfoScreen: React.FC = () => {
               title={t('contactInfo.fingerprint')} 
               subtitle={formatFingerprint(contact.fingerprint)}
               mono
-              onPress={() => Alert.alert(t('contactInfo.fingerprintTitle'), t('contactInfo.fingerprintMessage') + '\n\n' + formatFingerprint(contact.fingerprint))}
+              onPress={() => showAlert({ title: t('contactInfo.fingerprintTitle'), message: t('contactInfo.fingerprintMessage') + '\n\n' + formatFingerprint(contact.fingerprint) })}
               chevron
             />
           </View>
@@ -273,6 +350,14 @@ export const ContactInfoScreen: React.FC = () => {
           </View>
         </View>
 
+        {/* Bloquer et signaler — guideline App Store 1.2 */}
+        <TouchableOpacity style={styles.dangerBtn} onPress={handleBlockAndReport}>
+          <Ionicons name="ban-outline" size={20} color={colors.danger} />
+          <Text style={styles.dangerBtnText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.85}>
+            {t('contactInfo.blockAndReport')}
+          </Text>
+        </TouchableOpacity>
+
         {/* Supprimer la conversation */}
         <TouchableOpacity style={styles.dangerBtn} onPress={handleDelete}>
           <Ionicons name="trash-outline" size={20} color={colors.danger} />
@@ -285,6 +370,24 @@ export const ContactInfoScreen: React.FC = () => {
           {t('contactInfo.createdOn', { date: new Date(contact.createdAt).toLocaleDateString(getActiveLanguage(), { day: 'numeric', month: 'long', year: 'numeric' }) })}
         </Text>
       </ScrollView>
+
+      {/* Signalement du contact bloqué. Le contenu transmis identifie le
+          contact par son nom affiché + empreinte : c'est ce que le
+          signaleur connaît, et ça n'expose rien d'autre.
+          Le blocage est INCONDITIONNEL une fois « Bloquer et signaler »
+          confirmé (guideline 1.2) : seul le signalement est optionnel.
+          performBlock est donc branché sur TOUTES les sorties du modal
+          (soumission, Annuler, fermeture), dédupliqué par blockDoneRef. */}
+      <ReportModal
+        visible={showBlockReport}
+        onClose={() => {
+          setShowBlockReport(false);
+          void performBlock();
+        }}
+        context="contact"
+        content={`[blocked contact] name="${contact.displayName}" fingerprint="${contact.fingerprint}"`}
+        onSubmitted={performBlock}
+      />
     </View>
   );
 };
