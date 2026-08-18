@@ -35,7 +35,7 @@
 // - Haptic feedback ready
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, Platform, ActivityIndicator, Animated, Keyboard, Alert, Modal, Image, Pressable, useWindowDimensions, ScrollView, Easing, UIManager, Dimensions, StatusBar } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, Platform, ActivityIndicator, Animated, Keyboard, Modal, Image, Pressable, useWindowDimensions, ScrollView, Easing, UIManager, Dimensions, StatusBar } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSafeAreaInsets, SafeAreaView } from 'react-native-safe-area-context';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -46,6 +46,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
 import { suppressLock, releaseLock } from '../services/lockGuard';
+import haptics from '../services/haptics';
 import { ensureCameraPermission, ensureMediaLibraryPermission, ensureSaveToLibraryPermission } from '../services/permissions';
 import { useUnifiedMessages, UnifiedMessage } from '../hooks/useUnifiedMessages';
 import { MessageStatus } from '../services/messageStatus';
@@ -61,12 +62,13 @@ import { getCachedThumbnail, getCachedImage, getCachedFile, pickFile, validateFi
 import { initializeVoiceService, startRecording, stopRecording, cancelRecording, playVoice, pauseVoice, stopVoice, getCachedVoice, getVoicePublicUrl, formatVoiceDuration, cleanupVoiceService, VoiceMessagePayload, isRecording as isRecordingActive } from '../services/voiceMessageService';
 import * as Sharing from 'expo-sharing';
 import { resolveImageUri, resolveMediaToBase64, isMediaRef } from '../services/mediaFileStore';
-import { ChatHeader, SelectionHeader, ActionSheet, AlertModal } from '../components/ui';
-import { generateColorFromToken } from '../services/crypto';
+import { ChatHeader, showAlert, showConfirm, showActionSheet } from '../components/ui';
 import { InviteModal } from '../components/InviteModal';
+import { ReportModal } from '../components/ReportModal';
 import { CallButton1to1 } from '../components/CallButton1to1';
 import { useCall1to1 } from '../hooks/useCall1to1';
 import { Avatar } from '../components/Avatar';
+import { GroupAvatar } from '../components/GroupAvatar';
 import { isCallMessage, getCallPayload, formatCallDuration, getCallStatusText, CallMessagePayload } from '../services/callMessages';
 import { VoiceRecordButton } from '../components/VoiceRecordButton';
 import { useChunkingProgress } from '../hooks/useChunkingProgress';
@@ -99,20 +101,19 @@ const REACTION_EMOJIS = ['❤️', '👍', '😂', '😮', '😢', '🔥'];
 // ════════════════════════════════════════════════════════════════════════════
 // THEMED COLOR PALETTE
 // ════════════════════════════════════════════════════════════════════════════
-// v3.0 — was a static dark-only constant; now a FACTORY that builds the same
-// nested shape from the active ColorPalette. The component calls
-// `useThemedColors()` to get a live palette, and the three module-level
-// StyleSheet.create blocks below use a frozen boot-time palette captured
-// once (so the module loads cleanly). The component overrides via inline
-// styles where the boot/live palette differs, but in practice the boot
-// palette = the OS scheme captured synchronously in theme.ts, which matches
-// the system theme. Manual theme overrides still need a JS reload to
-// fully propagate to these legacy StyleSheets — that's the `requiresReload`
-// flag exposed by useTheme(). See docs/THEME_MIGRATION.md.
+// v4.0 — Constante sombre à l'origine, puis fabrique adossée à une palette
+// figée au démarrage ; aujourd'hui, PLUS AUCUNE capture figée.
 //
-// Important: every key here mirrors a `theme.colors.X` entry. If you add a
-// key to one palette, add the equivalent here.
-import { theme as _theme } from '../components/ui/theme';
+// Cette fonction traduit la palette du design system (`ColorPalette`, plate)
+// vers la nomenclature imbriquée qu'emploie ce fil de conversation
+// (`Colors.bubble.outgoing`, `Colors.status.read`…). Chaque consommateur —
+// le composant principal, `MessageStatusIcon`, `ReplyBar`, et les fabriques
+// de styles du bas de fichier — l'appelle avec la palette LIVE obtenue de
+// `useTheme()`. Un changement d'apparence se propage donc immédiatement.
+//
+// Important : chaque clé ci-dessous reflète une entrée de `ColorPalette`. Si
+// vous ajoutez une clé à la palette, ajoutez ici son équivalent.
+import { getAvatarColor, theme } from '../components/ui/theme';
 import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 
 function makeColorsFromPalette(c: ColorPalette) {
@@ -184,28 +185,52 @@ function makeColorsFromPalette(c: ColorPalette) {
   };
 }
 
-// Boot-time palette — used by the three module-level StyleSheet.create
-// blocks below. Captured once at module load from the (already-resolved)
-// boot theme. After ThemeProvider mounts, this object is frozen; the
-// component uses `useThemedColors()` to get live values inline.
-const Colors = makeColorsFromPalette(_theme.colors as ColorPalette);
+// La constante `Colors` figée au niveau module a été SUPPRIMÉE.
+//
+// Elle était construite à partir de `theme.colors`, soit la palette capturée
+// au chargement du module theme.ts. Trois consommateurs s'appuyaient dessus :
+//   - les valeurs par défaut des icônes SVG locales → `color` est désormais
+//     une prop obligatoire (tous les points d'appel la passaient déjà) ;
+//   - `ReplyBar` et `MessageStatusIcon` → ils construisaient déjà leur propre
+//     palette live via `useTheme()`, la constante ne servait plus qu'à faire
+//     compiler les paramètres par défaut ;
+//   - les `StyleSheet.create` du bas de fichier → déjà convertis en
+//     fabriques `makeStyles(c)` consommées par `useThemedStyles`.
+//
+// Chaque `Colors.X` du fichier lit maintenant une palette dérivée de
+// `useTheme()`, donc suit le thème en direct.
 
 
 
-// Spacing scale (4px base unit)
-const Space = {
-  xxs: 2,
-  xs: 4,
-  sm: 8,
-  md: 12,
-  lg: 16,
-  xl: 20,
-  xxl: 24,
-  xxxl: 32,
-  xxxxl: 48,
-};
+// ════════════════════════════════════════════════════════════════════════════
+// TOKENS — alias vers le design system
+// ════════════════════════════════════════════════════════════════════════════
+// `Space` et `Radius` étaient des copies locales des échelles du thème. Le
+// problème n'était pas la duplication en soi mais la DÉRIVE : `Radius.lg`
+// valait 18 ici contre 16 dans le thème, `Radius.xl` 22 contre 20. Les mêmes
+// éléments (cartes, champs, pastilles) n'avaient donc pas le même arrondi
+// dans le fil de conversation et dans le reste de l'application.
+//
+// Ce sont désormais de simples alias. Les noms courts sont conservés car ils
+// apparaissent plusieurs centaines de fois dans la feuille de styles.
+const Space = theme.spacing;
 
-// Typography scale
+/**
+ * Rayons de bordure. Aligné sur `theme.borderRadius`, ce qui corrige les deux
+ * valeurs qui divergeaient (lg 18 → 16, xl 22 → 20). Les rayons de bulle
+ * (`bubble.default` 20 / `bubble.grouped` 6) sont identiques des deux côtés
+ * et ne bougent pas — le regroupement des bulles reste au pixel près.
+ */
+const Radius = theme.borderRadius;
+
+// Échelle typographique — VOLONTAIREMENT locale.
+//
+// `theme.fontSize` passe chaque valeur par `moderateScale()`, qui l'ajuste à
+// la largeur de l'écran. Le fil de conversation a été composé avec des tailles
+// fixes : hauteurs de bulle, alignement des coches de statut et césures des
+// horodatages en dépendent. Y injecter une mise à l'échelle par appareil
+// déplacerait toute la mise en page sur les petits et grands écrans, pour un
+// bénéfice nul. Cette échelle reste donc distincte, et c'est assumé.
 const Type = {
   size: {
     xs: 11,
@@ -226,21 +251,6 @@ const Type = {
     tight: 1.2,
     normal: 1.4,
     relaxed: 1.5,
-  },
-};
-
-// Border radius - Modern bubble design
-const Radius = {
-  xs: 4,
-  sm: 8,
-  md: 12,
-  lg: 18,
-  xl: 22,
-  xxl: 24,
-  full: 9999,
-  bubble: {
-    default: 20,
-    grouped: 6,
   },
 };
 
@@ -316,9 +326,16 @@ interface MessageReaction {
 // ============================================
 // ICONS - Premium SVG Icons
 // ============================================
-
+//
+// `color` est une prop OBLIGATOIRE. Chaque icône avait auparavant une valeur
+// par défaut du type `color = Colors.text.secondary`, évaluée à l'import du
+// module — donc figée sur la palette du démarrage et insensible aux
+// changements de thème. Comme tous les points d'appel passaient déjà une
+// couleur explicite, rendre la prop obligatoire supprime la capture figée
+// sans changer un seul pixel, et le compilateur garantit désormais qu'on ne
+// peut plus réintroduire le problème par omission.
 const Icons = {
-  Send: ({ size = 20, color = Colors.text.inverse }: { size?: number; color?: string }) => (
+  Send: ({ size = 20, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <Path 
         d="M22 2L11 13" 
@@ -338,7 +355,7 @@ const Icons = {
     </Svg>
   ),
   
-  Attach: ({ size = 24, color = Colors.text.secondary }: { size?: number; color?: string }) => (
+  Attach: ({ size = 24, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <Path
         d="M21.44 11.05L12.25 20.24C10.45 22.04 7.51 22.04 5.71 20.24C3.91 18.44 3.91 15.5 5.71 13.7L14.9 4.51C16.04 3.37 17.89 3.37 19.03 4.51C20.17 5.65 20.17 7.5 19.03 8.64L9.84 17.83C9.27 18.4 8.35 18.4 7.78 17.83C7.21 17.26 7.21 16.34 7.78 15.77L16.97 6.58"
@@ -350,44 +367,44 @@ const Icons = {
     </Svg>
   ),
   
-  Image: ({ size = 22, color = Colors.text.inverse }: { size?: number; color?: string }) => (
+  Image: ({ size = 22, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <Path d="M19 3H5C3.9 3 3 3.9 3 5V19C3 20.1 3.9 21 5 21H19C20.1 21 21 20.1 21 19V5C21 3.9 20.1 3 19 3ZM19 19H5V5H19V19ZM13.96 12.29L11.21 15.83L9.25 13.47L6.5 17H17.5L13.96 12.29Z" fill={color} />
     </Svg>
   ),
   
-  Camera: ({ size = 22, color = Colors.text.inverse }: { size?: number; color?: string }) => (
+  Camera: ({ size = 22, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <Path d="M12 15.2C13.7673 15.2 15.2 13.7673 15.2 12C15.2 10.2327 13.7673 8.8 12 8.8C10.2327 8.8 8.8 10.2327 8.8 12C8.8 13.7673 10.2327 15.2 12 15.2Z" fill={color} />
       <Path d="M9 2L7.17 4H4C2.9 4 2 4.9 2 6V18C2 19.1 2.9 20 4 20H20C21.1 20 22 19.1 22 18V6C22 4.9 21.1 4 20 4H16.83L15 2H9ZM12 17C9.24 17 7 14.76 7 12C7 9.24 9.24 7 12 7C14.76 7 17 9.24 17 12C17 14.76 14.76 17 12 17Z" fill={color} />
     </Svg>
   ),
   
-  File: ({ size = 22, color = Colors.text.inverse }: { size?: number; color?: string }) => (
+  File: ({ size = 22, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <Path d="M14 2H6C4.9 2 4 2.9 4 4V20C4 21.1 4.89 22 5.99 22H18C19.1 22 20 21.1 20 20V8L14 2ZM16 18H8V16H16V18ZM16 14H8V12H16V14ZM13 9V3.5L18.5 9H13Z" fill={color} />
     </Svg>
   ),
   
-  Mic: ({ size = 24, color = Colors.text.secondary }: { size?: number; color?: string }) => (
+  Mic: ({ size = 24, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
       <Path d="M12 14C13.66 14 14.99 12.66 14.99 11L15 5C15 3.34 13.66 2 12 2C10.34 2 9 3.34 9 5V11C9 12.66 10.34 14 12 14ZM17.3 11C17.3 14 14.76 16.1 12 16.1C9.24 16.1 6.7 14 6.7 11H5C5 14.41 7.72 17.23 11 17.72V21H13V17.72C16.28 17.24 19 14.42 19 11H17.3Z" />
     </Svg>
   ),
   
-  Close: ({ size = 24, color = Colors.text.primary }: { size?: number; color?: string }) => (
+  Close: ({ size = 24, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
       <Path d="M19 6.41L17.59 5L12 10.59L6.41 5L5 6.41L10.59 12L5 17.59L6.41 19L12 13.41L17.59 19L19 17.59L13.41 12L19 6.41Z" />
     </Svg>
   ),
   
-  Download: ({ size = 20, color = Colors.text.primary }: { size?: number; color?: string }) => (
+  Download: ({ size = 20, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
       <Path d="M19 9H15V3H9V9H5L12 16L19 9ZM5 18V20H19V18H5Z" />
     </Svg>
   ),
   
-  Emoji: ({ size = 24, color = Colors.text.secondary }: { size?: number; color?: string }) => (
+  Emoji: ({ size = 24, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <Circle cx="12" cy="12" r="10" stroke={color} strokeWidth={1.8} />
       <Path d="M8 14C8.5 15.5 10 17 12 17C14 17 15.5 15.5 16 14" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
@@ -396,7 +413,7 @@ const Icons = {
     </Svg>
   ),
   
-  Reply: ({ size = 18, color = Colors.accent.primary }: { size?: number; color?: string }) => (
+  Reply: ({ size = 18, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <Path 
         d="M10 9V5L3 12L10 19V14.9C15 14.9 18.5 16.5 21 20C20 15 17 10 10 9Z" 
@@ -405,7 +422,7 @@ const Icons = {
     </Svg>
   ),
   
-  DoubleCheck: ({ size = 16, color = Colors.status.sent }: { size?: number; color?: string }) => (
+  DoubleCheck: ({ size = 16, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 16 16" fill="none">
       <Path
         d="M1.5 8.5L4.5 11.5L11 5"
@@ -424,7 +441,7 @@ const Icons = {
     </Svg>
   ),
   
-  SingleCheck: ({ size = 16, color = Colors.status.sent }: { size?: number; color?: string }) => (
+  SingleCheck: ({ size = 16, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 16 16" fill="none">
       <Path
         d="M3 8L6.5 11.5L13 5"
@@ -436,13 +453,13 @@ const Icons = {
     </Svg>
   ),
   
-  Keyboard: ({ size = 24, color = Colors.text.secondary }: { size?: number; color?: string }) => (
+  Keyboard: ({ size = 24, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
       <Path d="M20 5H4C2.9 5 2 5.9 2 7V17C2 18.1 2.9 19 4 19H20C21.1 19 22 18.1 22 17V7C22 5.9 21.1 5 20 5ZM11 8H13V10H11V8ZM11 11H13V13H11V11ZM8 8H10V10H8V8ZM8 11H10V13H8V11ZM7 13H5V11H7V13ZM7 10H5V8H7V10ZM16 17H8V15H16V17ZM16 13H14V11H16V13ZM16 10H14V8H16V10ZM19 13H17V11H19V13ZM19 10H17V8H19V10Z" fill={color} />
     </Svg>
   ),
   
-  StatusClock: ({ size = 14, color = Colors.status.sent }: { size?: number; color?: string }) => (
+  StatusClock: ({ size = 14, color }: { size?: number; color: string }) => (
     <Svg width={size} height={size} viewBox="0 0 16 16" fill="none">
       <Circle cx="8" cy="8" r="6.5" stroke={color} strokeWidth={1.5} />
       <Path
@@ -471,12 +488,17 @@ interface MessageStatusIconProps {
 // elle évite le re-render quand le parent change pour une raison non liée
 // au statut du message. Apparaît dans CHAQUE message texte → multiplicatif.
 const MessageStatusIcon: React.FC<MessageStatusIconProps> = React.memo(({ status, isMine }) => {
-  if (!isMine) return null;
-  // Component-local live colours — flips with theme without a reload.
+  // Les hooks sont appelés AVANT tout retour anticipé. Le `if (!isMine)
+  // return null` se trouvait au-dessus de `useTheme()` : dans une FlatList,
+  // une même position de cellule est réutilisée pour des messages
+  // différents, donc `isMine` peut passer de false à true sur la même
+  // instance — React voyait alors « moins de hooks que prévu » et crashait.
   // eslint-disable-next-line @typescript-eslint/no-shadow
   const { colors: liveColors } = useTheme();
   // eslint-disable-next-line @typescript-eslint/no-shadow
   const Colors = makeColorsFromPalette(liveColors);
+
+  if (!isMine) return null;
 
   switch (status) {
     case 'sending':
@@ -488,9 +510,14 @@ const MessageStatusIcon: React.FC<MessageStatusIconProps> = React.memo(({ status
     case 'read':
       return <Icons.DoubleCheck size={14} color={Colors.status.read} />;
     case 'failed':
-      return <Ionicons name="alert-circle" size={14} color="#E74C3C" />;
+      return <Ionicons name="alert-circle" size={14} color={Colors.accent.error} />;
     default:
-      return <Icons.DoubleCheck size={14} color={Colors.status.read} />;
+      // Statut inconnu ou absent → on n'affiche RIEN. Le `default:`
+      // renvoyait auparavant la double coche « lu », c'est-à-dire qu'un
+      // message dont on ignore le sort était présenté comme lu par le
+      // destinataire. Sur une messagerie confidentielle, affirmer à tort
+      // qu'un message a été lu est le pire des mensonges possibles.
+      return null;
   }
 });
 
@@ -504,26 +531,34 @@ interface ReactionPickerProps {
   onSelect: (emoji: string) => void;
   onClose: () => void;
   selectedEmojis?: string[]; // Emojis déjà sélectionnés par l'utilisateur
+  // Ouvre le menu d'actions du message (« ⋯ » en bout de barre). Pattern
+  // standard des messageries : la barre de réactions et le menu d'actions
+  // sont deux surfaces distinctes — les actions (Signaler, Supprimer…)
+  // vivent dans un ActionSheet, pas dans le picker.
+  onMore?: () => void;
 }
 
-const ReactionPicker: React.FC<ReactionPickerProps> = ({ 
-  visible, 
-  position, 
-  onSelect, 
+const ReactionPicker: React.FC<ReactionPickerProps> = ({
+  visible,
+  position,
+  onSelect,
   onClose,
   selectedEmojis = [],
+  onMore,
 }) => {
   // Component-local themed styles — flip with theme without a JS reload.
   const styles = useThemedStyles(makeStyles);
+  const { colors: liveColors } = useTheme();
+  const Colors = makeColorsFromPalette(liveColors);
   const scaleAnim = useRef(new Animated.Value(0)).current;
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
   const insets = useSafeAreaInsets();
-  
-  // Dimensions compactes et responsives
+
+  // Dimensions compactes et responsives (+1 cellule « ⋯ » si onMore)
   const EMOJI_SIZE = 36;
-  const EMOJI_COUNT = REACTION_EMOJIS.length; // 6
+  const CELL_COUNT = REACTION_EMOJIS.length + (onMore ? 1 : 0);
   const HORIZONTAL_PADDING = 8;
-  const PICKER_WIDTH = (EMOJI_SIZE * EMOJI_COUNT) + (HORIZONTAL_PADDING * 2);
+  const PICKER_WIDTH = (EMOJI_SIZE * CELL_COUNT) + (HORIZONTAL_PADDING * 2);
   const PICKER_HEIGHT = EMOJI_SIZE + 12;
   const SAFE_MARGIN = 16;
   
@@ -582,7 +617,7 @@ const ReactionPicker: React.FC<ReactionPickerProps> = ({
               top,
               left,
               opacity: scaleAnim,
-              transform: [{ 
+              transform: [{
                 scale: scaleAnim.interpolate({
                   inputRange: [0, 1],
                   outputRange: [0.85, 1],
@@ -615,6 +650,20 @@ const ReactionPicker: React.FC<ReactionPickerProps> = ({
               </TouchableOpacity>
             );
           })}
+          {onMore && (
+            <TouchableOpacity
+              style={styles.reactionPickerEmoji}
+              onPress={() => {
+                onClose();
+                onMore();
+              }}
+              activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel="…"
+            >
+              <Ionicons name="ellipsis-horizontal" size={20} color={Colors.text.secondary} />
+            </TouchableOpacity>
+          )}
         </Animated.View>
       </Pressable>
     </Modal>
@@ -956,7 +1005,6 @@ export function ConversationScreen() {
   
   // State
   const [inputText, setInputText] = useState('');
-  const [showMenu, setShowMenu] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [shareMasterKey, setShareMasterKey] = useState<string | null>(null);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
@@ -990,13 +1038,11 @@ export function ConversationScreen() {
   const [reactionPosition, setReactionPosition] = useState({ x: 0, y: 0 });
   const [reactionMessageId, setReactionMessageId] = useState<string | null>(null);
 
-  // Selection mode
-  const [isSelectionMode, setIsSelectionMode] = useState(false);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false);
-  const [deleteLoading, setDeleteLoading] = useState(false);
-  
+  // Guideline 1.2 : signalement d'un message reçu (via le ReactionPicker).
+  // On fige le contenu au moment de l'ouverture — si le message est supprimé
+  // pendant que la modal est ouverte, le signalement reste cohérent.
+  const [reportContent, setReportContent] = useState<string | null>(null);
+
   // v21.0: Search mode
   const [isSearchMode, setIsSearchMode] = useState(initialSearchMode || false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -1180,8 +1226,10 @@ export function ConversationScreen() {
     sendFile: sendFileHook,
     sendVoice: sendVoiceHook,
     updateMessage,
+    // `deleteMessages` : suppression locale unitaire via le menu « ⋯ » de
+    // l'appui long. `deleteAllMessages` n'est pas destructuré : son UI (menu
+    // de conversation) reste à faire.
     deleteMessages,
-    deleteAllMessages,
     toggleReaction,
     markAsRead,
     retryMessage,
@@ -1191,6 +1239,42 @@ export function ConversationScreen() {
   
   // v25.0: Progression du media chunking (envoi/réception)
   const { getSendProgress, receiveEntries } = useChunkingProgress(conversationId);
+
+  // v30.0 — File d'approbation des demandes de jonction (admin uniquement).
+  // Placé APRÈS la destructuration de useUnifiedMessages : `conversationInfo`
+  // doit être défini avant d'être lu ici et dans le tableau de dépendances
+  // (sinon TDZ → « Cannot read property 'type' of undefined »).
+  useEffect(() => {
+    if (conversationInfo.type !== 'group') return;
+    let unsub: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const apiG = await import('../services/apiGroups');
+        const gs = await import('../services/groupService');
+        if (cancelled) return;
+        if (!gs.amIAdmin(conversationId)) return; // seul l'admin approuve
+        unsub = apiG.onJoinRequest((req: any) => {
+          if (req.groupId !== conversationId) return;
+          // `dismissible: false` : une demande de participation attend une
+          // décision de l'admin. La refermer d'un tap distrait la ferait
+          // disparaître sans réponse, et le demandeur resterait bloqué sans
+          // savoir pourquoi. Refuser explicitement est une réponse ; ignorer
+          // n'en est pas une.
+          void showAlert({
+            title: t('groups.joinRequestTitle', 'Demande de participation'),
+            message: t('groups.joinRequestBody', { name: req.displayName, defaultValue: `${req.displayName} souhaite rejoindre le groupe.` }),
+            dismissible: false,
+            buttons: [
+              { text: t('groups.decline', 'Refuser'), style: 'cancel', onPress: () => { apiG.rejectJoinRequest(req).catch(() => {}); } },
+              { text: t('groups.accept', 'Accepter'), onPress: () => { apiG.approveJoinRequest(req).catch(() => {}); } },
+            ],
+          });
+        });
+      } catch {}
+    })();
+    return () => { cancelled = true; if (unsub) unsub(); };
+  }, [conversationId, conversationInfo.type, t]);
   
   
   // Track new messages for animation
@@ -1451,23 +1535,22 @@ export function ConversationScreen() {
   // this, already-mounted cells keep their captured styles and render in
   // the previous theme until the user scrolls them out and back in.
   const messageListExtraData = useMemo(() => ({
-    selectedIds,
     newMessageIds,
     searchResults,
     currentSearchIndex,
     themeScheme: liveTheme.scheme,
-  }), [selectedIds, newMessageIds, searchResults, currentSearchIndex, liveTheme.scheme]);
+  }), [newMessageIds, searchResults, currentSearchIndex, liveTheme.scheme]);
 
   // Effects
   useEffect(() => {
     // v21.0: Ne pas scrollToEnd automatiquement en mode recherche
-    if (messages && Array.isArray(messages) && messages.length > 0 && !isSelectionMode && !isSearchMode) {
+    if (messages && Array.isArray(messages) && messages.length > 0 && !isSearchMode) {
       const timer = setTimeout(() => {
         flatListRef.current?.scrollToEnd({ animated: true });
       }, 100);
       return () => clearTimeout(timer);
     }
-  }, [messages, isSelectionMode, isSearchMode]);
+  }, [messages, isSearchMode]);
 
   // Ref pour tracker les messages déjà marqués comme lus
   const markedAsReadRef = useRef<Set<string>>(new Set());
@@ -1723,7 +1806,13 @@ export function ConversationScreen() {
   // Actions
   const handleSend = async () => {
     if (!inputText.trim() || sending) return;
-    
+
+    // Feedback immédiat (< 300 ms) : l'haptique part AVANT l'aller-retour
+    // réseau, en même temps que l'animation du bouton. L'utilisateur sait
+    // que son geste a été pris en compte sans attendre l'accusé de
+    // réception du relais.
+    haptics.impact('light');
+
     Animated.sequence([
       Animated.timing(sendButtonScale, { toValue: 0.85, duration: 80, useNativeDriver: true }),
       Animated.spring(sendButtonScale, { toValue: 1, tension: 400, friction: 12, useNativeDriver: true }),
@@ -1743,7 +1832,7 @@ export function ConversationScreen() {
     
     const success = await sendMessageHook(textToSend, replyData);
     if (!success) {
-      Alert.alert(t('common.error'), t('conversation.errSendMessage'));
+      showAlert({ title: t('common.error'), message: t('conversation.errSendMessage') });
     }
   };
 
@@ -1758,11 +1847,36 @@ export function ConversationScreen() {
   };
 
   const handleReaction = async (messageId: string, emoji: string) => {
+    // Sélection dans une liste → tick léger, la nuance la plus discrète
+    // de la grammaire haptique.
+    haptics.selection();
     setShowReactionPicker(false);
     await toggleReaction(messageId, emoji);
   };
 
+  const handleDeleteMessage = async (messageId: string) => {
+    // Suppression LOCALE uniquement : le message est retiré de cet appareil,
+    // les autres participants gardent leur copie (rien ne part sur le réseau).
+    const confirmed = await showConfirm({
+      title: t('conversation.deleteMessageTitle'),
+      message: t('conversation.deleteMessageConfirm'),
+      confirmText: t('common.delete'),
+      cancelText: t('common.cancel'),
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    const ok = await deleteMessages([messageId]);
+    if (!ok) {
+      showAlert({ title: t('common.error'), message: t('conversation.errDelete') });
+    }
+  };
+
   const handleLongPressMessage = (messageId: string, event: any) => {
+    // L'appui long ouvre le picker de réactions : impact moyen pour marquer
+    // le franchissement du délai (400 ms) — sans lui, l'utilisateur ne sait
+    // pas si son doigt a été maintenu assez longtemps.
+    haptics.impact('medium');
     setReactionMessageId(messageId);
     setReactionPosition({ 
       x: event.nativeEvent.pageX, 
@@ -1826,7 +1940,7 @@ export function ConversationScreen() {
         setSelectedImage(result.assets[0].uri);
       }
     } catch (error) {
-      Alert.alert(t('common.error'), t('conversation.errPickImage'));
+      showAlert({ title: t('common.error'), message: t('conversation.errPickImage') });
     } finally {
       releaseLock();
     }
@@ -1845,7 +1959,7 @@ export function ConversationScreen() {
         setSelectedImage(result.assets[0].uri);
       }
     } catch (error) {
-      Alert.alert(t('common.error'), t('conversation.errTakePhoto'));
+      showAlert({ title: t('common.error'), message: t('conversation.errTakePhoto') });
     } finally {
       releaseLock();
     }
@@ -1860,16 +1974,16 @@ export function ConversationScreen() {
         // validateFileSize est async - il faut await!
         const validation = await validateFileSize(file.size);
         if (!validation.valid) {
-          Alert.alert(
-            t('conversation.fileTooLargeTitle'),
-            validation.error || t('conversation.fileTooLargeMessage'),
-          );
+          showAlert({
+            title: t('conversation.fileTooLargeTitle'),
+            message: validation.error || t('conversation.fileTooLargeMessage'),
+          });
           return;
         }
         setSelectedFile(file);
       }
     } catch (error) {
-      Alert.alert(t('conversation.filePickErrorTitle'), t('conversation.filePickError'));
+      showAlert({ title: t('conversation.filePickErrorTitle'), message: t('conversation.filePickError') });
     } finally {
       releaseLock();
     }
@@ -1944,7 +2058,7 @@ export function ConversationScreen() {
       setRecordingLocked(false);
       return true;
     } else {
-      Alert.alert(t('common.error'), t('conversation.errStartRecording'));
+      showAlert({ title: t('common.error'), message: t('conversation.errStartRecording') });
       return false;
     }
   };
@@ -1965,7 +2079,7 @@ export function ConversationScreen() {
 
     // Envoyer le vocal si durée > 1 seconde
     if (result.duration < 1000) {
-      Alert.alert(t('conversation.titleVoiceTooShort'), t('conversation.errVoiceTooShort'));
+      showAlert({ title: t('conversation.titleVoiceTooShort'), message: t('conversation.errVoiceTooShort') });
       setRecordingDuration(0);
       setRecordingWaveform([]);
       return;
@@ -2005,7 +2119,7 @@ export function ConversationScreen() {
       }, 150);
 
     } catch (error: any) {
-      Alert.alert(t('common.error'), error.message || t('conversation.errSendVoice'));
+      showAlert({ title: t('common.error'), message: error.message || t('conversation.errSendVoice') });
     } finally {
       setSendingVoice(false);
     }
@@ -2092,62 +2206,42 @@ export function ConversationScreen() {
       });
     } catch (error) {
       console.error('Error playing voice:', error);
-      Alert.alert(t('common.error'), t('conversation.errPlayVoice'));
+      showAlert({ title: t('common.error'), message: t('conversation.errPlayVoice') });
       setPlayingVoiceId(null);
       setIsVoicePlaying(false);
     }
   };
 
-  const handleLongPress = (messageId: string) => {
-    if (!isSelectionMode) {
-      setIsSelectionMode(true);
-      setSelectedIds(new Set([messageId]));
-    }
-  };
-
-  const toggleMessageSelection = (messageId: string) => {
-    const newSelection = new Set(selectedIds);
-    if (newSelection.has(messageId)) {
-      newSelection.delete(messageId);
-      if (newSelection.size === 0) setIsSelectionMode(false);
-    } else {
-      newSelection.add(messageId);
-    }
-    setSelectedIds(newSelection);
-  };
-
-  const exitSelectionMode = () => {
-    setIsSelectionMode(false);
-    setSelectedIds(new Set());
-  };
-
-  const handleDeleteSelected = async () => {
-    setDeleteLoading(true);
-    try {
-      const success = await deleteMessages(Array.from(selectedIds));
-      if (success) {
-        exitSelectionMode();
-      } else {
-        Alert.alert(t('common.error'), t('conversation.errDelete'));
-      }
-    } finally {
-      setDeleteLoading(false);
-      setShowDeleteConfirm(false);
-    }
-  };
-
-  const handleDeleteAll = async () => {
-    setDeleteLoading(true);
-    try {
-      const success = await deleteAllMessages();
-      if (!success) {
-        Alert.alert(t('common.error'), t('conversation.errDelete'));
-      }
-    } finally {
-      setDeleteLoading(false);
-      setShowDeleteAllConfirm(false);
-    }
-  };
+  // ════════════════════════════════════════════════════════════════════════
+  // CODE MORT SUPPRIMÉ — mode sélection, menu de conversation, indicateur
+  // de frappe (Phase 0 de la refonte UI/UX).
+  // ════════════════════════════════════════════════════════════════════════
+  // Ce qui a été retiré ici et pourquoi :
+  //
+  //  1. `handleLongPress` / `toggleMessageSelection` / `exitSelectionMode`
+  //     et les états `isSelectionMode` / `selectedIds`. Le seul appelant de
+  //     `handleLongPress` était gardé par `if (isSelectionMode)`, et la
+  //     fonction elle-même commençait par `if (!isSelectionMode)`. Les deux
+  //     conditions étaient mutuellement exclusives : le mode sélection ne
+  //     pouvait littéralement JAMAIS démarrer. Toute l'UI associée
+  //     (SelectionHeader, cases à cocher, modale de confirmation) était donc
+  //     inatteignable.
+  //
+  //  2. `handleDeleteAll` + l'ActionSheet du header. `showMenu` n'avait
+  //     aucun appelant de `setShowMenu(true)` — le menu ne pouvait pas
+  //     s'ouvrir, et « Tout supprimer » avec lui.
+  //
+  // `deleteMessages` est depuis rebranchée derrière le menu « ⋯ » de l'appui
+  // long (suppression locale unitaire, cf. handleDeleteMessage).
+  // `deleteAllMessages` reste VOLONTAIREMENT conservée côté hook : correcte,
+  // testée côté service, en attente d'un menu de conversation.
+  //
+  // 3. L'indicateur de frappe : les props `isTyping` de ChatHeader et
+  //    d'Avatar n'étaient jamais alimentées. Au-delà du code mort, un
+  //    signal de présence est une métadonnée envoyée en continu au pair —
+  //    contraire au positionnement de l'app. S'il revient un jour, ce sera
+  //    en option explicitement désactivée par défaut.
+  // ════════════════════════════════════════════════════════════════════════
 
   const handleOpenShare = async () => {
     try {
@@ -2156,10 +2250,10 @@ export function ConversationScreen() {
         setShareMasterKey(masterKey);
         setShowShareModal(true);
       } else {
-        Alert.alert(t('common.error'), t('conversation.errFetchKey'));
+        showAlert({ title: t('common.error'), message: t('conversation.errFetchKey') });
       }
     } catch (error) {
-      Alert.alert(t('common.error'), t('conversation.errFetchKey'));
+      showAlert({ title: t('common.error'), message: t('conversation.errFetchKey') });
     }
   };
 
@@ -2222,7 +2316,7 @@ export function ConversationScreen() {
         if (fullImage) setViewerImage(fullImage);
       } catch (e) {
         console.error('❌ handlePress (image) error:', e);
-        Alert.alert(t('common.error'), t('conversation.errLoadImage'));
+        showAlert({ title: t('common.error'), message: t('conversation.errLoadImage') });
       }
     };
     
@@ -2282,7 +2376,7 @@ export function ConversationScreen() {
                       {status === 'sending' && <Icons.StatusClock size={14} color="rgba(255,255,255,0.7)" />}
                       {status === 'sent' && <Icons.SingleCheck size={14} color="rgba(255,255,255,0.7)" />}
                       {status === 'delivered' && <Icons.DoubleCheck size={14} color="rgba(255,255,255,0.85)" />}
-                      {(status === 'read' || !status) && <Icons.DoubleCheck size={14} color="#53BDEB" />}
+                      {status === 'read' && <Icons.DoubleCheck size={14} color="#53BDEB" />}
                     </View>
                   )}
                 </View>
@@ -2521,7 +2615,7 @@ export function ConversationScreen() {
                   {status === 'sending' && <Icons.StatusClock size={14} color="rgba(255,255,255,0.7)" />}
                   {status === 'sent' && <Icons.SingleCheck size={14} color="rgba(255,255,255,0.7)" />}
                   {status === 'delivered' && <Icons.DoubleCheck size={14} color="rgba(255,255,255,0.85)" />}
-                  {(status === 'read' || !status) && <Icons.DoubleCheck size={14} color="#53BDEB" />}
+                  {status === 'read' && <Icons.DoubleCheck size={14} color="#53BDEB" />}
                 </View>
               )}
             </View>
@@ -2567,7 +2661,7 @@ export function ConversationScreen() {
         }
       } catch (e) {
         console.error('❌ InlineFileBubble error:', e);
-        Alert.alert(t('common.error'), t('conversation.errOpenFile'));
+        showAlert({ title: t('common.error'), message: t('conversation.errOpenFile') });
       } finally {
         setDownloading(false);
       }
@@ -2645,7 +2739,7 @@ export function ConversationScreen() {
                   {status === 'sending' && <Icons.StatusClock size={14} color="rgba(255,255,255,0.6)" />}
                   {status === 'sent' && <Icons.SingleCheck size={14} color="rgba(255,255,255,0.7)" />}
                   {status === 'delivered' && <Icons.DoubleCheck size={14} color="rgba(255,255,255,0.85)" />}
-                  {(status === 'read' || !status) && <Icons.DoubleCheck size={14} color="#53BDEB" />}
+                  {status === 'read' && <Icons.DoubleCheck size={14} color="#53BDEB" />}
                 </View>
               )}
             </View>
@@ -2705,7 +2799,7 @@ export function ConversationScreen() {
         setIsPlaying(true);
       } catch (e) {
         console.error('❌ InlineVoiceBubble play error:', e);
-        Alert.alert(t('common.error'), t('conversation.errPlayVoice'));
+        showAlert({ title: t('common.error'), message: t('conversation.errPlayVoice') });
       } finally {
         setLoading(false);
       }
@@ -2783,7 +2877,7 @@ export function ConversationScreen() {
                 {status === 'sending' && <Icons.StatusClock size={12} color="rgba(255,255,255,0.6)" />}
                 {status === 'sent' && <Icons.SingleCheck size={12} color="rgba(255,255,255,0.7)" />}
                 {status === 'delivered' && <Icons.DoubleCheck size={12} color="rgba(255,255,255,0.85)" />}
-                {(status === 'read' || !status) && <Icons.DoubleCheck size={12} color="#53BDEB" />}
+                {status === 'read' && <Icons.DoubleCheck size={12} color="#53BDEB" />}
               </View>
             )}
           </View>
@@ -2828,7 +2922,7 @@ export function ConversationScreen() {
         }
       } catch (e) {
         console.error('❌ handlePress (file) error:', e);
-        Alert.alert(t('common.error'), t('conversation.errOpenFile'));
+        showAlert({ title: t('common.error'), message: t('conversation.errOpenFile') });
       } finally {
         setDownloading(false);
       }
@@ -2886,7 +2980,7 @@ export function ConversationScreen() {
                   {status === 'sending' && <Icons.StatusClock size={14} color={Colors.status.sent} />}
                   {status === 'sent' && <Icons.SingleCheck size={14} color={Colors.status.sent} />}
                   {status === 'delivered' && <Icons.DoubleCheck size={14} color={Colors.status.delivered} />}
-                  {(status === 'read' || !status) && <Icons.DoubleCheck size={14} color={Colors.status.read} />}
+                  {status === 'read' && <Icons.DoubleCheck size={14} color={Colors.status.read} />}
                 </>
               )}
             </View>
@@ -3046,7 +3140,7 @@ export function ConversationScreen() {
                   {status === 'sending' && <Icons.StatusClock size={14} color={Colors.status.sent} />}
                   {status === 'sent' && <Icons.SingleCheck size={14} color={Colors.status.sent} />}
                   {status === 'delivered' && <Icons.DoubleCheck size={14} color={Colors.status.delivered} />}
-                  {(status === 'read' || !status) && <Icons.DoubleCheck size={14} color={Colors.status.read} />}
+                  {status === 'read' && <Icons.DoubleCheck size={14} color={Colors.status.read} />}
                 </View>
               )}
             </View>
@@ -3168,8 +3262,6 @@ export function ConversationScreen() {
   const renderMessage = ({ item, index }: { item: MessageWithStatus; index: number }) => {
     if (!messages || !Array.isArray(messages)) return null;
 
-    const isSelected = selectedIds.has(item.id);
-
     // PERF FIX (3) : on lit le pré-calcul mémoïsé au lieu de scanner.
     // Fallback inline pour le cas (théorique) où l'index dépasse — sécurité.
     const groupInfo = messageGroupingInfo[index];
@@ -3184,6 +3276,26 @@ export function ConversationScreen() {
     const voicePayload = isVoice && !item.voiceData ? getVoicePayload(item) : null;
     const callPayload = isCall ? getCallPayload(item.content) : null;
     const isNew = newMessageIds.has(item.id);
+
+    // v30.0 — Bandeau système de groupe (centré, comme les messages d'appel).
+    if ((item as any).isSystem) {
+      return (
+        <View>
+          {showDate && (
+            <View style={styles.dateSeparator}>
+              <View style={styles.dateLine} />
+              <Text style={styles.dateText}>
+                {groupInfo ? groupInfo.dateLabel : formatDateSeparator(item.timestamp)}
+              </Text>
+              <View style={styles.dateLine} />
+            </View>
+          )}
+          <View style={styles.systemBannerRow}>
+            <Text style={styles.systemBannerText}>{item.content}</Text>
+          </View>
+        </View>
+      );
+    }
 
     // v15.2: Les messages d'appel sont centrés et n'ont pas de groupement
     if (isCall && callPayload) {
@@ -3213,7 +3325,7 @@ export function ConversationScreen() {
     const isLastOfGroup = groupInfo ? groupInfo.isLastOfGroup : true;
     
     const showAvatar = isLastOfGroup;
-    const senderColor = generateColorFromToken(item.senderToken);
+    const senderColor = getAvatarColor(item.senderToken);
     
     const fullDisplayName = getDisplayNameWithDiscriminator(
       item.displayName, 
@@ -3263,28 +3375,14 @@ export function ConversationScreen() {
       <View style={styles.messageWithReactionsWrapper}>
         {/* Message Row */}
         <Pressable
-          style={({ pressed }) => [
+          style={[
             styles.messageRow,
             item.isMine ? styles.messageRowMine : styles.messageRowTheirs,
             { marginTop: getMessageSpacing() },
-            pressed && isSelectionMode && { opacity: 0.7 },
           ]}
-          onPress={() => isSelectionMode && toggleMessageSelection(item.id)}
-          onLongPress={(e) => {
-            if (isSelectionMode) {
-              handleLongPress(item.id);
-            } else {
-              handleLongPressMessage(item.id, e);
-            }
-          }}
+          onLongPress={(e) => handleLongPressMessage(item.id, e)}
           delayLongPress={400}
         >
-          {isSelectionMode && (
-            <View style={[styles.checkbox, isSelected && styles.checkboxSelected]}>
-              {isSelected && <Text style={styles.checkmark}>✓</Text>}
-            </View>
-          )}
-          
           {!item.isMine && (
             <TouchableOpacity 
               style={styles.avatarSpaceLeft}
@@ -3503,7 +3601,6 @@ export function ConversationScreen() {
                 styles.bubble, 
                 item.isMine ? styles.bubbleMine : styles.bubbleTheirs, 
                 getBubbleRadius(),
-                isSelected && styles.bubbleSelected,
                 // v21.0: Style spécial pour le résultat de recherche actuel
                 isCurrentSearchResult(item.id) && styles.bubbleSearchActive,
                 isSearchResult(item.id) && !isCurrentSearchResult(item.id) && styles.bubbleSearchMatch,
@@ -3603,7 +3700,7 @@ export function ConversationScreen() {
           <SwipeableMessage 
             isMine={item.isMine}
             onSwipeRight={() => handleReply(item)}
-            enabled={!isSelectionMode && !isImage && !isFile}
+            enabled={!isImage && !isFile}
           >
             {messageContent}
           </SwipeableMessage>
@@ -3687,34 +3784,44 @@ export function ConversationScreen() {
       )}
 
       {/* Header */}
-      {isSearchMode ? null : isSelectionMode ? (
-        <SelectionHeader 
-          selectedCount={selectedIds.size} 
-          onClose={exitSelectionMode} 
-          onDelete={() => setShowDeleteConfirm(true)} 
-        />
-      ) : (
+      {isSearchMode ? null : (
         <ChatHeader
-          title={conversationInfo.type === '1to1' 
-            ? (conversationInfo.name || conversationName) 
-            : (conversationInfo.name || conversationName)
-          }
+          title={conversationInfo.name || conversationName}
           onBackPress={() => navigation.goBack()}
           onTitlePress={() => {
-            // @ts-ignore
-            navigation.navigate('ContactInfo', { sessionId: conversationId });
+            if (conversationInfo.type === 'group') {
+              // @ts-ignore — route ajoutée au RootStackParamList
+              navigation.navigate('GroupInfo', { groupId: conversationId });
+            } else {
+              // @ts-ignore
+              navigation.navigate('ContactInfo', { sessionId: conversationId });
+            }
           }}
           isEncrypted={true}
           avatar={
-            <Avatar
-              displayName={conversationInfo.name || conversationName}
-              size="medium"
-              avatarUri={conversationInfo.avatarBase64}
-            />
+            conversationInfo.type === 'group' ? (
+              <GroupAvatar
+                name={conversationInfo.name || conversationName}
+                members={conversationInfo.groupMembers}
+                groupId={conversationId}
+                avatarUri={conversationInfo.avatarBase64}
+                size="small"
+              />
+            ) : (
+              <Avatar
+                displayName={conversationInfo.name || conversationName}
+                size="medium"
+                avatarUri={conversationInfo.avatarBase64}
+              />
+            )
           }
-          subtitle=''
+          subtitle={
+            conversationInfo.type === 'group'
+              ? t('groups.memberCount', { count: conversationInfo.memberCount || 0, defaultValue: `${conversationInfo.memberCount || 0} membres` })
+              : ''
+          }
           rightActions={
-            conversationInfo.session ? (
+            conversationInfo.type === '1to1' && conversationInfo.session ? (
               <CallButton1to1 
                 sessionId={conversationId} 
                 contactName={conversationInfo.name || conversationName} 
@@ -4063,7 +4170,11 @@ export function ConversationScreen() {
                       multiline
                       onFocus={handleInputFocus}
                       onBlur={handleInputBlur}
-                      keyboardAppearance="dark"
+                      // Suit le thème de l'app au lieu d'être figé sur
+                      // "dark" : un clavier iOS sombre sous une interface
+                      // claire est le défaut le plus visible d'un light mode
+                      // mal fini.
+                      keyboardAppearance={liveTheme.isDark ? 'dark' : 'light'}
                     />
                     
                     <TouchableOpacity 
@@ -4113,12 +4224,60 @@ export function ConversationScreen() {
         onSelect={(emoji) => reactionMessageId && handleReaction(reactionMessageId, emoji)}
         onClose={() => setShowReactionPicker(false)}
         selectedEmojis={
-          reactionMessageId 
+          reactionMessageId
             ? (messages.find(m => m.id === reactionMessageId) as MessageWithStatus)?.reactions
                 ?.filter(r => r.userReacted)
                 ?.map(r => r.emoji) || []
             : []
         }
+        onMore={(() => {
+          // Menu d'actions « ⋯ » — Signaler (messages reçus uniquement,
+          // guideline 1.2 : signaler son propre message n'a pas de sens)
+          // et Supprimer (tous les messages, suppression locale).
+          const m = reactionMessageId ? messages.find(msg => msg.id === reactionMessageId) : null;
+          if (!m) return undefined;
+          const items: Array<{
+            title: string;
+            icon?: React.ReactNode;
+            destructive?: boolean;
+            onPress: () => void;
+          }> = [];
+          if (!m.isMine) {
+            // Médias : le content est une référence opaque — on préfixe par le
+            // type pour que le modérateur sache de quoi il s'agit.
+            const typeLabel = m.messageType && m.messageType !== 'text' ? `[${m.messageType}] ` : '';
+            const reportContentValue = typeLabel + (m.content || '');
+            items.push({
+              title: t('conversation.reportMessage'),
+              icon: <Ionicons name="flag-outline" size={22} color={Colors.accent.error} />,
+              destructive: true,
+              onPress: () => {
+                setReportContent(reportContentValue);
+              },
+            });
+          }
+          const messageId = m.id;
+          items.push({
+            title: t('common.delete'),
+            icon: <Ionicons name="trash-outline" size={22} color={Colors.accent.error} />,
+            destructive: true,
+            onPress: () => { void handleDeleteMessage(messageId); },
+          });
+          return () => {
+            void showActionSheet({ items });
+          };
+        })()}
+      />
+
+      {/* Signalement de message — guideline App Store 1.2.
+          Signaler n'entraîne AUCUNE action sur le message : il reste dans la
+          conversation (préserve la preuve côté utilisateur ; la suppression
+          locale reste disponible via le menu long-press). */}
+      <ReportModal
+        visible={reportContent !== null}
+        onClose={() => setReportContent(null)}
+        context="message"
+        content={reportContent || ''}
       />
 
       {/* Image Preview Modal */}
@@ -4257,9 +4416,9 @@ export function ConversationScreen() {
                       await FileSystem.writeAsStringAsync(saveUri, b64, { encoding: FileSystem.EncodingType.Base64 });
                     }
                     await MediaLibrary.saveToLibraryAsync(saveUri);
-                    Alert.alert(t('conversation.imageSavedTitle'), t('conversation.imageSavedMessage'));
+                    showAlert({ title: t('conversation.imageSavedTitle'), message: t('conversation.imageSavedMessage') });
                   } catch (e) {
-                    Alert.alert(t('common.error'), t('conversation.errSaveImage'));
+                    showAlert({ title: t('common.error'), message: t('conversation.errSaveImage') });
                   }
                 }}
               >
@@ -4305,17 +4464,7 @@ export function ConversationScreen() {
         </Pressable>
       </Modal>
 
-      {/* Action Sheet Menu */}
-      <ActionSheet
-        visible={showMenu}
-        onClose={() => setShowMenu(false)}
-        items={[
-          { title: t('conversation.inviteSomeone'), onPress: handleOpenShare },
-          { title: t('conversation.deleteAllTitle'), onPress: () => setShowDeleteAllConfirm(true), destructive: true },
-        ]}
-      />
-
-      {/* Share Modal */}
+      {/* Share Modal — ouvert depuis le CTA de l'état vide du fil */}
       {showShareModal && shareMasterKey && (
         <InviteModal
           visible={showShareModal}
@@ -4324,42 +4473,6 @@ export function ConversationScreen() {
           masterKey={shareMasterKey}
         />
       )}
-
-      {/* Delete Confirmation Modal */}
-      <AlertModal
-        visible={showDeleteConfirm}
-        onClose={() => setShowDeleteConfirm(false)}
-        title={t('conversation.deleteMessagesTitle')}
-        message={t('conversation.deleteMessagesConfirm', { count: selectedIds.size })}
-        primaryButton={{
-          title: t('common.delete'),
-          onPress: handleDeleteSelected,
-          variant: 'danger',
-          loading: deleteLoading,
-        }}
-        secondaryButton={{
-          title: t('common.cancel'),
-          onPress: () => setShowDeleteConfirm(false),
-        }}
-      />
-
-      {/* Delete All Confirmation Modal */}
-      <AlertModal
-        visible={showDeleteAllConfirm}
-        onClose={() => setShowDeleteAllConfirm(false)}
-        title={t('conversation.deleteAllTitle')}
-        message={t('conversation.deleteAllConfirm')}
-        primaryButton={{
-          title: t('conversation.deleteAll'),
-          onPress: handleDeleteAll,
-          variant: 'danger',
-          loading: deleteLoading,
-        }}
-        secondaryButton={{
-          title: t('common.cancel'),
-          onPress: () => setShowDeleteAllConfirm(false),
-        }}
-      />
 
     </View>
   );
@@ -4746,10 +4859,6 @@ const makeStyles = (c: ColorPalette) => {
   bubbleTheirs: { 
     backgroundColor: Colors.bubble.incoming,
   },
-  bubbleSelected: { 
-    opacity: 0.7,
-  },
-  
   // Quoted message
   quotedMessage: {
     flexDirection: 'row',
@@ -4856,6 +4965,30 @@ const makeStyles = (c: ColorPalette) => {
   },
   messageTextTheirs: {
     color: Colors.text.onBubbleTheirs,
+  },
+
+  // v30.0 — Groupes : nom d'expéditeur + bandeau système
+  groupSenderName: {
+    fontSize: Type.size.sm,
+    fontWeight: '600',
+    marginBottom: 2,
+  },
+  systemBannerRow: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 6,
+    paddingHorizontal: 16,
+    marginVertical: 4,
+  },
+  systemBannerText: {
+    fontSize: Type.size.sm,
+    color: Colors.text.secondary,
+    textAlign: 'center',
+    backgroundColor: Colors.bg.tertiary,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+    overflow: 'hidden',
   },
   
   // Message footer
@@ -5028,28 +5161,6 @@ const makeStyles = (c: ColorPalette) => {
     fontSize: 11,
     color: Colors.text.secondary,
     marginLeft: 2,
-  },
-  
-  // Checkbox
-  checkbox: { 
-    width: 22, 
-    height: 22, 
-    borderRadius: 11, 
-    borderWidth: 2, 
-    borderColor: Colors.ui.border, 
-    marginRight: Space.sm, 
-    justifyContent: 'center', 
-    alignItems: 'center', 
-    backgroundColor: Colors.bg.elevated,
-  },
-  checkboxSelected: { 
-    backgroundColor: Colors.accent.primary, 
-    borderColor: Colors.accent.primary,
-  },
-  checkmark: { 
-    color: '#FFF', 
-    fontSize: 12, 
-    fontWeight: Type.weight.bold,
   },
   
   // Media container
