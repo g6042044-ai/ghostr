@@ -1,4 +1,42 @@
 {
+  "terms": {
+    "title": "Condizioni d'uso",
+    "intro": "Leggi e accetta queste condizioni per usare Ghostr. Servono a mantenere il servizio sicuro per tutti.",
+    "s1Title": "1. Accettazione",
+    "s1Body": "Usando Ghostr accetti queste condizioni d'uso. Se non le accetti, non usare l'app.",
+    "s2Title": "2. Il servizio",
+    "s2Body": "Ghostr è una messaggistica cifrata end-to-end. Non ci sono account: la tua identità e i tuoi messaggi esistono solo sul tuo dispositivo e le conversazioni si creano solo su invito. Sei l'unico responsabile dei contenuti che invii.",
+    "s3Title": "3. Tolleranza zero per i contenuti inaccettabili",
+    "s3Body": "Su Ghostr non sono tollerati contenuti inaccettabili né comportamenti abusivi: molestie, minacce, incitamento all'odio, sfruttamento sessuale, contenuti illegali, spam. Le segnalazioni vengono esaminate e gestite entro 24 ore: i contenuti illeciti vengono rimossi e gli utenti abusivi perdono definitivamente la possibilità di contattare le loro vittime.",
+    "s4Title": "4. Segnalazione e blocco",
+    "s4Body": "Puoi segnalare qualsiasi messaggio ricevuto (pressione prolungata → Segnala) e bloccare un contatto in qualsiasi momento (info contatto → Blocca e segnala). Il blocco elimina immediatamente la conversazione dal tuo dispositivo e impedisce definitivamente al contatto bloccato di ricontattarti. Le segnalazioni vengono trasmesse alla moderazione solo con il tuo consenso esplicito.",
+    "s5Title": "5. Privacy",
+    "s5Body": "I messaggi sono cifrati end-to-end; i server non possono leggerli. Quando segnali un contenuto, viene trasmesso solo ciò che scegli di segnalare, senza il tuo indirizzo IP né la tua identità.",
+    "s6Title": "6. Garanzie",
+    "s6Body": "Ghostr è fornito «così com'è», senza garanzie di alcun tipo. Nei limiti consentiti dalla legge, i suoi autori non sono responsabili dei danni derivanti dall'uso dell'app.",
+    "s7Title": "7. Contatti",
+    "s7Body": "Domande o segnalazioni di comportamenti inappropriati: theghostr.com",
+    "lastUpdated": "Ultimo aggiornamento: agosto 2026",
+    "acceptNote": "Toccando «Accetta e continua», confermi di aver letto e accettato queste condizioni.",
+    "acceptButton": "Accetta e continua"
+  },
+  "report": {
+    "titleMessage": "Segnala messaggio",
+    "titleBlock": "Blocca e segnala",
+    "chooseCategory": "Perché lo stai segnalando?",
+    "categories": {
+      "spam": "Spam",
+      "harassment": "Molestie o minacce",
+      "illegal": "Contenuto illegale",
+      "other": "Altro"
+    },
+    "consentMessage": "Il messaggio segnalato sarà inviato alla moderazione di Ghostr. Nient'altro della conversazione lascia il tuo dispositivo. Le segnalazioni vengono esaminate entro 24 ore.",
+    "consentBlock": "Il nome e l'impronta d'identità del contatto saranno inviati alla moderazione di Ghostr, la conversazione sarà eliminata dal tuo dispositivo e questo contatto non potrà più contattarti. Le segnalazioni vengono esaminate entro 24 ore.",
+    "submitMessage": "Segnala",
+    "submitBlock": "Blocca e segnala",
+    "success": "Segnalazione inviata. Grazie.",
+    "sendFailed": "Impossibile inviare la segnalazione. Controlla la connessione."
+  },
   "common": {
     "cancel": "Annulla",
     "save": "Salva",
@@ -78,7 +116,9 @@
         "feature3": "Resistente ai computer quantistici"
       }
     },
-    "tagline": "MESSAGGISTICA CRITTOGRAFATA"
+    "tagline": "MESSAGGISTICA CRITTOGRAFATA",
+    "restoreBackup": "Ripristina un backup",
+    "restoreBackupHint": "Importa un file di backup per recuperare la tua identità e le tue conversazioni"
   },
   "conversationList": {
     "appName": "Ghostr",
@@ -122,6 +162,7 @@
     }
   },
   "conversation": {
+    "reportMessage": "Segnala",
     "today": "Oggi",
     "yesterday": "Ieri",
     "typing": "sta scrivendo…",
@@ -152,6 +193,8 @@
     "imageSavedMessage": "Immagine salvata nella galleria",
     "errSaveImage": "Impossibile salvare l'immagine",
     "searchPlaceholder": "Cerca nella conversazione…",
+    "deleteMessageTitle": "Elimina messaggio",
+    "deleteMessageConfirm": "Questo messaggio verrà eliminato solo su questo dispositivo. L'azione è irreversibile.",
     "deleteMessagesTitle": "Elimina messaggi",
     "deleteMessagesConfirm": "Vuoi davvero eliminare {{count}} messaggio? L'azione è irreversibile.",
     "deleteMessagesConfirm_plural": "Vuoi davvero eliminare {{count}} messaggi? L'azione è irreversibile.",
@@ -184,6 +227,7 @@
     "emojiObjects": "Oggetti"
   },
   "settings": {
+    "termsOfUse": "Condizioni d'uso",
     "title": "Impostazioni",
     "profileSection": "PROFILO",
     "securitySection": "SICUREZZA",
@@ -249,12 +293,7 @@
     "light": "Chiaro",
     "lightSubtitle": "Usa sempre il tema chiaro",
     "dark": "Scuro",
-    "darkSubtitle": "Usa sempre il tema scuro",
-    "applyOnRestartTitle": "Riavvia Ghostr per applicare",
-    "applyOnRestartMessage": "Alcune schermate usano il tema precedente fino al riavvio dell'app. L'intestazione e la tua scelta sono già aggiornate.",
-    "restartConfirmTitle": "Riavvia Ghostr per applicare",
-    "restartConfirmMessage": "Alcune schermate usano stili che richiedono il riavvio del bundle JS per cambiare tema in modo pulito. Tocca Riavvia per applicare il nuovo tema ovunque in una volta.",
-    "restartConfirmAction": "Riavvia"
+    "darkSubtitle": "Usa sempre il tema scuro"
   },
   "notifications": {
     "newMessageTitle": "Nuovo messaggio",
@@ -367,6 +406,9 @@
     "security2": "Il QR contiene solo un identificatore casuale"
   },
   "join": {
+    "blockedContactTitle": "Contatto bloccato",
+    "blockedContactMessage": "Hai bloccato {{name}}. Vuoi sbloccarlo e accettare questo invito?",
+    "unblockAndAccept": "Sblocca e accetta",
     "decoding": "Decodifica invito…",
     "establishing": "Stabilimento connessione sicura…",
     "connected": "Connessione stabilita!",
@@ -381,7 +423,6 @@
     "pastePlaceholder": "Incolla il codice qui…",
     "connectButton": "Connetti",
     "scanTitle": "Scansiona",
-    "authorize": "Autorizza",
     "pasteHere": "Incolla il codice qui…",
     "connect": "Connetti",
     "enterCode": "Incolla il codice di invito",
@@ -403,12 +444,18 @@
     "autoSecurity": "Sicurezza automatica",
     "autoSecurityDesc": "Le chiavi di crittografia vengono create localmente su ogni telefono. Nessun dato sensibile transita dal server.",
     "cameraAccess": "Accesso alla fotocamera",
-    "cameraAccessDesc": "Consenti l'accesso alla fotocamera per scansionare il codice QR",
+    "cameraAccessDesc": "La fotocamera viene utilizzata per scansionare un codice QR.",
+    "continue": "Continua",
     "codeLabel": "Codice di invito",
     "codeHint": "Il codice è una lunga stringa di caratteri",
     "placeQRInFrame": "Posiziona il codice QR nel riquadro",
     "selfInviteTitle": "Questo invito è tuo",
-    "selfInviteMessage": "Non puoi iniziare una conversazione con te stesso. Condividi invece questo codice con qualcun altro."
+    "selfInviteMessage": "Non puoi iniziare una conversazione con te stesso. Condividi invece questo codice con qualcun altro.",
+    "torchOn": "Accendi la torcia",
+    "torchOff": "Spegni la torcia",
+    "pasteFromClipboard": "Incolla",
+    "clipboardEmpty": "Gli appunti sono vuoti.",
+    "clipboardError": "Impossibile leggere gli appunti."
   },
   "lock": {
     "enterPassword": "Inserisci la tua password",
@@ -519,6 +566,8 @@
     "confirmLabel": "Conferma"
   },
   "contactInfo": {
+    "blockAndReport": "Blocca e segnala",
+    "blockConfirmMessage": "{{name}} non potrà più contattarti e la conversazione sarà eliminata da questo dispositivo. Al passaggio successivo potrai inviare il contenuto illecito alla moderazione.",
     "callError": "Impossibile avviare la chiamata",
     "callErrorGeneric": "Si è verificato un errore durante l'avvio della chiamata",
     "deleteWhileCallTitle": "Chiamata in corso",
@@ -628,13 +677,13 @@
     "enable": "Attiva",
     "later": "Più tardi",
     "privacyNote": "I server non ricevono alcuna informazione sui contenuti — solo un segnale vuoto ti notifica.",
-    "enableNotifications": "Attiva le notifiche",
     "stayReachable": "Resta raggiungibile",
-    "description1": "Attiva le notifiche per essere avvisato di ",
+    "description1": "Le notifiche ti avvisano di ",
     "highlightMessages": "messaggi",
     "descriptionAnd": " e ",
     "highlightCalls": "chiamate in arrivo",
     "description2": ", anche quando l'app è chiusa.",
+    "continue": "Continua",
     "privacyShort": "Il contenuto rimane crittografato e invisibile nelle notifiche.",
     "notNow": "Non ora"
   },
@@ -653,7 +702,8 @@
   },
   "header": {
     "selectedCount": "{{count}} selezionato",
-    "selectedCount_plural": "{{count}} selezionati"
+    "selectedCount_plural": "{{count}} selezionati",
+    "selectAll": "Seleziona tutto"
   },
   "messages": {
     "errors": {
@@ -834,6 +884,12 @@
     "shareDialogTitle": "Backup Ghostr cifrato"
   },
   "migrationExport": {
+    "wipeWarning": "Una volta cancellato questo dispositivo, tutti i suoi dati spariscono PER SEMPRE. Fallo SOLO dopo aver trasferito e salvato in modo sicuro il file di backup.",
+    "wipeButton": "Cancella questo dispositivo",
+    "wipingDevice": "Cancellazione del dispositivo…",
+    "confirmWipeTitle": "Cancellare definitivamente questo dispositivo?",
+    "confirmWipeBody": "Questo dispositivo sarà ripristinato. Tutti i dati (messaggi, chiavi, sessioni, media) saranno eliminati. Potrai ripristinarli su un altro dispositivo con il file di backup e la sua password.",
+    "confirmWipeYes": "Cancella ora",
     "createPasswordTitle": "Password del backup",
     "createPasswordDesc": "Cifrerà la tua identità, le sessioni e la cronologia. Scegli una password FORTE.",
     "forgotWarning": "Se dimentichi questa password, il backup diventa illeggibile. Nessuno può recuperarlo, nemmeno noi.",
@@ -880,6 +936,7 @@
     "saveToFolderError": "Errore durante il salvataggio nella cartella"
   },
   "migrationImport": {
+    "errorHardwareKeyInit": "L'archivio sicuro hardware del dispositivo non è disponibile. Riavvia il telefono e riprova.",
     "introTitle": "Ripristina da backup",
     "introLead": "Importa un backup Ghostr creato su un altro dispositivo. Le tue conversazioni saranno ripristinate completamente.",
     "beforeYouStartTitle": "Prima di iniziare",
@@ -944,5 +1001,91 @@
     "confirmPasswordTitle": "Conferma la password",
     "confirmPasswordDesc": "Reinserisci la password per confermare.",
     "passwordHint": "Memorizzala. Nessun recupero possibile."
+  },
+  "groups": {
+    "newGroup": "New group",
+    "addMembers": "Add members",
+    "group": "Group",
+    "nameLabel": "Group name",
+    "namePlaceholder": "E.g. Family, Project X…",
+    "descriptionLabel": "Description (optional)",
+    "descriptionPlaceholder": "What is this group about?",
+    "create": "Create group",
+    "creating": "Creating…",
+    "createFailed": "Failed to create the group.",
+    "nameRequired": "Name required",
+    "enterName": "Give the group a name.",
+    "full": "Group full",
+    "maxReached": "Maximum 50 members.",
+    "noContacts": "Ancora nessun contatto. Potrai aggiungere membri dai tuoi contatti più tardi.",
+    "selectedCount": "{{count}} selected",
+    "privacyHint": "Sarai l'amministratore. Potrai aggiungere membri dai tuoi contatti in seguito.",
+    "unknownContact": "Contact",
+    "info": "Group info",
+    "notFound": "Group not found",
+    "memberCount": "{{count}} members",
+    "membersSection": "Members",
+    "admin": "Admin",
+    "you": "you",
+    "makeAdmin": "Make admin",
+    "removeMember": "Remove from group",
+    "removeConfirmTitle": "Remove this member?",
+    "removeConfirmBody": "{{name}} will be removed from the group.",
+    "blockAndReport": "Blocca e segnala",
+    "blockConfirmBody": "{{name}} non potrà più contattarti. Al passaggio successivo potrai inviare il contenuto illecito alla moderazione.",
+    "memberBlocked": "{{name}} è stato bloccato.",
+    "leave": "Leave group",
+    "leaveTitle": "Leave group?",
+    "leaveBody": "You will no longer receive messages from this group.",
+    "mute": "Mute",
+    "longPressHint": "Long-press a member to manage them.",
+    "inviteByQR": "Invite via QR",
+    "adminOnly": "Only an admin can invite.",
+    "share": "Share",
+    "copyLink": "Copy",
+    "linkCopied": "Link copied",
+    "resetLink": "Reset",
+    "resetLinkTitle": "Reset the link?",
+    "resetLinkBody": "Old links and QR codes will stop working. Anyone with the old link won't be able to join.",
+    "resetLinkConfirm": "Reset",
+    "approvalRequired": "Approve requests",
+    "approvalHint": "You manually approve everyone who asks to join.",
+    "qrWarning": "Anyone scanning this code can request to join the group.",
+    "shareMessage": "Join \"{{name}}\" on ghostr: {{url}}",
+    "joinGroup": "Join a group",
+    "invalidInvite": "This invitation is invalid or has expired.",
+    "joinPreview": "You're about to request to join this group. An admin will need to approve your request.",
+    "requestToJoin": "Request to join",
+    "connecting": "Establishing secure connection…",
+    "waitingApproval": "Request sent. Waiting for an admin to approve…",
+    "waitingHint": "You can close this screen; you'll be added automatically once approved.",
+    "joinDeclined": "Your request was declined.",
+    "adminSessionFailed": "Couldn't establish a secure connection with the admin.",
+    "joinSendFailed": "Failed to send the request.",
+    "joinRequestTitle": "Join request",
+    "joinRequestBody": "{{name}} wants to join the group.",
+    "accept": "Accept",
+    "decline": "Decline",
+    "menu": {
+      "createTitle": "New group",
+      "createSubtitle": "Create an encrypted group conversation"
+    },
+    "addPartialTitle": "Alcune aggiunte non sono riuscite",
+    "addPartialBody": "Impossibile aggiungere: {{names}}. Riprova più tardi.",
+    "addSelected": "Aggiungi",
+    "adding": "Aggiunta…",
+    "inviteByLinkTitle": "Invita tramite link",
+    "inviteByLinkHint": "L'invito post-quantistico è troppo grande per un codice QR. Condividi il link qui sotto; il destinatario lo incolla in «Unisciti».",
+    "maxReachedExisting": "Massimo {{count}} membri.",
+    "noContactsToAdd": "Nessun contatto disponibile. Tutti i tuoi contatti sono già nel gruppo, oppure non hai ancora contatti.",
+    "searchContacts": "Cerca un contatto…",
+    "noSearchResults": "Nessun contatto trovato.",
+    "qrExpired": "Questo codice QR è scaduto. Chiedi all'amministratore di inviarti di nuovo il link d'invito.",
+    "inviteMalformed": "Impossibile leggere l'invito."
+  },
+  "errorBoundary": {
+    "title": "Si è verificato un errore",
+    "subtitle": "Questa schermata ha riscontrato un problema imprevisto. Puoi tornare indietro e riprovare senza chiudere l'app.",
+    "action": "Torna indietro"
   }
 }

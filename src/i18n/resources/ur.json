@@ -1,4 +1,42 @@
 {
+  "terms": {
+    "title": "استعمال کی شرائط",
+    "intro": "Ghostr استعمال کرنے کے لیے براہ کرم یہ شرائط پڑھیں اور قبول کریں۔ یہ سب کے لیے سروس کو محفوظ رکھنے کے لیے ہیں۔",
+    "s1Title": "1۔ قبولیت",
+    "s1Body": "Ghostr استعمال کر کے آپ ان شرائطِ استعمال سے اتفاق کرتے ہیں۔ اگر آپ متفق نہیں تو ایپ استعمال نہ کریں۔",
+    "s2Title": "2۔ سروس",
+    "s2Body": "Ghostr ایک اینڈ ٹو اینڈ انکرپٹڈ میسنجر ہے۔ کوئی اکاؤنٹ نہیں: آپ کی شناخت اور پیغامات صرف آپ کے آلے پر موجود ہوتے ہیں، اور گفتگو صرف دعوت سے بنتی ہے۔ آپ جو مواد بھیجتے ہیں اس کے آپ خود ذمہ دار ہیں۔",
+    "s3Title": "3۔ قابلِ اعتراض مواد کے لیے صفر برداشت",
+    "s3Body": "Ghostr پر قابلِ اعتراض مواد یا بدسلوکی برداشت نہیں کی جاتی: ہراسانی، دھمکیاں، نفرت انگیز تقریر، جنسی استحصال، غیر قانونی مواد، اسپام۔ رپورٹس کا جائزہ لے کر 24 گھنٹوں کے اندر کارروائی کی جاتی ہے: خلاف ورزی کرنے والا مواد ہٹا دیا جاتا ہے اور بدسلوکی کرنے والے صارفین اپنے متاثرین سے رابطے کی صلاحیت مستقل طور پر کھو دیتے ہیں۔",
+    "s4Title": "4۔ رپورٹ اور بلاک",
+    "s4Body": "آپ کسی بھی موصولہ پیغام کی رپورٹ کر سکتے ہیں (دیر تک دبائیں ← رپورٹ کریں) اور کسی رابطے کو کسی بھی وقت بلاک کر سکتے ہیں (رابطے کی معلومات ← بلاک اور رپورٹ کریں)۔ بلاک کرنے سے گفتگو فوراً آپ کے آلے سے حذف ہو جاتی ہے اور بلاک شدہ رابطہ آپ سے دوبارہ کبھی رابطہ نہیں کر سکتا۔ رپورٹس صرف آپ کی واضح رضامندی سے ماڈریشن کو بھیجی جاتی ہیں۔",
+    "s5Title": "5۔ رازداری",
+    "s5Body": "پیغامات اینڈ ٹو اینڈ انکرپٹڈ ہیں؛ سرورز انہیں نہیں پڑھ سکتے۔ رپورٹ کرتے وقت صرف وہی مواد بھیجا جاتا ہے جو آپ رپورٹ کرنا چاہتے ہیں — آپ کے IP ایڈریس یا شناخت کے بغیر۔",
+    "s6Title": "6۔ دستبرداری",
+    "s6Body": "Ghostr «جیسا ہے» فراہم کیا جاتا ہے، بغیر کسی ضمانت کے۔ قانون کی حد تک، اس کے مصنفین ایپ کے استعمال سے ہونے والے نقصانات کے ذمہ دار نہیں۔",
+    "s7Title": "7۔ رابطہ",
+    "s7Body": "سوالات یا نامناسب رویے کی اطلاع: theghostr.com",
+    "lastUpdated": "آخری تازہ کاری: اگست 2026",
+    "acceptNote": "«قبول کریں اور جاری رکھیں» دبا کر آپ تصدیق کرتے ہیں کہ آپ نے یہ شرائط پڑھ کر قبول کی ہیں۔",
+    "acceptButton": "قبول کریں اور جاری رکھیں"
+  },
+  "report": {
+    "titleMessage": "پیغام کی رپورٹ کریں",
+    "titleBlock": "بلاک اور رپورٹ کریں",
+    "chooseCategory": "آپ اس کی رپورٹ کیوں کر رہے ہیں؟",
+    "categories": {
+      "spam": "اسپام",
+      "harassment": "ہراسانی یا دھمکیاں",
+      "illegal": "غیر قانونی مواد",
+      "other": "دیگر"
+    },
+    "consentMessage": "رپورٹ کردہ پیغام Ghostr ماڈریشن کو بھیجا جائے گا۔ گفتگو کا کوئی اور حصہ آپ کے آلے سے باہر نہیں جاتا۔ رپورٹس کا جائزہ 24 گھنٹوں میں لیا جاتا ہے۔",
+    "consentBlock": "رابطے کا نام اور شناختی فنگرپرنٹ Ghostr ماڈریشن کو بھیجے جائیں گے، گفتگو آپ کے آلے سے حذف ہو جائے گی، اور یہ رابطہ آپ سے دوبارہ رابطہ نہیں کر سکے گا۔ رپورٹس کا جائزہ 24 گھنٹوں میں لیا جاتا ہے۔",
+    "submitMessage": "رپورٹ کریں",
+    "submitBlock": "بلاک اور رپورٹ کریں",
+    "success": "رپورٹ بھیج دی گئی۔ شکریہ۔",
+    "sendFailed": "رپورٹ نہیں بھیجی جا سکی۔ اپنا کنکشن چیک کریں۔"
+  },
   "common": {
     "cancel": "منسوخ کریں",
     "save": "محفوظ کریں",
@@ -78,7 +116,9 @@
         "feature3": "کوانٹم کمپیوٹرز کے خلاف مزاحم"
       }
     },
-    "tagline": "خفیہ کردہ پیغام رسانی"
+    "tagline": "خفیہ کردہ پیغام رسانی",
+    "restoreBackup": "بیک اپ بحال کریں",
+    "restoreBackupHint": "اپنی شناخت اور گفتگو بحال کرنے کے لیے بیک اپ فائل درآمد کریں"
   },
   "conversationList": {
     "appName": "Ghostr",
@@ -122,6 +162,7 @@
     }
   },
   "conversation": {
+    "reportMessage": "رپورٹ کریں",
     "today": "آج",
     "yesterday": "کل",
     "typing": "لکھ رہے ہیں…",
@@ -152,6 +193,8 @@
     "imageSavedMessage": "تصویر گیلری میں محفوظ ہو گئی",
     "errSaveImage": "تصویر محفوظ نہیں کی جا سکی",
     "searchPlaceholder": "گفتگو میں تلاش کریں…",
+    "deleteMessageTitle": "پیغام حذف کریں",
+    "deleteMessageConfirm": "یہ پیغام صرف اسی آلے سے حذف ہوگا۔ یہ عمل واپس نہیں ہو سکتا۔",
     "deleteMessagesTitle": "پیغامات حذف کریں",
     "deleteMessagesConfirm": "کیا آپ واقعی {{count}} پیغام حذف کرنا چاہتے ہیں؟ یہ عمل واپس نہیں ہو سکتا۔",
     "deleteMessagesConfirm_plural": "کیا آپ واقعی {{count}} پیغامات حذف کرنا چاہتے ہیں؟ یہ عمل واپس نہیں ہو سکتا۔",
@@ -184,6 +227,7 @@
     "emojiObjects": "اشیاء"
   },
   "settings": {
+    "termsOfUse": "استعمال کی شرائط",
     "title": "ترتیبات",
     "profileSection": "پروفائل",
     "securitySection": "سیکیورٹی",
@@ -249,12 +293,7 @@
     "light": "روشن",
     "lightSubtitle": "ہمیشہ روشن تھیم استعمال کریں",
     "dark": "تاریک",
-    "darkSubtitle": "ہمیشہ تاریک تھیم استعمال کریں",
-    "applyOnRestartTitle": "لاگو کرنے کے لیے Ghostr کو دوبارہ شروع کریں",
-    "applyOnRestartMessage": "ایپ کو دوبارہ شروع کرنے تک کچھ اسکرینز پچھلا تھیم استعمال کرتی ہیں۔ ہیڈر اور آپ کا انتخاب پہلے ہی اپ ڈیٹ ہو چکا ہے۔",
-    "restartConfirmTitle": "لاگو کرنے کے لیے Ghostr کو دوبارہ شروع کریں",
-    "restartConfirmMessage": "کچھ اسکرینز ایسے اسٹائلز استعمال کرتی ہیں جنہیں صاف طور پر تھیم تبدیل کرنے کے لیے JS بنڈل کو دوبارہ شروع کرنے کی ضرورت ہے۔ نیا تھیم ایک ساتھ ہر جگہ لاگو کرنے کے لیے دوبارہ شروع کریں پر ٹیپ کریں۔",
-    "restartConfirmAction": "دوبارہ شروع کریں"
+    "darkSubtitle": "ہمیشہ تاریک تھیم استعمال کریں"
   },
   "notifications": {
     "newMessageTitle": "نیا پیغام",
@@ -367,6 +406,9 @@
     "security2": "QR میں صرف ایک بے ترتیب شناخت کنندہ ہے"
   },
   "join": {
+    "blockedContactTitle": "بلاک شدہ رابطہ",
+    "blockedContactMessage": "آپ نے {{name}} کو بلاک کیا ہے۔ کیا آپ ان بلاک کر کے یہ دعوت قبول کرنا چاہتے ہیں؟",
+    "unblockAndAccept": "ان بلاک کریں اور قبول کریں",
     "decoding": "دعوت نامہ ڈی کوڈ ہو رہا ہے…",
     "establishing": "محفوظ کنیکشن قائم کیا جا رہا ہے…",
     "connected": "کنیکشن قائم ہو گیا!",
@@ -381,7 +423,6 @@
     "pastePlaceholder": "کوڈ یہاں پیسٹ کریں…",
     "connectButton": "منسلک ہوں",
     "scanTitle": "اسکین کریں",
-    "authorize": "اجازت دیں",
     "pasteHere": "کوڈ یہاں پیسٹ کریں…",
     "connect": "منسلک ہوں",
     "enterCode": "براہ کرم دعوت کا کوڈ پیسٹ کریں",
@@ -403,12 +444,18 @@
     "autoSecurity": "خود کار سیکیورٹی",
     "autoSecurityDesc": "خفیہ کاری کی چابیاں ہر فون پر مقامی طور پر بنتی ہیں۔ کوئی حساس ڈیٹا سرور سے نہیں گزرتا۔",
     "cameraAccess": "کیمرے تک رسائی",
-    "cameraAccessDesc": "QR کوڈ اسکین کرنے کے لیے کیمرے تک رسائی کی اجازت دیں",
+    "cameraAccessDesc": "کیمرہ QR کوڈ اسکین کرنے کے لیے استعمال ہوتا ہے۔",
+    "continue": "جاری رکھیں",
     "codeLabel": "دعوت کا کوڈ",
     "codeHint": "کوڈ ایک طویل حروف کی لڑی ہے",
     "placeQRInFrame": "QR کوڈ کو فریم میں رکھیں",
     "selfInviteTitle": "یہ دعوت آپ کی اپنی ہے",
-    "selfInviteMessage": "آپ خود کے ساتھ گفتگو شروع نہیں کر سکتے۔ اس کوڈ کو کسی اور کے ساتھ شیئر کریں۔"
+    "selfInviteMessage": "آپ خود کے ساتھ گفتگو شروع نہیں کر سکتے۔ اس کوڈ کو کسی اور کے ساتھ شیئر کریں۔",
+    "torchOn": "ٹارچ آن کریں",
+    "torchOff": "ٹارچ بند کریں",
+    "pasteFromClipboard": "پیسٹ کریں",
+    "clipboardEmpty": "آپ کا کلپ بورڈ خالی ہے۔",
+    "clipboardError": "کلپ بورڈ نہیں پڑھا جا سکا۔"
   },
   "lock": {
     "enterPassword": "براہ کرم اپنا پاس ورڈ درج کریں",
@@ -519,6 +566,8 @@
     "confirmLabel": "تصدیق کریں"
   },
   "contactInfo": {
+    "blockAndReport": "بلاک اور رپورٹ کریں",
+    "blockConfirmMessage": "{{name}} اب آپ سے رابطہ نہیں کر سکے گا اور گفتگو اس آلے سے حذف ہو جائے گی۔ اگلے مرحلے میں آپ خلاف ورزی کرنے والا مواد ماڈریشن کو بھیج سکتے ہیں۔",
     "callError": "کال شروع نہیں کی جا سکی",
     "callErrorGeneric": "کال شروع کرتے وقت خرابی پیش آ گئی",
     "deleteWhileCallTitle": "کال جاری ہے",
@@ -628,13 +677,13 @@
     "enable": "فعال کریں",
     "later": "بعد میں",
     "privacyNote": "سرورز کو مواد کی کوئی معلومات نہیں ملتی — صرف ایک خالی سگنل آپ کو مطلع کرتا ہے۔",
-    "enableNotifications": "اطلاعات فعال کریں",
     "stayReachable": "رابطے میں رہیں",
-    "description1": "ان کی اطلاع پانے کے لیے اطلاعات فعال کریں ",
+    "description1": "اطلاعات آپ کو ",
     "highlightMessages": "پیغامات",
     "descriptionAnd": " اور ",
     "highlightCalls": "آنے والی کالز",
-    "description2": "، چاہے ایپ بند ہو۔",
+    "description2": " سے باخبر رکھتی ہیں، چاہے ایپ بند ہو۔",
+    "continue": "جاری رکھیں",
     "privacyShort": "مواد اطلاعات میں خفیہ اور غیر مرئی رہتا ہے۔",
     "notNow": "ابھی نہیں"
   },
@@ -653,7 +702,8 @@
   },
   "header": {
     "selectedCount": "{{count}} منتخب",
-    "selectedCount_plural": "{{count}} منتخب"
+    "selectedCount_plural": "{{count}} منتخب",
+    "selectAll": "سب منتخب کریں"
   },
   "messages": {
     "errors": {
@@ -834,6 +884,12 @@
     "shareDialogTitle": "خفیہ شدہ Ghostr بیک اپ"
   },
   "migrationExport": {
+    "wipeWarning": "اس آلے کو مٹانے کے بعد اس کا تمام ڈیٹا ہمیشہ کے لیے ختم ہو جائے گا۔ یہ صرف اس وقت کریں جب آپ بیک اپ فائل منتقل کر کے محفوظ کر چکے ہوں۔",
+    "wipeButton": "یہ آلہ مٹائیں",
+    "wipingDevice": "آلہ مٹایا جا رہا ہے…",
+    "confirmWipeTitle": "کیا اس آلے کو مستقل طور پر مٹا دیں؟",
+    "confirmWipeBody": "یہ آلہ ری سیٹ ہو جائے گا۔ تمام ڈیٹا (پیغامات، کلیدیں، سیشنز، میڈیا) حذف ہو جائے گا۔ آپ بیک اپ فائل اور اس کے پاس ورڈ سے کسی دوسرے آلے پر بحال کر سکتے ہیں۔",
+    "confirmWipeYes": "ابھی مٹائیں",
     "createPasswordTitle": "بیک اپ پاس ورڈ",
     "createPasswordDesc": "یہ آپ کی شناخت، سیشنز اور تاریخ کو خفیہ کرے گا۔ ایک مضبوط پاس ورڈ منتخب کریں۔",
     "forgotWarning": "اگر آپ یہ پاس ورڈ بھول جاتے ہیں، تو بیک اپ ناقابل پڑھنے کے قابل ہو جاتا ہے۔ کوئی بھی اسے بحال نہیں کر سکتا — یہاں تک کہ ہم بھی نہیں۔",
@@ -880,6 +936,7 @@
     "saveToFolderError": "فولڈر میں محفوظ کرتے وقت خرابی"
   },
   "migrationImport": {
+    "errorHardwareKeyInit": "آلے کا ہارڈویئر محفوظ اسٹور دستیاب نہیں۔ فون دوبارہ شروع کر کے دوبارہ کوشش کریں۔",
     "introTitle": "بیک اپ سے بحال کریں",
     "introLead": "دوسرے ڈیوائس پر بنایا گیا Ghostr بیک اپ درآمد کریں۔ آپ کی گفتگوئیں مکمل طور پر بحال ہو جائیں گی۔",
     "beforeYouStartTitle": "شروع کرنے سے پہلے",
@@ -944,5 +1001,91 @@
     "confirmPasswordTitle": "پاس ورڈ کی تصدیق کریں",
     "confirmPasswordDesc": "تصدیق کے لیے پاس ورڈ دوبارہ درج کریں۔",
     "passwordHint": "اسے یاد رکھیں۔ بازیافت ممکن نہیں۔"
+  },
+  "groups": {
+    "newGroup": "New group",
+    "addMembers": "Add members",
+    "group": "Group",
+    "nameLabel": "Group name",
+    "namePlaceholder": "E.g. Family, Project X…",
+    "descriptionLabel": "Description (optional)",
+    "descriptionPlaceholder": "What is this group about?",
+    "create": "Create group",
+    "creating": "Creating…",
+    "createFailed": "Failed to create the group.",
+    "nameRequired": "Name required",
+    "enterName": "Give the group a name.",
+    "full": "Group full",
+    "maxReached": "Maximum 50 members.",
+    "noContacts": "ابھی کوئی رابطہ نہیں۔ آپ بعد میں اپنے روابط سے اراکین شامل کر سکتے ہیں۔",
+    "selectedCount": "{{count}} selected",
+    "privacyHint": "آپ ایڈمن ہوں گے۔ بعد میں آپ اپنے روابط سے اراکین شامل کر سکتے ہیں۔",
+    "unknownContact": "Contact",
+    "info": "Group info",
+    "notFound": "Group not found",
+    "memberCount": "{{count}} members",
+    "membersSection": "Members",
+    "admin": "Admin",
+    "you": "you",
+    "makeAdmin": "Make admin",
+    "removeMember": "Remove from group",
+    "removeConfirmTitle": "Remove this member?",
+    "removeConfirmBody": "{{name}} will be removed from the group.",
+    "blockAndReport": "بلاک اور رپورٹ کریں",
+    "blockConfirmBody": "{{name}} اب آپ سے رابطہ نہیں کر سکے گا۔ اگلے مرحلے میں آپ خلاف ورزی کرنے والا مواد ماڈریشن کو بھیج سکتے ہیں۔",
+    "memberBlocked": "{{name}} کو بلاک کر دیا گیا ہے۔",
+    "leave": "Leave group",
+    "leaveTitle": "Leave group?",
+    "leaveBody": "You will no longer receive messages from this group.",
+    "mute": "Mute",
+    "longPressHint": "Long-press a member to manage them.",
+    "inviteByQR": "Invite via QR",
+    "adminOnly": "Only an admin can invite.",
+    "share": "Share",
+    "copyLink": "Copy",
+    "linkCopied": "Link copied",
+    "resetLink": "Reset",
+    "resetLinkTitle": "Reset the link?",
+    "resetLinkBody": "Old links and QR codes will stop working. Anyone with the old link won't be able to join.",
+    "resetLinkConfirm": "Reset",
+    "approvalRequired": "Approve requests",
+    "approvalHint": "You manually approve everyone who asks to join.",
+    "qrWarning": "Anyone scanning this code can request to join the group.",
+    "shareMessage": "Join \"{{name}}\" on ghostr: {{url}}",
+    "joinGroup": "Join a group",
+    "invalidInvite": "This invitation is invalid or has expired.",
+    "joinPreview": "You're about to request to join this group. An admin will need to approve your request.",
+    "requestToJoin": "Request to join",
+    "connecting": "Establishing secure connection…",
+    "waitingApproval": "Request sent. Waiting for an admin to approve…",
+    "waitingHint": "You can close this screen; you'll be added automatically once approved.",
+    "joinDeclined": "Your request was declined.",
+    "adminSessionFailed": "Couldn't establish a secure connection with the admin.",
+    "joinSendFailed": "Failed to send the request.",
+    "joinRequestTitle": "Join request",
+    "joinRequestBody": "{{name}} wants to join the group.",
+    "accept": "Accept",
+    "decline": "Decline",
+    "menu": {
+      "createTitle": "New group",
+      "createSubtitle": "Create an encrypted group conversation"
+    },
+    "addPartialTitle": "کچھ اراکین شامل نہیں ہو سکے",
+    "addPartialBody": "شامل نہیں کیا جا سکا: {{names}}۔ بعد میں دوبارہ کوشش کریں۔",
+    "addSelected": "شامل کریں",
+    "adding": "شامل کیا جا رہا ہے…",
+    "inviteByLinkTitle": "لنک کے ذریعے دعوت",
+    "inviteByLinkHint": "پوسٹ کوانٹم دعوت QR کوڈ کے لیے بہت بڑی ہے۔ نیچے دیا گیا لنک شیئر کریں؛ وصول کنندہ اسے ’شامل ہوں‘ میں پیسٹ کرے۔",
+    "maxReachedExisting": "زیادہ سے زیادہ {{count}} اراکین۔",
+    "noContactsToAdd": "کوئی رابطہ دستیاب نہیں۔ آپ کے تمام روابط پہلے ہی گروپ میں ہیں، یا ابھی آپ کا کوئی رابطہ نہیں۔",
+    "searchContacts": "رابطہ تلاش کریں…",
+    "noSearchResults": "کوئی رابطہ نہیں ملا۔",
+    "qrExpired": "اس QR کوڈ کی میعاد ختم ہو چکی ہے۔ ایڈمن سے دعوتی لنک دوبارہ بھیجنے کو کہیں۔",
+    "inviteMalformed": "دعوت نامہ پڑھا نہیں جا سکا۔"
+  },
+  "errorBoundary": {
+    "title": "کچھ غلط ہو گیا",
+    "subtitle": "اس اسکرین میں ایک غیر متوقع مسئلہ پیش آیا۔ آپ ایپ بند کیے بغیر واپس جا کر دوبارہ کوشش کر سکتے ہیں۔",
+    "action": "واپس جائیں"
   }
 }

@@ -1,4 +1,42 @@
 {
+  "terms": {
+    "title": "Условия использования",
+    "intro": "Прочитайте и примите эти условия, чтобы пользоваться Ghostr. Они нужны, чтобы сервис оставался безопасным для всех.",
+    "s1Title": "1. Принятие условий",
+    "s1Body": "Используя Ghostr, вы соглашаетесь с настоящими условиями использования. Если вы не согласны, не используйте приложение.",
+    "s2Title": "2. Сервис",
+    "s2Body": "Ghostr — мессенджер со сквозным шифрованием. Аккаунтов нет: ваша личность и сообщения существуют только на вашем устройстве, а беседы создаются только по приглашению. Вы несёте полную ответственность за отправляемый контент.",
+    "s3Title": "3. Нулевая терпимость к недопустимому контенту",
+    "s3Body": "В Ghostr не допускаются недопустимый контент и оскорбительное поведение: домогательства, угрозы, разжигание ненависти, сексуальная эксплуатация, незаконный контент, спам. Жалобы рассматриваются и обрабатываются в течение 24 часов: нарушающий контент удаляется, а нарушители навсегда теряют возможность связываться со своими жертвами.",
+    "s4Title": "4. Жалобы и блокировка",
+    "s4Body": "Вы можете пожаловаться на любое полученное сообщение (долгое нажатие → Пожаловаться) и в любой момент заблокировать контакт (информация о контакте → Заблокировать и пожаловаться). Блокировка немедленно удаляет беседу с вашего устройства и навсегда лишает заблокированный контакт возможности связаться с вами. Жалобы передаются модерации только с вашего явного согласия.",
+    "s5Title": "5. Конфиденциальность",
+    "s5Body": "Сообщения зашифрованы сквозным шифрованием; серверы не могут их читать. При отправке жалобы передаётся только то, что вы решили сообщить, — без вашего IP-адреса и личности.",
+    "s6Title": "6. Отказ от гарантий",
+    "s6Body": "Ghostr предоставляется «как есть», без каких-либо гарантий. В пределах, допускаемых законом, авторы не несут ответственности за ущерб от использования приложения.",
+    "s7Title": "7. Контакты",
+    "s7Body": "Вопросы и сообщения о недопустимом поведении: theghostr.com",
+    "lastUpdated": "Последнее обновление: август 2026 г.",
+    "acceptNote": "Нажимая «Принять и продолжить», вы подтверждаете, что прочитали и принимаете эти условия.",
+    "acceptButton": "Принять и продолжить"
+  },
+  "report": {
+    "titleMessage": "Пожаловаться на сообщение",
+    "titleBlock": "Заблокировать и пожаловаться",
+    "chooseCategory": "Почему вы жалуетесь?",
+    "categories": {
+      "spam": "Спам",
+      "harassment": "Домогательства или угрозы",
+      "illegal": "Незаконный контент",
+      "other": "Другое"
+    },
+    "consentMessage": "Сообщение, на которое вы жалуетесь, будет передано модерации Ghostr. Больше ничего из беседы не покидает ваше устройство. Жалобы рассматриваются в течение 24 часов.",
+    "consentBlock": "Имя и отпечаток личности контакта будут переданы модерации Ghostr, беседа будет удалена с вашего устройства, и этот контакт больше не сможет с вами связаться. Жалобы рассматриваются в течение 24 часов.",
+    "submitMessage": "Пожаловаться",
+    "submitBlock": "Заблокировать и пожаловаться",
+    "success": "Жалоба отправлена. Спасибо.",
+    "sendFailed": "Не удалось отправить жалобу. Проверьте подключение."
+  },
   "common": {
     "cancel": "Отмена",
     "save": "Сохранить",
@@ -78,7 +116,9 @@
         "feature3": "Защита от квантовых компьютеров"
       }
     },
-    "tagline": "ЗАШИФРОВАННЫЕ СООБЩЕНИЯ"
+    "tagline": "ЗАШИФРОВАННЫЕ СООБЩЕНИЯ",
+    "restoreBackup": "Восстановить из резервной копии",
+    "restoreBackupHint": "Импортируйте файл резервной копии, чтобы восстановить личность и переписки"
   },
   "conversationList": {
     "appName": "Ghostr",
@@ -128,6 +168,7 @@
     }
   },
   "conversation": {
+    "reportMessage": "Пожаловаться",
     "today": "Сегодня",
     "yesterday": "Вчера",
     "typing": "печатает…",
@@ -158,6 +199,8 @@
     "imageSavedMessage": "Изображение сохранено в галерею",
     "errSaveImage": "Не удалось сохранить изображение",
     "searchPlaceholder": "Поиск в разговоре…",
+    "deleteMessageTitle": "Удалить сообщение",
+    "deleteMessageConfirm": "Это сообщение будет удалено только на этом устройстве. Это действие необратимо.",
     "deleteMessagesTitle": "Удалить сообщения",
     "deleteMessagesConfirm_0": "Вы уверены, что хотите удалить {{count}} сообщение? Это действие необратимо.",
     "deleteMessagesConfirm_1": "Вы уверены, что хотите удалить {{count}} сообщения? Это действие необратимо.",
@@ -193,6 +236,7 @@
     "deleteMessagesConfirm_plural": "Вы уверены, что хотите удалить {{count}} сообщений? Это действие необратимо."
   },
   "settings": {
+    "termsOfUse": "Условия использования",
     "title": "Настройки",
     "profileSection": "ПРОФИЛЬ",
     "securitySection": "БЕЗОПАСНОСТЬ",
@@ -258,12 +302,7 @@
     "light": "Светлая",
     "lightSubtitle": "Всегда использовать светлую тему",
     "dark": "Тёмная",
-    "darkSubtitle": "Всегда использовать тёмную тему",
-    "applyOnRestartTitle": "Перезапустите Ghostr, чтобы применить",
-    "applyOnRestartMessage": "Некоторые экраны используют прежнюю тему до перезапуска приложения. Заголовок и ваш выбор уже обновлены.",
-    "restartConfirmTitle": "Перезапустите Ghostr, чтобы применить",
-    "restartConfirmMessage": "Некоторые экраны используют стили, которые требуют перезапуска JS-бандла для корректной смены темы. Нажмите «Перезапустить», чтобы применить новую тему везде сразу.",
-    "restartConfirmAction": "Перезапустить"
+    "darkSubtitle": "Всегда использовать тёмную тему"
   },
   "notifications": {
     "newMessageTitle": "Новое сообщение",
@@ -382,6 +421,9 @@
     "expiresInDays_plural": "Истекает через {{count}} дней"
   },
   "join": {
+    "blockedContactTitle": "Заблокированный контакт",
+    "blockedContactMessage": "Вы заблокировали {{name}}. Разблокировать и принять это приглашение?",
+    "unblockAndAccept": "Разблокировать и принять",
     "decoding": "Декодирование приглашения…",
     "establishing": "Установка защищённого соединения…",
     "connected": "Соединение установлено!",
@@ -396,7 +438,6 @@
     "pastePlaceholder": "Вставьте код сюда…",
     "connectButton": "Подключиться",
     "scanTitle": "Сканировать",
-    "authorize": "Разрешить",
     "pasteHere": "Вставьте код сюда…",
     "connect": "Подключиться",
     "enterCode": "Пожалуйста, вставьте код приглашения",
@@ -418,12 +459,18 @@
     "autoSecurity": "Автоматическая безопасность",
     "autoSecurityDesc": "Ключи шифрования создаются локально на каждом телефоне. Чувствительные данные не проходят через сервер.",
     "cameraAccess": "Доступ к камере",
-    "cameraAccessDesc": "Разрешите доступ к камере, чтобы отсканировать QR-код",
+    "cameraAccessDesc": "Камера используется для сканирования QR-кода.",
+    "continue": "Продолжить",
     "codeLabel": "Код приглашения",
     "codeHint": "Код — это длинная строка символов",
     "placeQRInFrame": "Поместите QR-код в рамку",
     "selfInviteTitle": "Это приглашение — ваше",
-    "selfInviteMessage": "Нельзя начать разговор с самим собой. Поделитесь этим кодом с кем-нибудь другим."
+    "selfInviteMessage": "Нельзя начать разговор с самим собой. Поделитесь этим кодом с кем-нибудь другим.",
+    "torchOn": "Включить фонарик",
+    "torchOff": "Выключить фонарик",
+    "pasteFromClipboard": "Вставить",
+    "clipboardEmpty": "Буфер обмена пуст.",
+    "clipboardError": "Не удалось прочитать буфер обмена."
   },
   "lock": {
     "enterPassword": "Пожалуйста, введите пароль",
@@ -534,6 +581,8 @@
     "confirmLabel": "Подтвердить"
   },
   "contactInfo": {
+    "blockAndReport": "Заблокировать и пожаловаться",
+    "blockConfirmMessage": "{{name}} больше не сможет с вами связаться, а беседа будет удалена с этого устройства. На следующем шаге вы сможете передать нарушающий контент модерации.",
     "callError": "Не удалось начать вызов",
     "callErrorGeneric": "Произошла ошибка при запуске вызова",
     "deleteWhileCallTitle": "Идёт вызов",
@@ -647,13 +696,13 @@
     "enable": "Включить",
     "later": "Позже",
     "privacyNote": "Серверы не получают информацию о содержимом — вас оповещает лишь пустой сигнал.",
-    "enableNotifications": "Включить уведомления",
     "stayReachable": "Оставайтесь на связи",
-    "description1": "Включите уведомления, чтобы получать оповещения о ",
+    "description1": "Уведомления сообщают вам о ",
     "highlightMessages": "сообщениях",
     "descriptionAnd": " и ",
     "highlightCalls": "входящих вызовах",
     "description2": ", даже когда приложение закрыто.",
+    "continue": "Продолжить",
     "privacyShort": "Содержимое остаётся зашифрованным и невидимым в уведомлениях.",
     "notNow": "Не сейчас"
   },
@@ -675,7 +724,8 @@
     "selectedCount_1": "Выбрано: {{count}}",
     "selectedCount_2": "Выбрано: {{count}}",
     "selectedCount": "Выбрано: {{count}}",
-    "selectedCount_plural": "Выбрано: {{count}}"
+    "selectedCount_plural": "Выбрано: {{count}}",
+    "selectAll": "Выбрать все"
   },
   "messages": {
     "errors": {
@@ -856,6 +906,12 @@
     "shareDialogTitle": "Зашифрованная резервная копия Ghostr"
   },
   "migrationExport": {
+    "wipeWarning": "После стирания этого устройства все его данные исчезнут БЕЗВОЗВРАТНО. Делайте это ТОЛЬКО после того, как перенесли и надёжно сохранили файл резервной копии.",
+    "wipeButton": "Стереть это устройство",
+    "wipingDevice": "Стирание устройства…",
+    "confirmWipeTitle": "Безвозвратно стереть это устройство?",
+    "confirmWipeBody": "Это устройство будет сброшено. Все данные (сообщения, ключи, сессии, медиа) будут удалены. Вы сможете восстановить их на другом устройстве с помощью файла резервной копии и его пароля.",
+    "confirmWipeYes": "Стереть сейчас",
     "createPasswordTitle": "Пароль резервной копии",
     "createPasswordDesc": "Он зашифрует вашу личность, сессии и историю. Выберите СЛОЖНЫЙ пароль.",
     "forgotWarning": "Если вы забудете этот пароль, резервная копия станет нечитаемой. Никто не сможет её восстановить — даже мы.",
@@ -902,6 +958,7 @@
     "saveToFolderError": "Ошибка при сохранении в папку"
   },
   "migrationImport": {
+    "errorHardwareKeyInit": "Аппаратное защищённое хранилище устройства недоступно. Перезагрузите телефон и попробуйте снова.",
     "introTitle": "Восстановить из резервной копии",
     "introLead": "Импортируйте резервную копию Ghostr, созданную на другом устройстве. Ваши разговоры будут полностью восстановлены.",
     "beforeYouStartTitle": "Перед началом",
@@ -966,5 +1023,91 @@
     "confirmPasswordTitle": "Подтвердите пароль",
     "confirmPasswordDesc": "Введите пароль ещё раз для подтверждения.",
     "passwordHint": "Запомните его. Восстановление невозможно."
+  },
+  "groups": {
+    "newGroup": "New group",
+    "addMembers": "Add members",
+    "group": "Group",
+    "nameLabel": "Group name",
+    "namePlaceholder": "E.g. Family, Project X…",
+    "descriptionLabel": "Description (optional)",
+    "descriptionPlaceholder": "What is this group about?",
+    "create": "Create group",
+    "creating": "Creating…",
+    "createFailed": "Failed to create the group.",
+    "nameRequired": "Name required",
+    "enterName": "Give the group a name.",
+    "full": "Group full",
+    "maxReached": "Maximum 50 members.",
+    "noContacts": "Пока нет контактов. Вы сможете добавить участников из контактов позже.",
+    "selectedCount": "{{count}} selected",
+    "privacyHint": "Вы будете администратором. Позже вы сможете добавлять участников из контактов.",
+    "unknownContact": "Contact",
+    "info": "Group info",
+    "notFound": "Group not found",
+    "memberCount": "{{count}} members",
+    "membersSection": "Members",
+    "admin": "Admin",
+    "you": "you",
+    "makeAdmin": "Make admin",
+    "removeMember": "Remove from group",
+    "removeConfirmTitle": "Remove this member?",
+    "removeConfirmBody": "{{name}} will be removed from the group.",
+    "blockAndReport": "Заблокировать и пожаловаться",
+    "blockConfirmBody": "{{name}} больше не сможет с вами связаться. На следующем шаге вы сможете передать нарушающий контент модерации.",
+    "memberBlocked": "{{name}} заблокирован(а).",
+    "leave": "Leave group",
+    "leaveTitle": "Leave group?",
+    "leaveBody": "You will no longer receive messages from this group.",
+    "mute": "Mute",
+    "longPressHint": "Long-press a member to manage them.",
+    "inviteByQR": "Invite via QR",
+    "adminOnly": "Only an admin can invite.",
+    "share": "Share",
+    "copyLink": "Copy",
+    "linkCopied": "Link copied",
+    "resetLink": "Reset",
+    "resetLinkTitle": "Reset the link?",
+    "resetLinkBody": "Old links and QR codes will stop working. Anyone with the old link won't be able to join.",
+    "resetLinkConfirm": "Reset",
+    "approvalRequired": "Approve requests",
+    "approvalHint": "You manually approve everyone who asks to join.",
+    "qrWarning": "Anyone scanning this code can request to join the group.",
+    "shareMessage": "Join \"{{name}}\" on ghostr: {{url}}",
+    "joinGroup": "Join a group",
+    "invalidInvite": "This invitation is invalid or has expired.",
+    "joinPreview": "You're about to request to join this group. An admin will need to approve your request.",
+    "requestToJoin": "Request to join",
+    "connecting": "Establishing secure connection…",
+    "waitingApproval": "Request sent. Waiting for an admin to approve…",
+    "waitingHint": "You can close this screen; you'll be added automatically once approved.",
+    "joinDeclined": "Your request was declined.",
+    "adminSessionFailed": "Couldn't establish a secure connection with the admin.",
+    "joinSendFailed": "Failed to send the request.",
+    "joinRequestTitle": "Join request",
+    "joinRequestBody": "{{name}} wants to join the group.",
+    "accept": "Accept",
+    "decline": "Decline",
+    "menu": {
+      "createTitle": "New group",
+      "createSubtitle": "Create an encrypted group conversation"
+    },
+    "addPartialTitle": "Не удалось добавить некоторых участников",
+    "addPartialBody": "Не удалось добавить: {{names}}. Повторите попытку позже.",
+    "addSelected": "Добавить",
+    "adding": "Добавление…",
+    "inviteByLinkTitle": "Приглашение по ссылке",
+    "inviteByLinkHint": "Постквантовое приглашение слишком велико для QR-кода. Поделитесь ссылкой ниже; получатель вставит её в «Присоединиться».",
+    "maxReachedExisting": "Максимум {{count}} участников.",
+    "noContactsToAdd": "Нет доступных контактов. Все ваши контакты уже в группе, или у вас пока нет контактов.",
+    "searchContacts": "Поиск контакта…",
+    "noSearchResults": "Контакты не найдены.",
+    "qrExpired": "Срок действия этого QR-кода истёк. Попросите администратора прислать ссылку-приглашение ещё раз.",
+    "inviteMalformed": "Не удалось прочитать приглашение."
+  },
+  "errorBoundary": {
+    "title": "Произошла ошибка",
+    "subtitle": "На этом экране возникла непредвиденная проблема. Вы можете вернуться и повторить попытку, не закрывая приложение.",
+    "action": "Назад"
   }
 }

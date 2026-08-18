@@ -1,4 +1,42 @@
 {
+  "terms": {
+    "title": "شروط الاستخدام",
+    "intro": "يرجى قراءة هذه الشروط والموافقة عليها لاستخدام Ghostr. وُضعت لتبقى الخدمة آمنة للجميع.",
+    "s1Title": "1. القبول",
+    "s1Body": "باستخدامك Ghostr فإنك توافق على شروط الاستخدام هذه. إذا لم توافق عليها، فلا تستخدم التطبيق.",
+    "s2Title": "2. الخدمة",
+    "s2Body": "Ghostr تطبيق مراسلة مشفّر من طرف إلى طرف. لا توجد حسابات: هويتك ورسائلك موجودة على جهازك فقط، والمحادثات تُنشأ بالدعوة فقط. أنت وحدك المسؤول عن المحتوى الذي ترسله.",
+    "s3Title": "3. عدم التسامح مطلقًا مع المحتوى المسيء",
+    "s3Body": "لا يُسمح في Ghostr بأي محتوى مسيء أو سلوك تعسفي: التحرش، التهديد، خطاب الكراهية، الاستغلال الجنسي، المحتوى غير القانوني، والرسائل المزعجة. تُراجع البلاغات وتُعالج خلال 24 ساعة: يُحذف المحتوى المخالف ويفقد المسيئون نهائيًا إمكانية التواصل مع ضحاياهم.",
+    "s4Title": "4. الإبلاغ والحظر",
+    "s4Body": "يمكنك الإبلاغ عن أي رسالة مستلمة (ضغطة مطوّلة ← إبلاغ) وحظر جهة اتصال في أي وقت (معلومات جهة الاتصال ← حظر وإبلاغ). يحذف الحظر المحادثة فورًا من جهازك ويمنع جهة الاتصال المحظورة نهائيًا من التواصل معك مجددًا. لا تُرسل البلاغات إلى الإشراف إلا بموافقتك الصريحة.",
+    "s5Title": "5. الخصوصية",
+    "s5Body": "الرسائل مشفّرة من طرف إلى طرف؛ لا يمكن للخوادم قراءتها. عند الإبلاغ عن محتوى، يُرسل فقط ما اخترت الإبلاغ عنه، دون عنوان IP الخاص بك أو هويتك.",
+    "s6Title": "6. إخلاء المسؤولية",
+    "s6Body": "يُقدَّم Ghostr «كما هو» دون أي ضمانات. وفي الحدود التي يسمح بها القانون، لا يتحمل مطوّروه المسؤولية عن أي أضرار ناتجة عن استخدام التطبيق.",
+    "s7Title": "7. التواصل",
+    "s7Body": "للأسئلة أو الإبلاغ عن سلوك غير لائق: theghostr.com",
+    "lastUpdated": "آخر تحديث: أغسطس 2026",
+    "acceptNote": "بالضغط على «موافقة ومتابعة» فإنك تؤكد أنك قرأت هذه الشروط ووافقت عليها.",
+    "acceptButton": "موافقة ومتابعة"
+  },
+  "report": {
+    "titleMessage": "الإبلاغ عن الرسالة",
+    "titleBlock": "حظر وإبلاغ",
+    "chooseCategory": "لماذا تُبلغ عن هذا؟",
+    "categories": {
+      "spam": "رسائل مزعجة",
+      "harassment": "تحرش أو تهديد",
+      "illegal": "محتوى غير قانوني",
+      "other": "أخرى"
+    },
+    "consentMessage": "ستُرسل الرسالة المبلَّغ عنها إلى إشراف Ghostr. لا شيء آخر من المحادثة يغادر جهازك. تُراجع البلاغات خلال 24 ساعة.",
+    "consentBlock": "سيُرسل اسم جهة الاتصال وبصمة هويتها إلى إشراف Ghostr، وستُحذف المحادثة من جهازك، ولن تتمكن جهة الاتصال هذه من التواصل معك بعد الآن. تُراجع البلاغات خلال 24 ساعة.",
+    "submitMessage": "إبلاغ",
+    "submitBlock": "حظر وإبلاغ",
+    "success": "تم إرسال البلاغ. شكرًا.",
+    "sendFailed": "تعذّر إرسال البلاغ. تحقّق من اتصالك."
+  },
   "common": {
     "cancel": "إلغاء",
     "save": "حفظ",
@@ -78,7 +116,9 @@
         "feature3": "مقاومة للحواسيب الكمومية"
       }
     },
-    "tagline": "مراسلة مشفّرة"
+    "tagline": "مراسلة مشفّرة",
+    "restoreBackup": "استعادة نسخة احتياطية",
+    "restoreBackupHint": "استورد ملف نسخة احتياطية لاستعادة هويتك ومحادثاتك"
   },
   "conversationList": {
     "appName": "Ghostr",
@@ -134,6 +174,7 @@
     }
   },
   "conversation": {
+    "reportMessage": "إبلاغ",
     "today": "اليوم",
     "yesterday": "أمس",
     "typing": "يكتب…",
@@ -164,6 +205,8 @@
     "imageSavedMessage": "تم حفظ الصورة في المعرض",
     "errSaveImage": "تعذّر حفظ الصورة",
     "searchPlaceholder": "ابحث في المحادثة…",
+    "deleteMessageTitle": "حذف الرسالة",
+    "deleteMessageConfirm": "سيتم حذف هذه الرسالة من هذا الجهاز فقط. لا يمكن التراجع عن هذا الإجراء.",
     "deleteMessagesTitle": "حذف الرسائل",
     "deleteMessagesConfirm_0": "هل أنت متأكد من حذف {{count}} رسائل؟ لا يمكن التراجع عن هذا الإجراء.",
     "deleteMessagesConfirm_1": "هل أنت متأكد من حذف رسالة واحدة؟ لا يمكن التراجع عن هذا الإجراء.",
@@ -202,6 +245,7 @@
     "deleteMessagesConfirm_plural": "هل أنت متأكد من حذف {{count}} رسائل؟ لا يمكن التراجع عن هذا الإجراء."
   },
   "settings": {
+    "termsOfUse": "شروط الاستخدام",
     "title": "الإعدادات",
     "profileSection": "الملف الشخصي",
     "securitySection": "الأمان",
@@ -267,12 +311,7 @@
     "light": "فاتح",
     "lightSubtitle": "استخدام المظهر الفاتح دائمًا",
     "dark": "داكن",
-    "darkSubtitle": "استخدام المظهر الداكن دائمًا",
-    "applyOnRestartTitle": "أعد تشغيل Ghostr للتطبيق",
-    "applyOnRestartMessage": "تستخدم بعض الشاشات المظهر السابق حتى إعادة تشغيل التطبيق. تم تحديث الترويسة واختيارك بالفعل.",
-    "restartConfirmTitle": "أعد تشغيل Ghostr للتطبيق",
-    "restartConfirmMessage": "تستخدم بعض الشاشات أنماطًا تحتاج إلى إعادة تشغيل حزمة JS لتغيير المظهر بشكل صحيح. اضغط على إعادة التشغيل لتطبيق المظهر الجديد في كل مكان مرة واحدة.",
-    "restartConfirmAction": "إعادة التشغيل"
+    "darkSubtitle": "استخدام المظهر الداكن دائمًا"
   },
   "notifications": {
     "newMessageTitle": "رسالة جديدة",
@@ -397,6 +436,9 @@
     "expiresInDays_plural": "تنتهي خلال {{count}} أيام"
   },
   "join": {
+    "blockedContactTitle": "جهة اتصال محظورة",
+    "blockedContactMessage": "لقد حظرت {{name}}. هل تريد إلغاء الحظر وقبول هذه الدعوة؟",
+    "unblockAndAccept": "إلغاء الحظر والقبول",
     "decoding": "فكّ ترميز الدعوة…",
     "establishing": "جارٍ تأسيس اتصال آمن…",
     "connected": "تم تأسيس الاتصال!",
@@ -411,7 +453,6 @@
     "pastePlaceholder": "الصق الرمز هنا…",
     "connectButton": "اتصال",
     "scanTitle": "مسح",
-    "authorize": "السماح",
     "pasteHere": "الصق الرمز هنا…",
     "connect": "اتصال",
     "enterCode": "يُرجى لصق رمز الدعوة",
@@ -433,12 +474,18 @@
     "autoSecurity": "أمان تلقائي",
     "autoSecurityDesc": "تُنشأ مفاتيح التشفير محليًا على كل هاتف. لا تمرّ بيانات حسّاسة عبر الخادم.",
     "cameraAccess": "الوصول إلى الكاميرا",
-    "cameraAccessDesc": "اسمح بالوصول إلى الكاميرا لمسح رمز QR",
+    "cameraAccessDesc": "تُستخدم الكاميرا لمسح رمز QR.",
+    "continue": "متابعة",
     "codeLabel": "رمز الدعوة",
     "codeHint": "الرمز عبارة عن سلسلة طويلة من الأحرف",
     "placeQRInFrame": "ضع رمز QR داخل الإطار",
     "selfInviteTitle": "هذه الدعوة لك",
-    "selfInviteMessage": "لا يمكنك بدء محادثة مع نفسك. شارك هذا الرمز مع شخص آخر بدلاً من ذلك."
+    "selfInviteMessage": "لا يمكنك بدء محادثة مع نفسك. شارك هذا الرمز مع شخص آخر بدلاً من ذلك.",
+    "torchOn": "تشغيل المصباح",
+    "torchOff": "إطفاء المصباح",
+    "pasteFromClipboard": "لصق",
+    "clipboardEmpty": "الحافظة فارغة.",
+    "clipboardError": "تعذّرت قراءة الحافظة."
   },
   "lock": {
     "enterPassword": "يُرجى إدخال كلمة المرور",
@@ -549,6 +596,8 @@
     "confirmLabel": "تأكيد"
   },
   "contactInfo": {
+    "blockAndReport": "حظر وإبلاغ",
+    "blockConfirmMessage": "لن يتمكن {{name}} من التواصل معك بعد الآن وستُحذف المحادثة من هذا الجهاز. في الخطوة التالية يمكنك إرسال المحتوى المخالف إلى الإشراف.",
     "callError": "تعذّر بدء المكالمة",
     "callErrorGeneric": "حدث خطأ أثناء بدء المكالمة",
     "deleteWhileCallTitle": "مكالمة جارية",
@@ -665,13 +714,13 @@
     "enable": "تفعيل",
     "later": "لاحقًا",
     "privacyNote": "الخوادم لا تتلقّى أي معلومات عن المحتوى — مجرّد إشارة فارغة لتنبيهك.",
-    "enableNotifications": "تفعيل الإشعارات",
     "stayReachable": "ابقَ على تواصل",
-    "description1": "فعِّل الإشعارات لتنبيهك إلى ",
+    "description1": "تنبهك الإشعارات إلى ",
     "highlightMessages": "الرسائل",
     "descriptionAnd": " و",
     "highlightCalls": "المكالمات الواردة",
     "description2": "، حتى عندما يكون التطبيق مغلقًا.",
+    "continue": "متابعة",
     "privacyShort": "يبقى المحتوى مشفّرًا وغير مرئي في الإشعارات.",
     "notNow": "ليس الآن"
   },
@@ -696,7 +745,8 @@
     "selectedCount_4": "{{count}} عنصرًا محدّدًا",
     "selectedCount_5": "{{count}} عنصر محدّد",
     "selectedCount": "تم تحديد {{count}}",
-    "selectedCount_plural": "تم تحديد {{count}}"
+    "selectedCount_plural": "تم تحديد {{count}}",
+    "selectAll": "تحديد الكل"
   },
   "messages": {
     "errors": {
@@ -877,6 +927,12 @@
     "shareDialogTitle": "نسخة احتياطية مشفرة من Ghostr"
   },
   "migrationExport": {
+    "wipeWarning": "بعد مسح هذا الجهاز، تختفي جميع بياناته نهائيًا. لا تفعل ذلك إلا بعد نقل ملف النسخ الاحتياطي وحفظه في مكان آمن.",
+    "wipeButton": "مسح هذا الجهاز",
+    "wipingDevice": "جارٍ مسح الجهاز…",
+    "confirmWipeTitle": "هل تريد مسح هذا الجهاز نهائيًا؟",
+    "confirmWipeBody": "سيُعاد ضبط هذا الجهاز. ستُحذف جميع البيانات (الرسائل والمفاتيح والجلسات والوسائط). يمكنك استعادتها على جهاز آخر باستخدام ملف النسخ الاحتياطي وكلمة مروره.",
+    "confirmWipeYes": "مسح الآن",
     "createPasswordTitle": "كلمة مرور النسخة الاحتياطية",
     "createPasswordDesc": "ستقوم بتشفير هويتك وجلساتك وسجلك. اختر كلمة مرور قوية.",
     "forgotWarning": "إذا نسيت كلمة المرور هذه، تصبح النسخة الاحتياطية غير قابلة للقراءة. لا أحد يمكنه استعادتها — ولا حتى نحن.",
@@ -923,6 +979,7 @@
     "saveToFolderError": "خطأ أثناء الحفظ في المجلد"
   },
   "migrationImport": {
+    "errorHardwareKeyInit": "مخزن الأمان في عتاد الجهاز غير متاح. أعد تشغيل الهاتف وحاول مجددًا.",
     "introTitle": "الاستعادة من نسخة احتياطية",
     "introLead": "استورد نسخة احتياطية من Ghostr تم إنشاؤها على جهاز آخر. ستتم استعادة محادثاتك بالكامل.",
     "beforeYouStartTitle": "قبل أن تبدأ",
@@ -987,5 +1044,91 @@
     "confirmPasswordTitle": "تأكيد كلمة المرور",
     "confirmPasswordDesc": "أعد إدخال كلمة المرور للتأكيد.",
     "passwordHint": "احفظها. لا يمكن استعادتها."
+  },
+  "groups": {
+    "newGroup": "New group",
+    "addMembers": "Add members",
+    "group": "Group",
+    "nameLabel": "Group name",
+    "namePlaceholder": "E.g. Family, Project X…",
+    "descriptionLabel": "Description (optional)",
+    "descriptionPlaceholder": "What is this group about?",
+    "create": "Create group",
+    "creating": "Creating…",
+    "createFailed": "Failed to create the group.",
+    "nameRequired": "Name required",
+    "enterName": "Give the group a name.",
+    "full": "Group full",
+    "maxReached": "Maximum 50 members.",
+    "noContacts": "لا توجد جهات اتصال بعد. يمكنك إضافة أعضاء من جهات اتصالك لاحقًا.",
+    "selectedCount": "{{count}} selected",
+    "privacyHint": "ستكون المسؤول. يمكنك لاحقًا إضافة أعضاء من جهات اتصالك.",
+    "unknownContact": "Contact",
+    "info": "Group info",
+    "notFound": "Group not found",
+    "memberCount": "{{count}} members",
+    "membersSection": "Members",
+    "admin": "Admin",
+    "you": "you",
+    "makeAdmin": "Make admin",
+    "removeMember": "Remove from group",
+    "removeConfirmTitle": "Remove this member?",
+    "removeConfirmBody": "{{name}} will be removed from the group.",
+    "blockAndReport": "حظر وإبلاغ",
+    "blockConfirmBody": "لن يتمكن {{name}} من التواصل معك بعد الآن. في الخطوة التالية يمكنك إرسال المحتوى المخالف إلى الإشراف.",
+    "memberBlocked": "تم حظر {{name}}.",
+    "leave": "Leave group",
+    "leaveTitle": "Leave group?",
+    "leaveBody": "You will no longer receive messages from this group.",
+    "mute": "Mute",
+    "longPressHint": "Long-press a member to manage them.",
+    "inviteByQR": "Invite via QR",
+    "adminOnly": "Only an admin can invite.",
+    "share": "Share",
+    "copyLink": "Copy",
+    "linkCopied": "Link copied",
+    "resetLink": "Reset",
+    "resetLinkTitle": "Reset the link?",
+    "resetLinkBody": "Old links and QR codes will stop working. Anyone with the old link won't be able to join.",
+    "resetLinkConfirm": "Reset",
+    "approvalRequired": "Approve requests",
+    "approvalHint": "You manually approve everyone who asks to join.",
+    "qrWarning": "Anyone scanning this code can request to join the group.",
+    "shareMessage": "Join \"{{name}}\" on ghostr: {{url}}",
+    "joinGroup": "Join a group",
+    "invalidInvite": "This invitation is invalid or has expired.",
+    "joinPreview": "You're about to request to join this group. An admin will need to approve your request.",
+    "requestToJoin": "Request to join",
+    "connecting": "Establishing secure connection…",
+    "waitingApproval": "Request sent. Waiting for an admin to approve…",
+    "waitingHint": "You can close this screen; you'll be added automatically once approved.",
+    "joinDeclined": "Your request was declined.",
+    "adminSessionFailed": "Couldn't establish a secure connection with the admin.",
+    "joinSendFailed": "Failed to send the request.",
+    "joinRequestTitle": "Join request",
+    "joinRequestBody": "{{name}} wants to join the group.",
+    "accept": "Accept",
+    "decline": "Decline",
+    "menu": {
+      "createTitle": "New group",
+      "createSubtitle": "Create an encrypted group conversation"
+    },
+    "addPartialTitle": "تعذّرت إضافة بعض الأعضاء",
+    "addPartialBody": "تعذّرت الإضافة: {{names}}. حاول مرة أخرى لاحقًا.",
+    "addSelected": "إضافة",
+    "adding": "جارٍ الإضافة…",
+    "inviteByLinkTitle": "الدعوة عبر رابط",
+    "inviteByLinkHint": "الدعوة ما بعد الكمّية أكبر من أن تتّسع في رمز QR. شارك الرابط أدناه؛ يلصقه المستلِم في «انضمام».",
+    "maxReachedExisting": "الحد الأقصى {{count}} عضوًا.",
+    "noContactsToAdd": "لا توجد جهات اتصال متاحة. جميع جهات اتصالك موجودة في المجموعة بالفعل، أو ليس لديك جهات اتصال بعد.",
+    "searchContacts": "ابحث عن جهة اتصال…",
+    "noSearchResults": "لم يُعثر على أي جهة اتصال.",
+    "qrExpired": "انتهت صلاحية رمز QR هذا. اطلب من المشرف إرسال رابط الدعوة مرة أخرى.",
+    "inviteMalformed": "تعذّرت قراءة الدعوة."
+  },
+  "errorBoundary": {
+    "title": "حدث خطأ ما",
+    "subtitle": "واجهت هذه الشاشة مشكلة غير متوقّعة. يمكنك العودة والمحاولة مرة أخرى دون إغلاق التطبيق.",
+    "action": "رجوع"
   }
 }

@@ -1,4 +1,42 @@
 {
+  "terms": {
+    "title": "Terms of Use",
+    "intro": "Please read and accept these terms to use Ghostr. They exist to keep the service safe for everyone.",
+    "s1Title": "1. Acceptance",
+    "s1Body": "By using Ghostr you agree to these Terms of Use. If you do not agree, do not use the app.",
+    "s2Title": "2. The service",
+    "s2Body": "Ghostr is an end-to-end encrypted messenger. There are no accounts: your identity and your messages exist only on your device, and conversations are created by invitation only. You are solely responsible for the content you send.",
+    "s3Title": "3. Zero tolerance for objectionable content",
+    "s3Body": "There is no tolerance for objectionable content or abusive users on Ghostr. This includes harassment, threats, hate speech, sexual exploitation, illegal content and spam. Reports are reviewed and acted upon within 24 hours: offending content is removed and abusive users permanently lose the ability to contact their victims.",
+    "s4Title": "4. Reporting and blocking",
+    "s4Body": "You can report any received message (long-press → Report) and block a contact at any time (contact info → Block and report). Blocking immediately deletes the conversation from your device and permanently prevents the blocked contact from contacting you again. Reports are transmitted to moderation only with your explicit consent.",
+    "s5Title": "5. Privacy",
+    "s5Body": "Messages are end-to-end encrypted; the servers cannot read them. When you report content, only what you choose to report is transmitted to moderation, without your IP address or identity.",
+    "s6Title": "6. Disclaimer",
+    "s6Body": "Ghostr is provided \"as is\", without warranty of any kind. To the maximum extent permitted by law, its authors cannot be held liable for damages resulting from the use of the app.",
+    "s7Title": "7. Contact",
+    "s7Body": "Questions or reports of inappropriate behavior: theghostr.com",
+    "lastUpdated": "Last updated: August 2026",
+    "acceptNote": "By tapping \"Accept and continue\", you confirm that you have read and agree to these terms.",
+    "acceptButton": "Accept and continue"
+  },
+  "report": {
+    "titleMessage": "Report message",
+    "titleBlock": "Block and report",
+    "chooseCategory": "Why are you reporting this?",
+    "categories": {
+      "spam": "Spam",
+      "harassment": "Harassment or threats",
+      "illegal": "Illegal content",
+      "other": "Other"
+    },
+    "consentMessage": "The reported message will be sent to Ghostr moderation. Nothing else from the conversation leaves your device. Reports are reviewed within 24 hours.",
+    "consentBlock": "The contact's name and identity fingerprint will be sent to Ghostr moderation, the conversation will be deleted from your device, and this contact will no longer be able to contact you. Reports are reviewed within 24 hours.",
+    "submitMessage": "Report",
+    "submitBlock": "Block and report",
+    "success": "Report sent. Thank you.",
+    "sendFailed": "Report could not be sent. Please check your connection."
+  },
   "common": {
     "cancel": "Cancel",
     "save": "Save",
@@ -78,7 +116,9 @@
         "feature3": "Resistant to quantum computers"
       }
     },
-    "tagline": "ENCRYPTED MESSAGING"
+    "tagline": "ENCRYPTED MESSAGING",
+    "restoreBackup": "Restore from backup",
+    "restoreBackupHint": "Import a backup file to recover your identity and conversations"
   },
   "conversationList": {
     "appName": "Ghostr",
@@ -122,6 +162,7 @@
     }
   },
   "conversation": {
+    "reportMessage": "Report",
     "today": "Today",
     "yesterday": "Yesterday",
     "typing": "typing…",
@@ -152,6 +193,8 @@
     "imageSavedMessage": "Image saved to the gallery",
     "errSaveImage": "Unable to save the image",
     "searchPlaceholder": "Search in conversation...",
+    "deleteMessageTitle": "Delete message",
+    "deleteMessageConfirm": "This message will be deleted from this device only. This cannot be undone.",
     "deleteMessagesTitle": "Delete messages",
     "deleteMessagesConfirm": "Are you sure you want to delete {{count}} message? This cannot be undone.",
     "deleteMessagesConfirm_plural": "Are you sure you want to delete {{count}} messages? This cannot be undone.",
@@ -184,6 +227,7 @@
     "emojiObjects": "Objects"
   },
   "settings": {
+    "termsOfUse": "Terms of Use",
     "title": "Settings",
     "profileSection": "PROFILE",
     "securitySection": "SECURITY",
@@ -249,12 +293,7 @@
     "light": "Light",
     "lightSubtitle": "Always use the light theme",
     "dark": "Dark",
-    "darkSubtitle": "Always use the dark theme",
-    "applyOnRestartTitle": "Restart Ghostr to apply",
-    "applyOnRestartMessage": "Some screens use the previous theme until the app is restarted. The header and your choice are already updated.",
-    "restartConfirmTitle": "Restart Ghostr to apply",
-    "restartConfirmMessage": "Some screens use module-level styles that need a fresh JS bundle to switch themes cleanly. Tap Restart to apply the new theme everywhere at once.",
-    "restartConfirmAction": "Restart"
+    "darkSubtitle": "Always use the dark theme"
   },
   "notifications": {
     "newMessageTitle": "New message",
@@ -367,6 +406,9 @@
     "security2": "The QR contains only a random identifier"
   },
   "join": {
+    "blockedContactTitle": "Blocked contact",
+    "blockedContactMessage": "You blocked {{name}}. Do you want to unblock them and accept this invitation?",
+    "unblockAndAccept": "Unblock and accept",
     "decoding": "Decoding invitation…",
     "establishing": "Establishing secure connection…",
     "connected": "Connection established!",
@@ -381,7 +423,6 @@
     "pastePlaceholder": "Paste the code here...",
     "connectButton": "Connect",
     "scanTitle": "Scan",
-    "authorize": "Authorize",
     "pasteHere": "Paste the code here…",
     "connect": "Connect",
     "enterCode": "Please paste the invitation code",
@@ -403,12 +444,18 @@
     "autoSecurity": "Automatic security",
     "autoSecurityDesc": "Encryption keys are created locally on each phone. No sensitive data passes through the server.",
     "cameraAccess": "Camera access",
-    "cameraAccessDesc": "Allow camera access to scan the QR code",
+    "cameraAccessDesc": "The camera is used to scan a QR code.",
+    "continue": "Continue",
     "codeLabel": "Invitation code",
     "codeHint": "The code is a long string of characters",
     "placeQRInFrame": "Place the QR code inside the frame",
     "selfInviteTitle": "This invite is yours",
-    "selfInviteMessage": "You can't start a conversation with yourself. Share this code with someone else instead."
+    "selfInviteMessage": "You can't start a conversation with yourself. Share this code with someone else instead.",
+    "torchOn": "Turn on flashlight",
+    "torchOff": "Turn off flashlight",
+    "pasteFromClipboard": "Paste",
+    "clipboardEmpty": "Your clipboard is empty.",
+    "clipboardError": "Couldn't read the clipboard."
   },
   "lock": {
     "enterPassword": "Please enter your password",
@@ -519,6 +566,8 @@
     "confirmLabel": "Confirm"
   },
   "contactInfo": {
+    "blockAndReport": "Block and report",
+    "blockConfirmMessage": "{{name}} will no longer be able to contact you and the conversation will be deleted from this device. You can forward the offending content to moderation in the next step.",
     "callError": "Unable to start the call",
     "callErrorGeneric": "An error occurred while starting the call",
     "deleteWhileCallTitle": "Call in progress",
@@ -627,14 +676,14 @@
     "subtitle": "Get notified of new messages, even when the app is closed.",
     "enable": "Enable",
     "later": "Later",
-    "privacyNote": "Anthropic receives no information about content — only an empty signal notifies you.",
-    "enableNotifications": "Enable notifications",
+    "privacyNote": "The servers receive no information about content — only an empty signal notifies you.",
     "stayReachable": "Stay reachable",
-    "description1": "Enable notifications to be alerted of ",
+    "description1": "Notifications alert you to ",
     "highlightMessages": "messages",
     "descriptionAnd": " and ",
     "highlightCalls": "incoming calls",
     "description2": ", even when the app is closed.",
+    "continue": "Continue",
     "privacyShort": "Content stays encrypted and invisible in notifications.",
     "notNow": "Not now"
   },
@@ -653,7 +702,8 @@
   },
   "header": {
     "selectedCount": "{{count}} selected",
-    "selectedCount_plural": "{{count}} selected"
+    "selectedCount_plural": "{{count}} selected",
+    "selectAll": "Select all"
   },
   "messages": {
     "errors": {
@@ -951,5 +1001,91 @@
     "confirmPasswordTitle": "Confirm the password",
     "confirmPasswordDesc": "Re-enter the password to confirm.",
     "passwordHint": "Memorize it. No recovery possible."
+  },
+  "groups": {
+    "newGroup": "New group",
+    "addMembers": "Add members",
+    "group": "Group",
+    "nameLabel": "Group name",
+    "namePlaceholder": "E.g. Family, Project X…",
+    "descriptionLabel": "Description (optional)",
+    "descriptionPlaceholder": "What is this group about?",
+    "create": "Create group",
+    "creating": "Creating…",
+    "createFailed": "Failed to create the group.",
+    "nameRequired": "Name required",
+    "enterName": "Give the group a name.",
+    "full": "Group full",
+    "maxReached": "Maximum 50 members.",
+    "noContacts": "No contacts yet. You can add members from your contacts later.",
+    "selectedCount": "{{count}} selected",
+    "privacyHint": "You'll be the admin. You can add members from your contacts afterwards.",
+    "unknownContact": "Contact",
+    "info": "Group info",
+    "notFound": "Group not found",
+    "memberCount": "{{count}} members",
+    "membersSection": "Members",
+    "admin": "Admin",
+    "you": "you",
+    "makeAdmin": "Make admin",
+    "removeMember": "Remove from group",
+    "removeConfirmTitle": "Remove this member?",
+    "removeConfirmBody": "{{name}} will be removed from the group.",
+    "blockAndReport": "Block and report",
+    "blockConfirmBody": "{{name}} will no longer be able to contact you. You can forward the offending content to moderation in the next step.",
+    "memberBlocked": "{{name}} has been blocked.",
+    "leave": "Leave group",
+    "leaveTitle": "Leave group?",
+    "leaveBody": "You will no longer receive messages from this group.",
+    "mute": "Mute",
+    "longPressHint": "Long-press a member to manage them.",
+    "inviteByQR": "Invite via QR",
+    "adminOnly": "Only an admin can invite.",
+    "share": "Share",
+    "copyLink": "Copy",
+    "linkCopied": "Link copied",
+    "resetLink": "Reset",
+    "resetLinkTitle": "Reset the link?",
+    "resetLinkBody": "Old links and QR codes will stop working. Anyone with the old link won't be able to join.",
+    "resetLinkConfirm": "Reset",
+    "approvalRequired": "Approve requests",
+    "approvalHint": "You manually approve everyone who asks to join.",
+    "qrWarning": "Anyone scanning this code can request to join the group.",
+    "shareMessage": "Join \"{{name}}\" on ghostr: {{url}}",
+    "joinGroup": "Join a group",
+    "invalidInvite": "This invitation is invalid or has expired.",
+    "joinPreview": "You're about to request to join this group. An admin will need to approve your request.",
+    "requestToJoin": "Request to join",
+    "connecting": "Establishing secure connection…",
+    "waitingApproval": "Request sent. Waiting for an admin to approve…",
+    "waitingHint": "You can close this screen; you'll be added automatically once approved.",
+    "joinDeclined": "Your request was declined.",
+    "adminSessionFailed": "Couldn't establish a secure connection with the admin.",
+    "joinSendFailed": "Failed to send the request.",
+    "joinRequestTitle": "Join request",
+    "joinRequestBody": "{{name}} wants to join the group.",
+    "accept": "Accept",
+    "decline": "Decline",
+    "menu": {
+      "createTitle": "New group",
+      "createSubtitle": "Create an encrypted group conversation"
+    },
+    "addPartialTitle": "Some members couldn't be added",
+    "addPartialBody": "Couldn't add: {{names}}. Please try again later.",
+    "addSelected": "Add",
+    "adding": "Adding…",
+    "inviteByLinkTitle": "Invite by link",
+    "inviteByLinkHint": "The post-quantum invite is too large for a QR code. Share the link below; the recipient pastes it into “Join”.",
+    "maxReachedExisting": "Maximum {{count}} members.",
+    "noContactsToAdd": "No contacts available. All your contacts are already in the group, or you don't have any contacts yet.",
+    "searchContacts": "Search a contact…",
+    "noSearchResults": "No contact found.",
+    "qrExpired": "This QR code has expired. Ask the group admin to send you the invitation link again.",
+    "inviteMalformed": "This invitation could not be read."
+  },
+  "errorBoundary": {
+    "title": "Something went wrong",
+    "subtitle": "This screen ran into an unexpected problem. You can go back and try again without closing the app.",
+    "action": "Go back"
   }
 }
