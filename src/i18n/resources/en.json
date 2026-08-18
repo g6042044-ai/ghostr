@@ -16,6 +16,8 @@
     "s6Body": "Ghostr is provided \"as is\", without warranty of any kind. To the maximum extent permitted by law, its authors cannot be held liable for damages resulting from the use of the app.",
     "s7Title": "7. Contact",
     "s7Body": "Questions or reports of inappropriate behavior: theghostr.com",
+    "contactButton": "Contact moderation — support@theghostr.com",
+    "contactError": "Could not open your email app. Write to support@theghostr.com.",
     "lastUpdated": "Last updated: August 2026",
     "acceptNote": "By tapping \"Accept and continue\", you confirm that you have read and agree to these terms.",
     "acceptButton": "Accept and continue"
