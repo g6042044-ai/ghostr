@@ -28,7 +28,8 @@
           "audio",
           "remote-notification"
         ],
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "CFBundleAllowMixedLocalizations": true
       },
       "entitlements": {
         "aps-environment": "production",
@@ -37,6 +38,16 @@
       "associatedDomains": [
         "applinks:theghostr.com"
       ]
+    },
+    "locales": {
+      "ar": "./locales/ar.json",
+      "de": "./locales/de.json",
+      "en": "./locales/en.json",
+      "es": "./locales/es.json",
+      "fr": "./locales/fr.json",
+      "it": "./locales/it.json",
+      "ru": "./locales/ru.json",
+      "ur": "./locales/ur.json"
     },
     "androidStatusBar": {
       "backgroundColor": "#0A0F14",
@@ -104,10 +115,10 @@
         "expo-build-properties",
         {
           "android": {
-            "compileSdkVersion": 35,
-            "targetSdkVersion": 35,
+            "compileSdkVersion": 36,
+            "targetSdkVersion": 36,
             "minSdkVersion": 24,
-            "buildToolsVersion": "35.0.0",
+            "buildToolsVersion": "36.0.0",
             "enableMinifyInReleaseBuilds": false,
             "enableShrinkResourcesInReleaseBuilds": false
           },
@@ -157,7 +168,8 @@
       "./plugins/withRingbackTone",
       "./plugins/withCallNotification",
       "./plugins/withInsistentRingtone",
-      "./plugins/withSpeakerRoute"
+      "./plugins/withSpeakerRoute",
+      "./plugins/withLargeScreenCompat"
     ],
     "extra": {
       "eas": {
