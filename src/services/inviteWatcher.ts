@@ -192,7 +192,15 @@ class InviteWatcher {
         return;
       }
 
-      // On ne s'intéresse qu'aux réponses d'acceptation PQ
+      // On ne s'intéresse qu'aux réponses d'acceptation PQ.
+      // ROBUSTESSE : JSON.parse('null') renvoie null sans lever d'exception, et
+      // un payload non-objet (nombre, chaîne) ne lèverait pas non plus → lire
+      // .type dessus planterait (« Cannot read property 'type' of undefined »).
+      // On rejette donc tout payload qui n'est pas un objet exploitable.
+      if (!payload || typeof payload !== 'object') {
+        this.processedIds.add(msg.id);
+        return;
+      }
       if (payload.type !== 'ghostr_accept_pq') {
         this.processedIds.add(msg.id);
         return;

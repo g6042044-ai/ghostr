@@ -152,6 +152,9 @@ const ALLOWED_RPCS = [
   // App notice (kill-switch / deprecation banner) — payload signé Ed25519,
   // vérification client-side, server non-confiance. Cf. src/services/appNotice.ts
   'get_app_notice',
+  // Guideline 1.2 (App Store) : signalement volontaire de contenu par le
+  // destinataire. Cf. src/services/reportService.ts
+  'submit_report',
 ] as const;
 
 type AllowedRpc = typeof ALLOWED_RPCS[number];

@@ -2,7 +2,7 @@
 // Modern identity creation — full-screen layout, elements fill space when keyboard closed
 
 import { useState, useRef, useEffect } from 'react';
-import { View, Text, StyleSheet, TextInput, KeyboardAvoidingView, Platform, Image, TouchableOpacity, Animated, Alert, ActivityIndicator, StatusBar, Keyboard, BackHandler } from 'react-native';
+import { View, Text, StyleSheet, TextInput, KeyboardAvoidingView, Platform, Image, TouchableOpacity, Animated, ActivityIndicator, StatusBar, Keyboard, BackHandler } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
 import * as ImagePicker from 'expo-image-picker';
@@ -10,9 +10,8 @@ import { suppressLock, releaseLock } from '../services/lockGuard';
 import { ensureCameraPermission, ensureMediaLibraryPermission } from '../services/permissions';
 import { setGlobalDisplayName, setGlobalAvatar } from '../services/storage';
 import { sessionService } from '../services/tripleRatchet';
-import { Button, useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
+import { Button, useTheme, useThemedStyles, getAvatarColor, type ColorPalette, showActionSheet } from '../components/ui';
 import { ImageCropper } from '../components/ImageCropper';
-import { AVATAR_COLORS } from '../services/crypto';
 import { Ionicons } from '@expo/vector-icons';
 import { SplashScreen } from './SplashScreen';
 
@@ -37,7 +36,7 @@ const AVATAR_SMALL = 72;
 
 export function SetupProfileScreen({ onComplete, onBack }: SetupProfileScreenProps) {
   const insets = useSafeAreaInsets();
-  const { colors } = useTheme();
+  const { colors, isDark } = useTheme();
   const styles = useThemedStyles(makeStyles);
   const { t } = useTranslation();
   const [displayName, setDisplayName] = useState('');
@@ -107,12 +106,10 @@ export function SetupProfileScreen({ onComplete, onBack }: SetupProfileScreenPro
     if (p.length >= 2) return (p[0][0] + p[1][0]).toUpperCase();
     return name.trim().substring(0, 2).toUpperCase();
   };
-  const getAvatarColor = (name: string): string => {
-    if (!name.trim()) return AVATAR_COLORS[0];
-    let h = 0;
-    for (let i = 0; i < name.length; i++) h = ((h << 5) - h) + name.charCodeAt(i);
-    return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
-  };
+  // `getAvatarColor` local supprimé : il réimplémentait le hash du design
+  // system sur une palette différente, si bien que l'aperçu du profil ne
+  // montrait PAS la couleur que les autres verront. La fonction partagée est
+  // importée depuis `components/ui`.
   // processImage() has been removed: the in-app ImageCropper now handles the
   // resize → JPEG-compress → base64 pipeline as part of confirm(), so the
   // value passed to setAvatarUri is already a ready-to-store data: URI.
@@ -176,12 +173,39 @@ export function SetupProfileScreen({ onComplete, onBack }: SetupProfileScreenPro
   };
   const handleAvatarPress = () => {
     Keyboard.dismiss();
-    Alert.alert(t('setupProfile.photoOptions'), undefined, [
-      { text: t('common.cancel'), style: 'cancel' },
-      { text: t('setupProfile.takePhoto'), onPress: handleTakePhoto },
-      { text: t('setupProfile.chooseGallery'), onPress: handlePickGallery },
-      avatarUri ? { text: t('setupProfile.removePhoto'), onPress: () => setAvatarUri(null), style: 'destructive' } : null,
-    ].filter(Boolean) as any);
+    // ActionSheet du design system plutôt qu'un `Alert.alert` à quatre
+    // boutons. Un choix parmi N est exactement ce qu'une feuille d'actions
+    // sait faire : les options y sont empilées, avec icône et sous-titre
+    // possibles. Un Alert natif à quatre boutons les empile aussi, mais sans
+    // icône, avec un ordre différent sur iOS et Android, et dans le style de
+    // l'OS — soit la première impression que le nouvel utilisateur a de
+    // l'app, en dehors de sa propre identité visuelle.
+    void showActionSheet({
+      title: t('setupProfile.photoOptions'),
+      items: [
+        {
+          title: t('setupProfile.takePhoto'),
+          icon: <Ionicons name="camera-outline" size={24} color={colors.primary} />,
+          onPress: handleTakePhoto,
+        },
+        {
+          title: t('setupProfile.chooseGallery'),
+          icon: <Ionicons name="images-outline" size={24} color={colors.primary} />,
+          onPress: handlePickGallery,
+        },
+        // L'option de suppression n'apparaît que s'il y a une photo à
+        // supprimer — proposer « Retirer la photo » quand il n'y en a pas
+        // est une impasse.
+        ...(avatarUri
+          ? [{
+              title: t('setupProfile.removePhoto'),
+              icon: <Ionicons name="trash-outline" size={24} color={colors.danger} />,
+              onPress: () => setAvatarUri(null),
+              destructive: true,
+            }]
+          : []),
+      ],
+    });
   };
 
   const handleContinue = async () => {
@@ -208,7 +232,13 @@ export function SetupProfileScreen({ onComplete, onBack }: SetupProfileScreenPro
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
+      {/* Idem WelcomeScreen : la barre d'état doit suivre le thème, l'écran
+          étant peint avec `colors.background`. */}
+      <StatusBar
+        barStyle={isDark ? 'light-content' : 'dark-content'}
+        backgroundColor="transparent"
+        translucent
+      />
 
       {/* ═══════════════════════════════════════════════════════════════════
           BOUTON RETOUR — uniquement si onBack est fourni ET clavier fermé

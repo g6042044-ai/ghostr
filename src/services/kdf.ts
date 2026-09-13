@@ -1,28 +1,35 @@
 // src/services/kdf.ts
-// Key Derivation Function - Version 6.0 Production-Ready
-// 
+// Key Derivation Function — Version 7.0 — 16 KB Page Size Safe
+//
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  STRATÉGIE DE SÉCURITÉ ÉTAT DE L'ART 2025                                ║
+// ║  STRATÉGIE DE SÉCURITÉ ÉTAT DE L'ART 2026                                ║
 // ╠══════════════════════════════════════════════════════════════════════════╣
-// ║  EAS Build (prod)  : Argon2id natif    → 64 MiB, 3 iter  → ~200-400ms   ║
-// ║  Expo Go (dev)     : PBKDF2 JS pur     → 50K iter        → ~1-2 sec     ║
+// ║  Toutes plateformes  : Argon2id (@noble/hashes, JS pur, RFC 9106)        ║
+// ║                        m=19 MiB, t=2, p=1  → ~2-5s sur mobile            ║
+// ║                        Paramètres OWASP 2025 minimum                     ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 //
-// Argon2id est recommandé par OWASP 2025 comme l'algorithme de référence
-// pour la dérivation de clés à partir de mots de passe.
-// 
-// En Expo Go, PBKDF2 JS est utilisé comme fallback (acceptable pour le dev).
-// En production (EAS Build), Argon2id natif offre une sécurité maximale.
+// CONTEXTE DE LA MIGRATION (v6 → v7):
+// La v6 utilisait `react-native-argon2` (natif). Cette lib n'est pas compatible
+// avec les tailles de page mémoire 16 KB exigées par Google Play depuis nov.
+// 2025 (lib non maintenue, NDK trop ancien). On la remplace par @noble/hashes
+// qui est :
+//   - 100% JS pur (aucun binaire natif → aucun problème d'alignement 16 KB)
+//   - audité, maintenu activement, conforme RFC 9106
+//   - identique en sortie au natif pour des paramètres identiques
 //
-// INSTALLATION PRODUCTION:
-// npx expo install react-native-argon2
-// npx expo prebuild
-// eas build --profile production
+// Les anciennes clés v6 (m=64 MiB, t=3) restent décryptables via
+// deriveKeyWithParams qui lit les paramètres stockés. La performance sera
+// dégradée (~10-15s la première fois), mais needsMigration() déclenchera
+// une re-encryption automatique avec les nouveaux paramètres v7.
+//
+// PBKDF2 reste disponible uniquement comme fallback historique en Expo Go.
 
 import * as Crypto from 'expo-crypto';
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 import { sha256 } from '@noble/hashes/sha256';
+import { argon2idAsync } from '@noble/hashes/argon2';
 
 // ============================================
 // TYPES
@@ -39,7 +46,7 @@ export interface KDFParams {
   iterations?: number;
   // Meta
   version: number;
-  native?: boolean;
+  native?: boolean;          // toujours false en v7 (JS pur)
 }
 
 export interface KDFResult {
@@ -62,55 +69,56 @@ export interface AlgorithmInfo {
 // CONFIGURATION
 // ============================================
 
-// Argon2id - Paramètres OWASP 2025
-const ARGON2_MEMORY_KIB = 65536;    // 64 MiB
-const ARGON2_TIME_COST = 3;         // 3 iterations
-const ARGON2_PARALLELISM = 1;       // 1 thread (mobile)
+// Argon2id — Paramètres OWASP 2025 minimum (m=19 MiB, t=2, p=1)
+// Choisi pour équilibrer sécurité et performance en JS pur sur mobile.
+// Référence : https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+const ARGON2_MEMORY_KIB = 19456;    // 19 MiB
+const ARGON2_TIME_COST = 2;         // 2 iterations
+const ARGON2_PARALLELISM = 1;       // 1 thread (JS = pas de vrai parallélisme de toute façon)
 const ARGON2_HASH_LENGTH = 32;      // 256 bits
 
-// PBKDF2 - Fallback pour Expo Go
-const PBKDF2_ITERATIONS_JS = 50000; // ~1-2 sec en JS pur
+// Limite mémoire interne d'@noble/hashes (DoS protection).
+// 19 MiB ≪ 1 GiB, donc on garde le défaut. Documenté explicitement pour clarté.
+const ARGON2_MAXMEM_BYTES = 2 ** 30; // 1 GiB
+
+// PBKDF2 — Fallback historique pour Expo Go uniquement
+const PBKDF2_ITERATIONS_JS = 50000;
 
 // Tailles
 const KEY_LENGTH = 32;
-const SALT_LENGTH = 32;
+const SALT_LENGTH = 32;             // 32 bytes — compatible avec ancien format v6
 
 // Version actuelle du format
-const CURRENT_VERSION = 6;
+const CURRENT_VERSION = 7;
 
 // ============================================
 // ERREURS TYPÉES
 // ============================================
 
 /**
- * Lancée quand Argon2id natif n'est pas disponible dans un build natif
- * (EAS Build, `expo run`, etc.). Indique une erreur de configuration : le
- * module react-native-argon2 doit être présent et nativement linké.
+ * Conservée pour compatibilité avec le code appelant (appLock.ts,
+ * AppNoticeOverlay.tsx, secureBackup.ts) qui catch encore cette erreur.
  *
- * L'UI doit attraper cette erreur spécifiquement et afficher un message
- * explicite à l'utilisateur plutôt qu'un « échec du verrouillage » opaque.
+ * En v7, Argon2id est TOUJOURS disponible (JS pur), donc cette erreur ne
+ * devrait JAMAIS être lancée par kdf.ts en production. Elle reste utile
+ * en tant que type d'erreur pour les cas exceptionnels (paramètres
+ * corrompus, salt invalide, etc.).
  */
 export class ArgonUnavailableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ArgonUnavailableError';
-    // Restaurer la chaîne de prototype (nécessaire avec ES5 target sur certains
-    // transpilers, sinon `instanceof` ne fonctionne pas correctement).
     Object.setPrototypeOf(this, ArgonUnavailableError.prototype);
   }
 }
 
 // ============================================
-// DÉTECTION ARGON2 NATIF
+// DÉTECTION ENVIRONNEMENT
 // ============================================
 
-let argon2Module: any = null;
-let argon2Checked = false;
 let isExpoGo = false;
+let envChecked = false;
 
-/**
- * Détecte si on est dans Expo Go
- */
 function detectExpoGo(): boolean {
   try {
     // @ts-ignore
@@ -121,67 +129,31 @@ function detectExpoGo(): boolean {
   }
 }
 
-/**
- * Vérifie si react-native-argon2 est disponible
- */
-async function checkArgon2Available(): Promise<boolean> {
-  if (argon2Checked) {
-    return argon2Module !== null;
-  }
-  
-  argon2Checked = true;
-  isExpoGo = detectExpoGo();
-  
-  if (isExpoGo) {
-    __DEV__ && console.log('📱 Expo Go détecté - Argon2 natif non disponible');
-    __DEV__ && console.log('⚠️ Fallback PBKDF2 activé. Normal en développement.');
-    __DEV__ && console.log('💡 En production (EAS Build), Argon2id sera utilisé automatiquement.');
-    return false;
-  }
-  
-  try {
-    // Import dynamique pour éviter l'erreur si non installé
-    const module = await import('react-native-argon2').catch(() => null);
-    
-    if (module && module.default) {
-      // Test rapide pour vérifier que ça fonctionne
-      const testSalt = 'testsalt12345678901234567890123456';
-      const testResult = await module.default('test', testSalt, {
-        mode: 'argon2id',
-        memory: 1024,
-        iterations: 1,
-        parallelism: 1,
-        hashLength: 32,
-      });
-      
-      if (testResult && testResult.rawHash) {
-        argon2Module = module.default;
-        __DEV__ && console.log('✅ react-native-argon2 disponible (sécurité maximale)');
-        return true;
-      }
+function ensureEnvChecked() {
+  if (!envChecked) {
+    isExpoGo = detectExpoGo();
+    envChecked = true;
+    if (__DEV__) {
+      console.log(
+        isExpoGo
+          ? '📱 Expo Go détecté'
+          : '🏗️ Build natif détecté (EAS / dev-client)'
+      );
     }
-  } catch (e) {
-    __DEV__ && console.log('⚠️ react-native-argon2 non disponible:', e);
   }
-  
-  __DEV__ && console.log('⚠️ Fallback PBKDF2 activé');
-  return false;
 }
 
 /**
- * Vérifie si Argon2 natif est disponible (pour l'UI)
+ * Compat API : retourne toujours true en v7 (Argon2id JS pur disponible
+ * partout). Conservée pour ne pas casser les appelants.
  */
 export async function isArgon2Available(): Promise<boolean> {
-  return checkArgon2Available();
+  ensureEnvChecked();
+  return true;
 }
 
-/**
- * Vérifie si on est en mode Expo Go
- */
 export function isRunningInExpoGo(): boolean {
-  if (!argon2Checked) {
-    isExpoGo = detectExpoGo();
-  }
+  ensureEnvChecked();
   return isExpoGo;
 }
 
@@ -189,26 +161,27 @@ export function isRunningInExpoGo(): boolean {
 // UTILITAIRES
 // ============================================
 
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+function utf8Encode(str: string): Uint8Array {
+  return new TextEncoder().encode(str);
 }
 
 // ============================================
-// ARGON2ID (NATIF)
+// ARGON2ID (JS PUR via @noble/hashes)
 // ============================================
 
 /**
- * Dérive une clé avec Argon2id natif
+ * Dérive une clé avec Argon2id (RFC 9106) en JS pur, version asynchrone.
+ *
+ * IMPORTANT — Performance & responsivité :
+ * Argon2 en JS pur est intrinsèquement plus lent que le natif (pas de
+ * Uint64Array rapide en JS). On utilise `argon2idAsync` de @noble/hashes
+ * v1.8+ qui cède au runtime toutes les `asyncTick` ms — l'UI reste donc
+ * fluide pendant la dérivation, et `onProgress` rapporte un vrai % de
+ * progression (pas une simple estimation).
+ *
+ * Performance attendue (mobile ARM, JS via Hermes) :
+ *   - v7 (m=19 MiB, t=2)  : ~2-5 s
+ *   - v6 (m=64 MiB, t=3) legacy : ~10-20 s (one-time, déclenche migration)
  */
 async function deriveWithArgon2(
   password: string,
@@ -218,36 +191,48 @@ async function deriveWithArgon2(
   parallelism: number = ARGON2_PARALLELISM,
   onProgress?: (progress: number) => void
 ): Promise<Uint8Array> {
-  if (!argon2Module) {
-    throw new Error('Argon2 module not available');
-  }
-  
-  onProgress?.(0.1);
-  
-  // react-native-argon2 attend le salt en string (hex ou utf8)
-  const saltHex = bytesToHex(salt);
-  
-  const result = await argon2Module(password, saltHex, {
-    mode: 'argon2id',
-    memory,
-    iterations: timeCost,
-    parallelism,
-    hashLength: ARGON2_HASH_LENGTH,
-    saltEncoding: 'hex',
+  const startTime = Date.now();
+
+  // Yield AVANT pour laisser React Native rendre l'UI de loading.
+  onProgress?.(0);
+  await new Promise(resolve => setTimeout(resolve, 16));
+
+  // @noble/hashes argon2idAsync (v1.8+) :
+  //   - password / salt : KDFInput (string ou Uint8Array)
+  //   - opts.t       : iterations
+  //   - opts.m       : memory in KiB
+  //   - opts.p       : parallelism (≥1, ignoré en pratique en JS)
+  //   - opts.dkLen   : output length in bytes
+  //   - opts.maxmem  : memory limit guard (DoS) — défaut 1 GiB, suffisant
+  //   - opts.asyncTick : cooperative yield interval in ms (défaut 10)
+  //   - opts.onProgress : (progress: number 0..1) => void
+  // Salt min : 8 bytes (RFC 9106) — on a 32 bytes, OK.
+  const key = await argon2idAsync(password, salt, {
+    t: timeCost,
+    m: memory,
+    p: parallelism,
+    dkLen: ARGON2_HASH_LENGTH,
+    maxmem: ARGON2_MAXMEM_BYTES,
+    asyncTick: 10,
+    onProgress: (progress: number) => {
+      // Mappe la progression réelle d'argon2 sur [0.05 .. 1.0] pour laisser
+      // un peu de marge au début (init UI) et à la fin (post-traitement).
+      onProgress?.(0.05 + 0.95 * progress);
+    },
   });
-  
-  onProgress?.(1);
-  
-  if (!result || !result.rawHash) {
-    throw new Error('Argon2 derivation failed');
+
+  if (__DEV__) {
+    const elapsed = Date.now() - startTime;
+    console.log(
+      `⏱️ Argon2id JS async: m=${memory} KiB, t=${timeCost}, p=${parallelism} → ${elapsed}ms`
+    );
   }
-  
-  // Le rawHash est en hex
-  return hexToBytes(result.rawHash);
+
+  return key;
 }
 
 // ============================================
-// PBKDF2 (FALLBACK JS PUR)
+// PBKDF2 (FALLBACK JS PUR — Expo Go uniquement)
 // ============================================
 
 /**
@@ -256,53 +241,52 @@ async function deriveWithArgon2(
 class HmacSha256 {
   private innerPad: Uint8Array;
   private outerPad: Uint8Array;
-  
+
   constructor(key: Uint8Array) {
     const blockSize = 64;
     const paddedKey = new Uint8Array(blockSize);
-    
+
     if (key.length <= blockSize) {
       paddedKey.set(key);
     } else {
-      // RFC 2104: Si la clé dépasse la taille de bloc, la hasher d'abord
-      // sha256 retourne 32 bytes, qui est < blockSize (64), donc on set directement
       paddedKey.set(sha256(key));
     }
-    
+
     this.innerPad = new Uint8Array(blockSize);
     this.outerPad = new Uint8Array(blockSize);
-    
+
     for (let i = 0; i < blockSize; i++) {
       this.innerPad[i] = paddedKey[i] ^ 0x36;
       this.outerPad[i] = paddedKey[i] ^ 0x5c;
     }
   }
-  
+
   async compute(data: Uint8Array): Promise<Uint8Array> {
     const innerData = new Uint8Array(64 + data.length);
     innerData.set(this.innerPad);
     innerData.set(data, 64);
-    
+
     const innerHash = await Crypto.digest(
       Crypto.CryptoDigestAlgorithm.SHA256,
       innerData
     );
-    
+
     const outerData = new Uint8Array(64 + 32);
     outerData.set(this.outerPad);
     outerData.set(new Uint8Array(innerHash), 64);
-    
+
     const result = await Crypto.digest(
       Crypto.CryptoDigestAlgorithm.SHA256,
       outerData
     );
-    
+
     return new Uint8Array(result);
   }
 }
 
 /**
- * PBKDF2-SHA256 en JS pur
+ * PBKDF2-SHA256 en JS pur — utilisé UNIQUEMENT en Expo Go.
+ * Tous les builds natifs (EAS dev/preview/production) utilisent Argon2id.
  */
 async function deriveWithPBKDF2(
   password: string,
@@ -311,34 +295,32 @@ async function deriveWithPBKDF2(
   onProgress?: (progress: number) => void
 ): Promise<Uint8Array> {
   const startTime = Date.now();
-  const encoder = new TextEncoder();
-  const passwordBytes = encoder.encode(password);
-  
+  const passwordBytes = utf8Encode(password);
+
   const hmac = new HmacSha256(passwordBytes);
-  
-  // Premier bloc: U1 = PRF(Password, Salt || INT(1))
+
   const u = new Uint8Array(salt.length + 4);
   u.set(salt);
   u.set([0, 0, 0, 1], salt.length);
-  
+
   let block = await hmac.compute(u);
   const result = new Uint8Array(block);
-  
+
   let lastYield = Date.now();
   let lastProgress = 0;
   const yieldInterval = 200;
-  
+
   for (let i = 1; i < iterations; i++) {
     block = await hmac.compute(block);
-    
+
     for (let j = 0; j < KEY_LENGTH; j++) {
       result[j] ^= block[j];
     }
-    
+
     const now = Date.now();
     if (now - lastYield > yieldInterval) {
       await new Promise(resolve => setTimeout(resolve, 0));
-      
+
       const progress = i / iterations;
       if (progress - lastProgress > 0.02) {
         onProgress?.(progress);
@@ -347,10 +329,12 @@ async function deriveWithPBKDF2(
       lastYield = now;
     }
   }
-  
-  const elapsed = Date.now() - startTime;
-  __DEV__ && console.log(`⏱️ PBKDF2 JS: ${iterations} iterations en ${elapsed}ms`);
-  
+
+  if (__DEV__) {
+    const elapsed = Date.now() - startTime;
+    console.log(`⏱️ PBKDF2 JS: ${iterations} iterations en ${elapsed}ms`);
+  }
+
   onProgress?.(1);
   return result;
 }
@@ -367,61 +351,29 @@ export function generateSalt(length: number = SALT_LENGTH): Uint8Array {
 }
 
 /**
- * Dérive une clé à partir d'un mot de passe
- * Utilise Argon2id si disponible, sinon PBKDF2
+ * Dérive une clé à partir d'un mot de passe.
+ *
+ * - En build natif (EAS) : Argon2id (m=19 MiB, t=2, p=1) — sécurité OWASP
+ * - En Expo Go            : PBKDF2 (50k iters) — fallback développement
+ *
+ * Avant v7, Argon2 nécessitait un module natif. La v7 utilise @noble/hashes
+ * qui fonctionne partout. On garde le fallback PBKDF2 en Expo Go uniquement
+ * pour réduire la latence en dev (Expo Go = dev only de toute façon).
  */
 export async function deriveKey(
   password: string,
   existingSalt?: Uint8Array,
   onProgress?: (progress: number) => void
 ): Promise<KDFResult> {
+  ensureEnvChecked();
   const salt = existingSalt || generateSalt();
-  const hasArgon2 = await checkArgon2Available();
-  
+
   let key: Uint8Array;
   let params: KDFParams;
   let algorithmInfo: AlgorithmInfo;
-  
-  if (hasArgon2 && argon2Module) {
-    // 🔒 Argon2id natif — chemin UNIQUE en production
-    key = await deriveWithArgon2(
-      password,
-      salt,
-      ARGON2_MEMORY_KIB,
-      ARGON2_TIME_COST,
-      ARGON2_PARALLELISM,
-      onProgress
-    );
 
-    params = {
-      algorithm: 'argon2id',
-      salt: encodeBase64(salt),
-      memory: ARGON2_MEMORY_KIB,
-      timeCost: ARGON2_TIME_COST,
-      parallelism: ARGON2_PARALLELISM,
-      version: CURRENT_VERSION,
-      native: true,
-    };
-
-    algorithmInfo = {
-      name: 'Argon2id (64 MiB)',
-      strength: 'high',
-      memoryMB: ARGON2_MEMORY_KIB / 1024,
-      iterations: ARGON2_TIME_COST,
-      estimatedTimeMs: 300,
-      native: true,
-    };
-
-    __DEV__ && console.log('🔐 Clé dérivée avec Argon2id (sécurité maximale)');
-  } else if (isExpoGo) {
-    // Expo Go UNIQUEMENT : fallback PBKDF2 pour permettre le développement.
-    // Ce chemin ne peut PAS être atteint dans un build EAS de production :
-    //   - isExpoGo requiert Constants.executionEnvironment === 'storeClient'
-    //     (Expo Go sur le store), ce qui est impossible dans un EAS Build.
-    //   - Tout build EAS (dev ou prod) a executionEnvironment = 'standalone'
-    //     ou 'bare', jamais 'storeClient'.
-    // Même un __DEV__ EAS Build passera donc par la branche "else" ci-dessous
-    // et lèvera ArgonUnavailableError si le module natif manque.
+  if (isExpoGo) {
+    // ─── Expo Go : PBKDF2 (rapide, pour dev uniquement) ───
     key = await deriveWithPBKDF2(
       password,
       salt,
@@ -443,73 +395,76 @@ export async function deriveKey(
       iterations: PBKDF2_ITERATIONS_JS,
       estimatedTimeMs: 1500,
       native: false,
-      warning: 'Mode développement (Expo Go) — PBKDF2 fallback actif',
+      warning: 'Mode développement (Expo Go) — PBKDF2 fallback',
     };
 
-    __DEV__ && console.log('⚠️ Clé dérivée avec PBKDF2 (Expo Go uniquement)');
+    if (__DEV__) console.log('⚠️ Clé dérivée avec PBKDF2 (Expo Go uniquement)');
   } else {
-    // ═══════════════════════════════════════════════════════════════════════
-    // ARGON2 INDISPONIBLE DANS UN BUILD NATIF — ERREUR DE BUILD
-    // ═══════════════════════════════════════════════════════════════════════
-    // On arrive ici si :
-    //   - react-native-argon2 n'est pas dans package.json, OU
-    //   - le module natif a été retiré du bundle par le bundler, OU
-    //   - le module a planté au test de disponibilité.
-    //
-    // Dans TOUS les cas, c'est une erreur de configuration du build qu'il
-    // faut corriger à la source. On lève une erreur typée pour que l'UI
-    // (SecurityScreen) puisse afficher un message clair à l'utilisateur
-    // au lieu d'un échec silencieux.
-    // ═══════════════════════════════════════════════════════════════════════
-    throw new ArgonUnavailableError(
-      'Argon2id natif non disponible. ' +
-      'react-native-argon2 doit être installé et linké nativement dans ce build. ' +
-      'Commandes : npx expo install react-native-argon2 && npx expo prebuild --clean && eas build'
+    // ─── Build natif : Argon2id JS pur (sécurité maximale, 16 KB safe) ───
+    key = await deriveWithArgon2(
+      password,
+      salt,
+      ARGON2_MEMORY_KIB,
+      ARGON2_TIME_COST,
+      ARGON2_PARALLELISM,
+      onProgress
     );
+
+    params = {
+      algorithm: 'argon2id',
+      salt: encodeBase64(salt),
+      memory: ARGON2_MEMORY_KIB,
+      timeCost: ARGON2_TIME_COST,
+      parallelism: ARGON2_PARALLELISM,
+      version: CURRENT_VERSION,
+      native: false, // v7 = JS pur, jamais natif
+    };
+
+    algorithmInfo = {
+      name: `Argon2id (${ARGON2_MEMORY_KIB / 1024} MiB)`,
+      strength: 'high',
+      memoryMB: ARGON2_MEMORY_KIB / 1024,
+      iterations: ARGON2_TIME_COST,
+      estimatedTimeMs: 3000,
+      native: false,
+    };
+
+    if (__DEV__) console.log('🔐 Clé dérivée avec Argon2id (JS pur, RFC 9106)');
   }
 
   return { key, params: JSON.stringify(params), algorithmInfo };
 }
 
 /**
- * Dérive une clé avec des paramètres existants
+ * Dérive une clé avec des paramètres existants (déchiffrement, vérif).
+ *
+ * Lit l'algorithme et les paramètres depuis le JSON stocké, applique la même
+ * dérivation. Compatible avec les anciens formats v6 (m=64 MiB, t=3) pour
+ * les utilisateurs internes qui auraient déjà des données chiffrées.
  */
 export async function deriveKeyWithParams(
   password: string,
   paramsJson: string,
   onProgress?: (progress: number) => void
 ): Promise<Uint8Array> {
+  ensureEnvChecked();
   const params: KDFParams = JSON.parse(paramsJson);
   const salt = decodeBase64(params.salt);
-  
-  if (params.algorithm === 'argon2id') {
-    const hasArgon2 = await checkArgon2Available();
 
-    if (hasArgon2 && argon2Module) {
-      return deriveWithArgon2(
-        password,
-        salt,
-        params.memory || ARGON2_MEMORY_KIB,
-        params.timeCost || ARGON2_TIME_COST,
-        params.parallelism || ARGON2_PARALLELISM,
-        onProgress
-      );
-    } else {
-      // Argon2 requis mais non disponible — erreur typée pour l'UI
-      throw new ArgonUnavailableError(
-        'Les données sont chiffrées avec Argon2id mais le module natif est ' +
-        'indisponible. Reconstruisez l\'application avec react-native-argon2.'
-      );
-    }
+  if (params.algorithm === 'argon2id') {
+    // Tous les builds (Expo Go inclus) peuvent désormais dériver de l'Argon2id.
+    return deriveWithArgon2(
+      password,
+      salt,
+      params.memory || ARGON2_MEMORY_KIB,
+      params.timeCost || ARGON2_TIME_COST,
+      params.parallelism || ARGON2_PARALLELISM,
+      onProgress
+    );
   } else {
-    // Params PBKDF2 : uniquement acceptés en Expo Go. Dans tout autre
-    // environnement, refuser — un build natif ne doit jamais utiliser PBKDF2.
-    if (!isExpoGo) {
-      throw new ArgonUnavailableError(
-        'Ce build natif refuse PBKDF2 pour raison de sécurité. Les données ' +
-        'doivent être re-chiffrées avec Argon2id (réinitialisez le verrouillage).'
-      );
-    }
+    // PBKDF2 legacy : autorisé en Expo Go (dev), mais aussi accepté en build
+    // natif si les données ont été créées en dev — sinon les utilisateurs
+    // d'Expo Go ne pourraient plus accéder à leurs données après un EAS build.
     const iterations = params.iterations || PBKDF2_ITERATIONS_JS;
     return deriveWithPBKDF2(password, salt, iterations, onProgress);
   }
@@ -523,14 +478,13 @@ export async function deriveSubKey(
   info: string,
   keyLength: number = 32
 ): Promise<Uint8Array> {
-  const encoder = new TextEncoder();
-  const infoBytes = encoder.encode(info);
-  
+  const infoBytes = utf8Encode(info);
+
   const hmac = new HmacSha256(masterKey);
   const input = new Uint8Array(infoBytes.length + 1);
   input.set(infoBytes);
   input[input.length - 1] = 1;
-  
+
   const key = await hmac.compute(input);
   return key.slice(0, keyLength);
 }
@@ -540,24 +494,27 @@ export async function deriveSubKey(
 // ============================================
 
 /**
- * Vérifie si une migration est nécessaire
+ * Vérifie si une migration est nécessaire.
+ *
+ * Migration v6 → v7 :
+ *   - Les utilisateurs internes en v6 (m=64 MiB, t=3) ont des unlocks lents
+ *     (~10-15s en JS). On déclenche une re-dérivation en v7 (m=19 MiB, t=2)
+ *     dès qu'on en a l'occasion pour accélérer les unlocks futurs (~2-5s).
  */
 export function needsMigration(paramsJson: string): boolean {
   try {
     const params: KDFParams = JSON.parse(paramsJson);
-    
-    // Migration nécessaire si :
-    // - Version ancienne
-    // - PBKDF2 utilisé alors qu'Argon2 est disponible (vérifié plus tard)
+
     if (params.version < CURRENT_VERSION) {
       return true;
     }
-    
-    // Si c'est PBKDF2 et qu'on pourrait utiliser Argon2, suggérer upgrade
+
+    // Données chiffrées en PBKDF2 alors qu'on tourne en build natif :
+    // proposer un upgrade Argon2id.
     if (params.algorithm === 'pbkdf2' && !isExpoGo) {
       return true;
     }
-    
+
     return false;
   } catch {
     return true;
@@ -570,35 +527,30 @@ export function needsMigration(paramsJson: string): boolean {
 export function getAlgorithmInfo(paramsJson: string): AlgorithmInfo {
   try {
     const params: KDFParams = JSON.parse(paramsJson);
-    
+
     if (params.algorithm === 'argon2id') {
       const memoryMB = (params.memory || ARGON2_MEMORY_KIB) / 1024;
+      // Estimation grossière : ~150ms par MiB en JS pur
+      const estimatedTimeMs = Math.round(memoryMB * 150 * (params.timeCost || ARGON2_TIME_COST));
       return {
         name: `Argon2id (${memoryMB} MiB)`,
         strength: 'high',
         memoryMB,
         iterations: params.timeCost || ARGON2_TIME_COST,
-        estimatedTimeMs: 300,
-        native: params.native || false,
+        estimatedTimeMs,
+        native: false,
       };
     } else {
       const iterations = params.iterations || PBKDF2_ITERATIONS_JS;
-      let strength: 'high' | 'standard' | 'low';
-      
-      if (iterations >= 100000) {
-        strength = 'standard';
-      } else if (iterations >= 50000) {
-        strength = 'standard';
-      } else {
-        strength = 'low';
-      }
-      
+      const strength: 'high' | 'standard' | 'low' =
+        iterations >= 50000 ? 'standard' : 'low';
+
       return {
         name: 'PBKDF2-SHA256',
         strength,
         iterations,
         estimatedTimeMs: Math.round(iterations / 30),
-        native: params.native || false,
+        native: false,
         warning: 'Argon2id recommandé pour une sécurité optimale',
       };
     }
@@ -613,50 +565,15 @@ export function getAlgorithmInfo(paramsJson: string): AlgorithmInfo {
 }
 
 /**
- * Estime le temps de dérivation
+ * Estime le temps de dérivation (en ms)
  */
 export async function estimateDerivationTime(paramsJson: string): Promise<number> {
-  const params: KDFParams = JSON.parse(paramsJson);
-  
-  if (params.algorithm === 'argon2id') {
-    const hasArgon2 = await checkArgon2Available();
-    if (hasArgon2) {
-      return 300; // ~300ms en natif
-    }
-    return -1; // Non disponible
-  } else {
-    const iterations = params.iterations || PBKDF2_ITERATIONS_JS;
-    return Math.round(iterations / 30); // ~30 iter/ms en JS
+  try {
+    const info = getAlgorithmInfo(paramsJson);
+    return info.estimatedTimeMs;
+  } catch {
+    return -1;
   }
-}
-
-// ============================================
-// LEGACY SUPPORT (simplifié - pour compatibilité API)
-// ============================================
-
-/**
- * Ancienne fonction de dérivation v2 (pour migration si nécessaire)
- * @deprecated Utiliser deriveKey à la place
- */
-export async function deriveKeyLegacyV2(
-  password: string,
-  salt: Uint8Array
-): Promise<Uint8Array> {
-  __DEV__ && console.warn('⚠️ deriveKeyLegacyV2 est déprécié');
-  return deriveWithPBKDF2(password, salt, 20000);
-}
-
-/**
- * Ancienne fonction de dérivation v1
- * @deprecated Utiliser deriveKey à la place
- */
-export async function deriveKeyLegacy(
-  password: string,
-  salt: Uint8Array,
-  iterations: number = 10000
-): Promise<Uint8Array> {
-  __DEV__ && console.warn('⚠️ deriveKeyLegacy est déprécié');
-  return deriveWithPBKDF2(password, salt, iterations);
 }
 
 // ============================================
@@ -664,7 +581,10 @@ export async function deriveKeyLegacy(
 // ============================================
 
 /**
- * Vérifie si les paramètres peuvent être utilisés dans l'environnement actuel
+ * Vérifie si les paramètres peuvent être utilisés dans l'environnement actuel.
+ *
+ * En v7, Argon2id et PBKDF2 fonctionnent partout (JS pur).
+ * Cette fonction retourne donc toujours true pour les paramètres valides.
  */
 export async function canDecryptWithParams(paramsJson: string): Promise<{
   canDecrypt: boolean;
@@ -672,29 +592,50 @@ export async function canDecryptWithParams(paramsJson: string): Promise<{
 }> {
   try {
     const params: KDFParams = JSON.parse(paramsJson);
-    
-    if (params.algorithm === 'argon2id') {
-      const hasArgon2 = await checkArgon2Available();
-      if (!hasArgon2) {
-        return {
-          canDecrypt: false,
-          reason: 'Les données ont été chiffrées avec Argon2id. ' +
-                  'Utilisez un build de production pour y accéder.',
-        };
-      }
+    if (params.algorithm !== 'argon2id' && params.algorithm !== 'pbkdf2') {
+      return {
+        canDecrypt: false,
+        reason: `Algorithme non supporté : ${params.algorithm}`,
+      };
     }
-    
     return { canDecrypt: true };
   } catch {
-    return { 
-      canDecrypt: false, 
-      reason: 'Paramètres de chiffrement invalides' 
+    return {
+      canDecrypt: false,
+      reason: 'Paramètres de chiffrement invalides',
     };
   }
 }
 
 // ============================================
-// EXPORTS POUR DEBUG
+// LEGACY SUPPORT
+// ============================================
+
+/**
+ * @deprecated Utiliser deriveKey à la place
+ */
+export async function deriveKeyLegacyV2(
+  password: string,
+  salt: Uint8Array
+): Promise<Uint8Array> {
+  if (__DEV__) console.warn('⚠️ deriveKeyLegacyV2 est déprécié');
+  return deriveWithPBKDF2(password, salt, 20000);
+}
+
+/**
+ * @deprecated Utiliser deriveKey à la place
+ */
+export async function deriveKeyLegacy(
+  password: string,
+  salt: Uint8Array,
+  iterations: number = 10000
+): Promise<Uint8Array> {
+  if (__DEV__) console.warn('⚠️ deriveKeyLegacy est déprécié');
+  return deriveWithPBKDF2(password, salt, iterations);
+}
+
+// ============================================
+// EXPORTS POUR DEBUG / TESTS
 // ============================================
 
 export const _internal = {
@@ -703,8 +644,6 @@ export const _internal = {
   ARGON2_PARALLELISM,
   PBKDF2_ITERATIONS_JS,
   CURRENT_VERSION,
-  checkArgon2Available,
   detectExpoGo,
   isExpoGo: () => isExpoGo,
-  hasArgon2: () => argon2Module !== null,
 };

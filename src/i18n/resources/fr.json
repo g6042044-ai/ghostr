@@ -210,6 +210,10 @@
     "downloading": "Téléchargement…",
     "tapToDownload": "Appuyez pour télécharger",
     "tapToDownloadWithSize": "{{size}} — Appuyez pour télécharger",
+    "tapToRetry": "Appuyez pour réessayer",
+    "decrypting": "Déchiffrement…",
+    "file": "Fichier",
+    "tap": "Appuyez",
     "encryptedSending": "Envoi chiffré…",
     "encryptedBeforeSending": "🔐 Chiffré avant l'envoi",
     "networkError": "Erreur réseau",
@@ -841,7 +845,8 @@
     "hoursAgoFull": "Il y a {{count}}h"
   },
   "input": {
-    "enterCode": "Entrez le code…"
+    "enterCode": "Entrez le code…",
+    "searchPlaceholder": "Rechercher…"
   },
   "migrationLockdown": {
     "heroTitle": "Migration en cours",
@@ -1043,6 +1048,8 @@
     "longPressHint": "Appui long sur un membre pour le gérer.",
     "inviteByQR": "Inviter via QR",
     "adminOnly": "Seul un administrateur peut inviter.",
+    "adminOnlyAction": "Seul un administrateur peut effectuer cette action.",
+    "inviteFailed": "Impossible de générer l'invitation.",
     "share": "Partager",
     "copyLink": "Copier",
     "linkCopied": "Lien copié",

@@ -3,7 +3,7 @@
 // Accessible depuis la liste des conversations (tap sur une invitation)
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { View, Text, TouchableOpacity, Alert, ScrollView, Share, Platform, Animated, Easing } from 'react-native';
+import { View, Text, TouchableOpacity, ScrollView, Share, Platform, Animated, Easing } from 'react-native';
 import { useNavigation, useRoute, useFocusEffect } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
@@ -19,7 +19,9 @@ import { sessionService } from '../services/tripleRatchet';
 import { suppressNotification } from '../components/InAppNotification';
 import { withExternalActivity } from '../services/lockGuard';
 import { buildInviteUrl } from '../services/inviteUrl';
-import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
+import { qrFitsCapacity } from '../services/groupInviteCodec';
+import { useTheme, useThemedStyles, showToast, type ColorPalette, showConfirm } from '../components/ui';
+import haptics from '../services/haptics';
 
 type RootStackParamList = {
   ConversationList: undefined;
@@ -116,30 +118,29 @@ export function InviteDetailScreen() {
     // On copie l'URL complète : si le destinataire a l'app, le lien
     // l'ouvre directement ; sinon, il est redirigé vers le store.
     await Clipboard.setStringAsync(buildInviteUrl(invite.inviteString));
-    Alert.alert(t('inviteDetail.copied'), t('inviteDetail.copiedMessage'));
+    // Toast au lieu d'un Alert : la copie a réussi, il n'y a rien à
+    // décider. Une modale bloquante ici forçait un tap sur « OK » avant
+    // de pouvoir aller coller le lien dans une autre application.
+    showToast(t('inviteDetail.copied'));
+    haptics.selection();
   };
 
-  const handleDelete = () => {
+  const handleDelete = async () => {
     if (!invite) return;
-    Alert.alert(
-      t('inviteDetail.deleteTitle'),
-      t('inviteDetail.deleteMessage'),
-      [
-        { text: t('common.cancel'), style: 'cancel' },
-        {
-          text: t('common.delete'),
-          style: 'destructive',
-          onPress: async () => {
-            // [Bug #1] Libérer l'OTPK réservée avant suppression
-            if (invite.status === 'pending') {
-              sessionService.unreserveOtpk(invite.oneTimePreKeyId);
-            }
-            await pendingInviteStore.remove(invite.tag);
-            navigation.goBack();
-          },
-        },
-      ],
-    );
+    const confirmed = await showConfirm({
+      title: t('inviteDetail.deleteTitle'),
+      message: t('inviteDetail.deleteMessage'),
+      confirmText: t('common.delete'),
+      cancelText: t('common.cancel'),
+      destructive: true,
+    });
+    if (!confirmed) return;
+    // [Bug #1] Libérer l'OTPK réservée avant suppression
+    if (invite.status === 'pending') {
+      sessionService.unreserveOtpk(invite.oneTimePreKeyId);
+    }
+    await pendingInviteStore.remove(invite.tag);
+    navigation.goBack();
   };
 
   // ── UTILS ──
@@ -188,13 +189,29 @@ export function InviteDetailScreen() {
         {/* QR Code */}
         <View style={styles.qrSection}>
           <View style={styles.qrCard}>
-            <QRCode
-              value={buildInviteUrl(invite.inviteString)}
-              size={180}
-              backgroundColor="#FFFFFF"
-              color="#0A0F14"
-              ecl="M"
-            />
+            {/* Garde de capacité.
+                L'invitation 1:1 est courte par construction — le bundle PQXDH
+                est téléversé au serveur et le QR ne porte que {v:2, t, n},
+                soit ~150 caractères. Ce rendu passait donc jusqu'ici.
+                MAIS il n'y avait AUCUNE vérification : le jour où une charge
+                utile plus lourde arrive sur ce chemin (invitation de groupe,
+                ajout d'un champ), react-native-qrcode-svg lève au rendu — et
+                une exception de rendu dans un écran non protégé fait tomber
+                l'application. En « M », le plafond n'est que de 2 331 octets.
+                On vérifie donc, et on dégrade proprement vers le lien. */}
+            {qrFitsCapacity(buildInviteUrl(invite.inviteString), 'M') ? (
+              <QRCode
+                value={buildInviteUrl(invite.inviteString)}
+                size={180}
+                backgroundColor="#FFFFFF"
+                color="#0A0F14"
+                ecl="M"
+              />
+            ) : (
+              <Text style={styles.qrTooLarge} selectable numberOfLines={4}>
+                {buildInviteUrl(invite.inviteString)}
+              </Text>
+            )}
           </View>
         </View>
 
@@ -262,6 +279,13 @@ const makeStyles = (colors: ColorPalette) => ({
   divider: { height: 1, backgroundColor: colors.divider, marginHorizontal: 16 },
 
   qrSection: { alignItems: 'center', paddingVertical: 28 },
+  qrTooLarge: {
+    fontSize: 11,
+    fontFamily: 'monospace',
+    color: colors.textSecondary,
+    textAlign: 'center',
+    paddingHorizontal: 8,
+  },
   qrCard: {
     backgroundColor: '#FFFFFF', padding: 18, borderRadius: 20,
     ...Platform.select({

@@ -12,7 +12,15 @@
 		BB2F792D24A3F905000567C9 /* Expo.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB2F792C24A3F905000567C9 /* Expo.plist */; };
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
 		CALLRING0000000000002 /* ghostr_ringtone.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = CALLRING0000000000001 /* ghostr_ringtone.mp3 */; };
-		429E55A453ED410CA9B8C131 /* incallmanager_ringback.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = F64B86C570894DC5B2F13B5B /* incallmanager_ringback.mp3 */; };
+		BB4AD5C539DD44BFBEE6B935 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = 4A68E593D2A249D9B352BFE5 /* InfoPlist.strings */; };
+		EB7EA3AF66434F21943F6550 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = 5AD1316ECEFB454DB27E9CE2 /* InfoPlist.strings */; };
+		0535CB9F53044306A4599EF7 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = 32D5F08B1381402E96A1D1B0 /* InfoPlist.strings */; };
+		9C03BB5C82AD40998BB093B7 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = 5DC4DE6B383D4905B1171BD2 /* InfoPlist.strings */; };
+		2506E6306CA045CD91880447 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = F252782BAF294222B7AAA564 /* InfoPlist.strings */; };
+		01B09DE41D814975863321AA /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = E79ED183361D4653B3653AF3 /* InfoPlist.strings */; };
+		0F4E96C9582D494C9275787A /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = 6732214E61E94E478C49906D /* InfoPlist.strings */; };
+		FD40ED9E54F947A195537C10 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = 5069A64277B042A3A8DCCE42 /* InfoPlist.strings */; };
+		E5E8580D90C94213A36E0819 /* incallmanager_ringback.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = 3447DD8FEED24B22BC2E29CB /* incallmanager_ringback.mp3 */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -25,7 +33,15 @@
 		F11748412D0307B40044C1D9 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = Ghostr/AppDelegate.swift; sourceTree = "<group>"; };
 		F11748442D0722820044C1D9 /* Ghostr-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "Ghostr-Bridging-Header.h"; path = "Ghostr/Ghostr-Bridging-Header.h"; sourceTree = "<group>"; };
 		CALLRING0000000000001 /* ghostr_ringtone.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = "ghostr_ringtone.mp3"; sourceTree = "<group>"; };
-		F64B86C570894DC5B2F13B5B /* incallmanager_ringback.mp3 */ = {isa = PBXFileReference; name = "incallmanager_ringback.mp3"; path = "Ghostr/incallmanager_ringback.mp3"; sourceTree = "<group>"; fileEncoding = undefined; lastKnownFileType = unknown; explicitFileType = undefined; includeInIndex = 0; };
+		4A68E593D2A249D9B352BFE5 /* InfoPlist.strings */ = {isa = PBXFileReference; name = "InfoPlist.strings"; path = "ar.lproj/InfoPlist.strings"; sourceTree = "<group>"; fileEncoding = 4; lastKnownFileType = text.plist.strings; explicitFileType = undefined; includeInIndex = 0; };
+		5AD1316ECEFB454DB27E9CE2 /* InfoPlist.strings */ = {isa = PBXFileReference; name = "InfoPlist.strings"; path = "de.lproj/InfoPlist.strings"; sourceTree = "<group>"; fileEncoding = 4; lastKnownFileType = text.plist.strings; explicitFileType = undefined; includeInIndex = 0; };
+		32D5F08B1381402E96A1D1B0 /* InfoPlist.strings */ = {isa = PBXFileReference; name = "InfoPlist.strings"; path = "en.lproj/InfoPlist.strings"; sourceTree = "<group>"; fileEncoding = 4; lastKnownFileType = text.plist.strings; explicitFileType = undefined; includeInIndex = 0; };
+		5DC4DE6B383D4905B1171BD2 /* InfoPlist.strings */ = {isa = PBXFileReference; name = "InfoPlist.strings"; path = "es.lproj/InfoPlist.strings"; sourceTree = "<group>"; fileEncoding = 4; lastKnownFileType = text.plist.strings; explicitFileType = undefined; includeInIndex = 0; };
+		F252782BAF294222B7AAA564 /* InfoPlist.strings */ = {isa = PBXFileReference; name = "InfoPlist.strings"; path = "fr.lproj/InfoPlist.strings"; sourceTree = "<group>"; fileEncoding = 4; lastKnownFileType = text.plist.strings; explicitFileType = undefined; includeInIndex = 0; };
+		E79ED183361D4653B3653AF3 /* InfoPlist.strings */ = {isa = PBXFileReference; name = "InfoPlist.strings"; path = "it.lproj/InfoPlist.strings"; sourceTree = "<group>"; fileEncoding = 4; lastKnownFileType = text.plist.strings; explicitFileType = undefined; includeInIndex = 0; };
+		6732214E61E94E478C49906D /* InfoPlist.strings */ = {isa = PBXFileReference; name = "InfoPlist.strings"; path = "ru.lproj/InfoPlist.strings"; sourceTree = "<group>"; fileEncoding = 4; lastKnownFileType = text.plist.strings; explicitFileType = undefined; includeInIndex = 0; };
+		5069A64277B042A3A8DCCE42 /* InfoPlist.strings */ = {isa = PBXFileReference; name = "InfoPlist.strings"; path = "ur.lproj/InfoPlist.strings"; sourceTree = "<group>"; fileEncoding = 4; lastKnownFileType = text.plist.strings; explicitFileType = undefined; includeInIndex = 0; };
+		3447DD8FEED24B22BC2E29CB /* incallmanager_ringback.mp3 */ = {isa = PBXFileReference; name = "incallmanager_ringback.mp3"; path = "Ghostr/incallmanager_ringback.mp3"; sourceTree = "<group>"; fileEncoding = undefined; lastKnownFileType = unknown; explicitFileType = undefined; includeInIndex = 0; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -48,7 +64,7 @@
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
 				AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */,
-				F64B86C570894DC5B2F13B5B /* incallmanager_ringback.mp3 */,
+				3447DD8FEED24B22BC2E29CB /* incallmanager_ringback.mp3 */,
 			);
 			name = Ghostr;
 			sourceTree = "<group>";
@@ -93,10 +109,90 @@
 			isa = PBXGroup;
 			children = (
 				BB2F792C24A3F905000567C9 /* Expo.plist */,
+				68841FEF4AA14267A82E2304 /* ar.lproj */,
+				3B4D6AC087D844C796D8ECB9 /* de.lproj */,
+				8F32C830E7544449A99169BB /* en.lproj */,
+				B0E579E2D6B74C16BBEDCA69 /* es.lproj */,
+				09FEB147481F496F9D992909 /* fr.lproj */,
+				4EBE91A948574505B3CDD21D /* it.lproj */,
+				EF11D8D7749E49EEB5C0A779 /* ru.lproj */,
+				E47E432EFA614EFDA39DF34F /* ur.lproj */,
 			);
 			name = Supporting;
 			path = Ghostr/Supporting;
 			sourceTree = "<group>";
+		};
+		68841FEF4AA14267A82E2304 /* ar.lproj */ = {
+			isa = "PBXGroup";
+			children = (
+				4A68E593D2A249D9B352BFE5 /* InfoPlist.strings */,
+			);
+			name = ar.lproj;
+			sourceTree = "<group>";
+			path = "";
+		};
+		3B4D6AC087D844C796D8ECB9 /* de.lproj */ = {
+			isa = "PBXGroup";
+			children = (
+				5AD1316ECEFB454DB27E9CE2 /* InfoPlist.strings */,
+			);
+			name = de.lproj;
+			sourceTree = "<group>";
+			path = "";
+		};
+		8F32C830E7544449A99169BB /* en.lproj */ = {
+			isa = "PBXGroup";
+			children = (
+				32D5F08B1381402E96A1D1B0 /* InfoPlist.strings */,
+			);
+			name = en.lproj;
+			sourceTree = "<group>";
+			path = "";
+		};
+		B0E579E2D6B74C16BBEDCA69 /* es.lproj */ = {
+			isa = "PBXGroup";
+			children = (
+				5DC4DE6B383D4905B1171BD2 /* InfoPlist.strings */,
+			);
+			name = es.lproj;
+			sourceTree = "<group>";
+			path = "";
+		};
+		09FEB147481F496F9D992909 /* fr.lproj */ = {
+			isa = "PBXGroup";
+			children = (
+				F252782BAF294222B7AAA564 /* InfoPlist.strings */,
+			);
+			name = fr.lproj;
+			sourceTree = "<group>";
+			path = "";
+		};
+		4EBE91A948574505B3CDD21D /* it.lproj */ = {
+			isa = "PBXGroup";
+			children = (
+				E79ED183361D4653B3653AF3 /* InfoPlist.strings */,
+			);
+			name = it.lproj;
+			sourceTree = "<group>";
+			path = "";
+		};
+		EF11D8D7749E49EEB5C0A779 /* ru.lproj */ = {
+			isa = "PBXGroup";
+			children = (
+				6732214E61E94E478C49906D /* InfoPlist.strings */,
+			);
+			name = ru.lproj;
+			sourceTree = "<group>";
+			path = "";
+		};
+		E47E432EFA614EFDA39DF34F /* ur.lproj */ = {
+			isa = "PBXGroup";
+			children = (
+				5069A64277B042A3A8DCCE42 /* InfoPlist.strings */,
+			);
+			name = ur.lproj;
+			sourceTree = "<group>";
+			path = "";
 		};
 /* End PBXGroup section */
 
@@ -161,7 +257,15 @@
 				BB2F792D24A3F905000567C9 /* Expo.plist in Resources */,
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */,
-				429E55A453ED410CA9B8C131 /* incallmanager_ringback.mp3 in Resources */,
+				BB4AD5C539DD44BFBEE6B935 /* InfoPlist.strings in Resources */,
+				EB7EA3AF66434F21943F6550 /* InfoPlist.strings in Resources */,
+				0535CB9F53044306A4599EF7 /* InfoPlist.strings in Resources */,
+				9C03BB5C82AD40998BB093B7 /* InfoPlist.strings in Resources */,
+				2506E6306CA045CD91880447 /* InfoPlist.strings in Resources */,
+				01B09DE41D814975863321AA /* InfoPlist.strings in Resources */,
+				0F4E96C9582D494C9275787A /* InfoPlist.strings in Resources */,
+				FD40ED9E54F947A195537C10 /* InfoPlist.strings in Resources */,
+				E5E8580D90C94213A36E0819 /* incallmanager_ringback.mp3 in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

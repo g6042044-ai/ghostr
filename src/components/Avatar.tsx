@@ -6,15 +6,15 @@
 // - Support image base64 (photo de profil)
 // - Fallback sur initiales générées
 // - Couleur déterministe basée sur senderToken
-// - Indicateur de statut (en ligne, typing)
+// - Indicateur de statut (en ligne)
 // - Animation de chargement
 // - Badge de warning pour changement d'identité
 
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, ViewStyle, Image, Animated, ActivityIndicator } from 'react-native';
-import { generateColorFromToken, generateAvatarInitials } from '../services/crypto';
+import { View, Text, StyleSheet, ViewStyle, Image, ActivityIndicator } from 'react-native';
+import { generateAvatarInitials } from '../services/crypto';
 import { Ionicons } from '@expo/vector-icons';
-import { useThemedStyles, type ColorPalette } from './ui';
+import { useThemedStyles, getAvatarColor, type ColorPalette } from './ui';
 
 // ============================================
 // TYPES
@@ -32,7 +32,6 @@ interface AvatarProps {
   
   // États
   isOnline?: boolean;
-  isTyping?: boolean;
   showWarning?: boolean;        // Badge d'alerte (changement d'identité)
   
   // Personnalisation
@@ -55,21 +54,9 @@ const SIZES = {
   call: { container: 110, text: 38, badge: 22, onlineBadge: 20, border: 3 },
 };
 
-// Palette WhatsApp-like pour les avatars
-const WHATSAPP_AVATAR_COLORS = [
-  '#00A884', // WhatsApp teal
-  '#FF6B6B', // Rouge corail
-  '#4ECDC4', // Turquoise
-  '#45B7D1', // Bleu ciel
-  '#96CEB4', // Vert menthe
-  '#F7DC6F', // Jaune
-  '#BB8FCE', // Violet
-  '#85C1E9', // Bleu poudre
-  '#F8B500', // Ambre
-  '#00CED1', // Cyan
-  '#E74C3C', // Rouge vif
-  '#9B59B6', // Violet foncé
-];
+// La palette locale `WHATSAPP_AVATAR_COLORS` a été supprimée : elle était
+// l'une des trois palettes d'avatars concurrentes du projet. La couleur vient
+// désormais de `getAvatarColor` (design system), commune à tous les écrans.
 
 // ============================================
 // COMPOSANT PRINCIPAL
@@ -82,7 +69,6 @@ export function Avatar({
   size = 'medium',
   style,
   isOnline = false,
-  isTyping = false,
   showWarning = false,
   backgroundColor,
   textColor = '#FFFFFF',
@@ -93,7 +79,6 @@ export function Avatar({
   const dimensions = SIZES[size];
   const [imageLoading, setImageLoading] = useState(false);
   const [imageError, setImageError] = useState(false);
-  const pulseAnim = React.useRef(new Animated.Value(1)).current;
   
   // v27.1: Reset l'état d'erreur quand l'URI change.
   // Sans ça, si le chargement précédent échouait, le nouvel avatar
@@ -109,37 +94,13 @@ export function Avatar({
     setImageError(false);
   }, [avatarUri]);
   
-  // Animation de pulsation pour le typing
-  useEffect(() => {
-    if (isTyping) {
-      const pulse = Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, {
-            toValue: 1.05,
-            duration: 600,
-            useNativeDriver: true,
-          }),
-          Animated.timing(pulseAnim, {
-            toValue: 1,
-            duration: 600,
-            useNativeDriver: true,
-          }),
-        ])
-      );
-      pulse.start();
-      return () => pulse.stop();
-    } else {
-      pulseAnim.setValue(1);
-    }
-  }, [isTyping]);
-  
   // Générer les initiales
   const initials = generateAvatarInitials(displayName, senderToken);
   
-  // Générer la couleur à partir du senderToken (déterministe)
-  const bgColor = backgroundColor || (senderToken 
-    ? generateColorFromToken(senderToken)
-    : WHATSAPP_AVATAR_COLORS[0]);
+  // Couleur déterministe issue du senderToken. `getAvatarColor` gère déjà le
+  // cas de la chaîne vide en renvoyant la première teinte de la palette, donc
+  // pas besoin de branche de repli ici.
+  const bgColor = backgroundColor || getAvatarColor(senderToken || '');
   
   // Vérifier si on a une image valide
   const hasValidImage = avatarUri && !imageError;
@@ -154,11 +115,10 @@ export function Avatar({
   };
   
   return (
-    <Animated.View
+    <View
       style={[
         styles.container,
         containerStyle,
-        { transform: [{ scale: pulseAnim }] },
         style,
       ]}
     >
@@ -206,7 +166,7 @@ export function Avatar({
       )}
       
       {/* Indicateur en ligne */}
-      {isOnline && !isTyping && (
+      {isOnline && (
         <View
           style={[
             styles.onlineBadge,
@@ -218,23 +178,6 @@ export function Avatar({
             },
           ]}
         />
-      )}
-      
-      {/* Indicateur typing */}
-      {isTyping && (
-        <View
-          style={[
-            styles.typingBadge,
-            {
-              width: dimensions.onlineBadge + 4,
-              height: dimensions.onlineBadge + 4,
-              borderRadius: (dimensions.onlineBadge + 4) / 2,
-              borderWidth: dimensions.border,
-            },
-          ]}
-        >
-          <TypingDots size={dimensions.onlineBadge - 4} />
-        </View>
       )}
       
       {/* Badge d'alerte */}
@@ -252,84 +195,9 @@ export function Avatar({
           <Text style={[styles.warningIcon, { fontSize: dimensions.badge - 4 }]}>!</Text>
         </View>
       )}
-    </Animated.View>
-  );
-}
-
-// ============================================
-// COMPOSANT TYPING DOTS
-// ============================================
-
-interface TypingDotsProps {
-  size: number;
-}
-
-const TypingDots: React.FC<TypingDotsProps> = ({ size }) => {
-  const styles = useThemedStyles(makeStyles);
-  const dot1 = React.useRef(new Animated.Value(0)).current;
-  const dot2 = React.useRef(new Animated.Value(0)).current;
-  const dot3 = React.useRef(new Animated.Value(0)).current;
-  
-  useEffect(() => {
-    const animateDot = (dot: Animated.Value, delay: number) => {
-      return Animated.loop(
-        Animated.sequence([
-          Animated.delay(delay),
-          Animated.timing(dot, {
-            toValue: 1,
-            duration: 300,
-            useNativeDriver: true,
-          }),
-          Animated.timing(dot, {
-            toValue: 0,
-            duration: 300,
-            useNativeDriver: true,
-          }),
-        ])
-      );
-    };
-    
-    const animations = [
-      animateDot(dot1, 0),
-      animateDot(dot2, 150),
-      animateDot(dot3, 300),
-    ];
-    
-    animations.forEach(a => a.start());
-    
-    return () => animations.forEach(a => a.stop());
-  }, []);
-  
-  const dotSize = Math.max(2, size / 4);
-  
-  return (
-    <View style={styles.typingDotsContainer}>
-      {[dot1, dot2, dot3].map((dot, index) => (
-        <Animated.View
-          key={index}
-          style={[
-            styles.typingDot,
-            {
-              width: dotSize,
-              height: dotSize,
-              borderRadius: dotSize / 2,
-              opacity: dot.interpolate({
-                inputRange: [0, 1],
-                outputRange: [0.3, 1],
-              }),
-              transform: [{
-                scale: dot.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [0.8, 1.2],
-                }),
-              }],
-            },
-          ]}
-        />
-      ))}
     </View>
   );
-};
+}
 
 // ============================================
 // COMPOSANT AVATAR GROUPE
@@ -418,25 +286,6 @@ const makeStyles = (colors: ColorPalette) => ({
     right: 0,
     backgroundColor: colors.online,
     borderColor: colors.background,
-  },
-
-  // Typing badge
-  typingBadge: {
-    position: 'absolute' as const,
-    bottom: -2,
-    right: -2,
-    backgroundColor: colors.surfaceLight,
-    borderColor: colors.background,
-    alignItems: 'center' as const,
-    justifyContent: 'center' as const,
-  },
-  typingDotsContainer: {
-    flexDirection: 'row' as const,
-    alignItems: 'center' as const,
-    gap: 1,
-  },
-  typingDot: {
-    backgroundColor: colors.typing,
   },
 
   // Warning badge — state colour (warning yellow). Stays yellow on both

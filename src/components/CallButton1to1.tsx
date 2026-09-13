@@ -3,11 +3,11 @@
 // Version 1.0 - Utilise useCall1to1
 
 import { useState, useRef } from 'react';
-import { TouchableOpacity, ActivityIndicator, Animated, Alert } from 'react-native';
+import { TouchableOpacity, ActivityIndicator, Animated } from 'react-native';
 import Svg, { Path } from 'react-native-svg';
 import { useTranslation } from 'react-i18next';
 import { useCall1to1 } from '../hooks/useCall1to1';
-import { useTheme, useThemedStyles, type ColorPalette } from './ui';
+import { useTheme, useThemedStyles, type ColorPalette, showAlert } from './ui';
 
 // ============================================
 // TYPES
@@ -93,20 +93,18 @@ export function CallButton1to1({
       const result = await startCall(sessionId, contactName);
 
       if (!result.success) {
-        Alert.alert(
-          t('common.error'),
-          result.error || t('contactInfo.callError'),
-          [{ text: t('common.ok') }]
-        );
+        showAlert({
+          title: t('common.error'),
+          message: result.error || t('contactInfo.callError'),
+        });
       }
 
     } catch (error) {
       console.error('[CallButton1to1] Start call error:', error);
-      Alert.alert(
-        t('common.error'),
-        t('contactInfo.callGenericError'),
-        [{ text: t('common.ok') }]
-      );
+      showAlert({
+        title: t('common.error'),
+        message: t('contactInfo.callGenericError'),
+      });
     } finally {
       setIsStarting(false);
     }

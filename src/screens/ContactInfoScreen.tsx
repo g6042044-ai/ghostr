@@ -29,6 +29,7 @@ import { useTranslation } from 'react-i18next';
 import { sessionService } from '../services/tripleRatchet/sessionService';
 import { clearLocalMessages1to1, clearUnreadCount } from '../services/api1to1';
 import * as groupService from '../services/groupService';
+import { GROUPS_ENABLED } from '../config/features';
 import { useCall1to1 } from '../hooks/useCall1to1';
 import { isInCall1to1 } from '../services/call1to1Service';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -184,8 +185,13 @@ export const ContactInfoScreen: React.FC = () => {
       // 1:1. Sinon, supprimer la session briserait la messagerie de
       // groupe vers lui (perte de données). La conversation vidée
       // disparaît de la liste (filtre « vide + dans un groupe »).
+      //
+      // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. Même règle que dans
+      // ConversationListScreen.handleDelete : sans groupes, il n'y a aucune
+      // messagerie mesh à préserver et le filtre de masquage est inactif — on
+      // supprime donc réellement la session.
       const fp = sessionService.getSession(sessionId)?.theirIdentityKeyFingerprint;
-      if (!fp || !groupService.isContactInAnyGroup(fp)) {
+      if (!fp || !GROUPS_ENABLED || !groupService.isContactInAnyGroup(fp)) {
         await sessionService.deleteSession(sessionId);
       }
       navigation.goBack();
@@ -238,7 +244,8 @@ export const ContactInfoScreen: React.FC = () => {
       try { await AsyncStorage.removeItem(`@ghostr_reactions_${sessionId}`); } catch {}
       // Même règle que handleDelete : préserver la session si le contact est
       // membre d'un groupe (transport mesh), sinon suppression complète.
-      if (!fp || !groupService.isContactInAnyGroup(fp)) {
+      // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts, idem ci-dessus.
+      if (!fp || !GROUPS_ENABLED || !groupService.isContactInAnyGroup(fp)) {
         await sessionService.deleteSession(sessionId);
       }
       navigation.goBack();

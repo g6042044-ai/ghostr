@@ -210,6 +210,10 @@
     "downloading": "Downloading…",
     "tapToDownload": "Tap to download",
     "tapToDownloadWithSize": "{{size}} — Tap to download",
+    "tapToRetry": "Tap to retry",
+    "decrypting": "Decrypting…",
+    "file": "File",
+    "tap": "Tap",
     "encryptedSending": "Encrypted send…",
     "encryptedBeforeSending": "🔐 Encrypted before sending",
     "networkError": "Network error",
@@ -841,7 +845,8 @@
     "hoursAgoFull": "{{count}}h ago"
   },
   "input": {
-    "enterCode": "Enter the code…"
+    "enterCode": "Enter the code…",
+    "searchPlaceholder": "Search…"
   },
   "migrationLockdown": {
     "heroTitle": "Migration in progress",
@@ -1043,6 +1048,8 @@
     "longPressHint": "Long-press a member to manage them.",
     "inviteByQR": "Invite via QR",
     "adminOnly": "Only an admin can invite.",
+    "adminOnlyAction": "Only an admin can do this.",
+    "inviteFailed": "Could not generate the invitation.",
     "share": "Share",
     "copyLink": "Copy",
     "linkCopied": "Link copied",

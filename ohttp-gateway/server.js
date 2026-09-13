@@ -64,6 +64,9 @@ const ALLOWED_RPCS = new Set([
   // App notice (kill-switch / deprecation banner) — payload signé Ed25519,
   // forward direct vers Supabase RPC public.get_app_notice().
   'get_app_notice',
+  // Guideline 1.2 (App Store) : signalement volontaire de contenu par le
+  // destinataire. Forward direct vers Supabase RPC public.submit_report().
+  'submit_report',
 ]);
 
 // ============================================
@@ -352,6 +355,7 @@ const RATE_LIMIT_RULES = {
   send_sig:  30,
   read_msg:  60,
   read_sig:  60,
+  report:    5,
 };
 
 // Map<key, { count, windowStart }> — key = `${type}:${tag}` ou `${type}:${certNonce}`
@@ -1727,6 +1731,26 @@ async function requestHandlerInner(req, res) {
           }
         }
         bumpMetric(rlType === 'read_msg' ? 'rpc_get_messages' : 'rpc_get_call_signals');
+        bumpMetric('rpc_total');
+      }
+
+      // Guideline 1.2 : rate limit gateway-level des signalements par
+      // reporter_tag (defense-in-depth, le check_rate_limit SQL reste la
+      // référence en multi-instance).
+      if (request.rpc === 'submit_report') {
+        const reporterTag = (request.params && request.params.p_reporter_tag) || '';
+        if (typeof reporterTag === 'string' && reporterTag.length >= 8 && reporterTag.length <= 64) {
+          if (!gatewayCheckRateLimit('report', reporterTag)) {
+            bumpMetric('err_rate_limit_gateway');
+            const errResp = encryptResponse(
+              JSON.stringify({ data: null, error: 'Rate limit exceeded (gateway)' }),
+              ephemeralPubKey, usedSecretKey
+            );
+            res.writeHead(429, { 'Content-Type': 'application/octet-stream' });
+            res.end(Buffer.from(errResp));
+            return;
+          }
+        }
         bumpMetric('rpc_total');
       }
 

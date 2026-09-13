@@ -16,7 +16,7 @@
 // Audit Fix M-02: L'import direct de supabase a été supprimé.
 // Toutes les opérations passent par secureRpc() via le relay OHTTP.
 import { sessionService, StoredSession, encodeBase64 } from './tripleRatchet';
-import { LocalMessage } from './storage';
+import { LocalMessage, registerLockHook } from './storage';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState } from 'react-native';
 import { getRandomBytes } from './crypto';
@@ -28,14 +28,15 @@ import { reportChunkingReceiveProgress, reportChunkingReceiveComplete, startProg
 import { requirePinningOrThrow } from './networkSecurity';
 import { startConstantTraffic, stopConstantTraffic, enqueueMessage, getPollGeneration } from './constantTraffic';
 // Audit Fix C-01: Sealed Sender
-import { isSealedSenderReady, createSealedSenderEnvelope, invalidateSenderCertificate, SenderCertificate, ensureSealedSenderBootstrap as _ssEnsureBootstrap, resetSealedSenderBootstrap as _ssResetBootstrap, setSealedSenderCertificateFetcher, subscribeSealedSenderState } from './sealedSender';
+import { isSealedSenderReady, createSealedSenderEnvelope, invalidateSenderCertificate, SenderCertificate, ensureSealedSenderBootstrap as _ssEnsureBootstrap, resetSealedSenderBootstrap as _ssResetBootstrap, setSealedSenderCertificateFetcher, setSealedSenderCacheHooks, subscribeSealedSenderState } from './sealedSender';
+import { loadSealedSenderCache, saveSealedSenderCache, clearSealedSenderCache } from './sealedSenderCache';
 import { secureRpc } from './relayTransport';
 // Push Notifications — Sender-Side Architecture
 import { createPushBlobForPeer, generateRandomPushBlob, getOwnPushTokenInfo, storePeerPushToken } from './pushNotificationService';
 // v20.0: SHA-256 pour le tag de session (remplace XOR faible)
 import { sha256 } from '@noble/hashes/sha256';
 import * as Crypto from 'expo-crypto';
-import { externalizeMedia, migrateMessagesToFileStore, clearAllMediaFiles, deleteSessionMedia, resolveMediaToBase64, isMediaRef } from './mediaFileStore';
+import { externalizeMedia, migrateMessagesToFileStore, clearAllMediaFiles, deleteSessionMedia, deleteMediaFiles, resolveMediaToBase64, isMediaRef } from './mediaFileStore';
 // Mute service — filtre les notifications par conversation
 import { isSessionMutedSync, clearMuteState } from './muteService';
 // P7 FIX: Import blob upload for media retry
@@ -43,6 +44,19 @@ import { encryptAndUploadBlob, base64ToUint8Array } from './encryptedBlobService
 // PHASE 1: Epoch tags (rotation 5min) — legacy
 // ACTION 3: Tags directionnels asymétriques avec rotation 24h
 import { deriveTagSeed, getDirectionalSendTag, getDirectionalReceiveTags, csprngShuffle as csprngShuffleArray } from './epochTags';
+// v29.0: Couche de fiabilité de livraison (outbox ACK-driven + retransmission)
+import {
+  loadOutbox as reliabilityLoadOutbox,
+  trackOutbound as reliabilityTrack,
+  markAcked as reliabilityMarkAcked,
+  dropOutbox as reliabilityDrop,
+  dropOutboxForSession as reliabilityDropSession,
+  clearOutbox as reliabilityClearOutbox,
+  reliabilityTick,
+  setResendHandler as reliabilitySetResendHandler,
+  setGiveUpHandler as reliabilitySetGiveUpHandler,
+  ResendOutcome,
+} from './reliabilityService';
 // v26.0: Service de relai pour polling des pending session tags
 
 // ============================================
@@ -54,6 +68,7 @@ const LAST_POLL_PREFIX = 'ghostr_1to1_lastpoll_';
 const PROCESSED_IDS_PREFIX = 'ghostr_1to1_processed_';
 const STATUS_PREFIX = 'ghostr_1to1_status_';
 const UNREAD_COUNT_PREFIX = 'ghostr_1to1_unread_'; // v6.1: Compteur messages non lus
+const DELETED_IDS_PREFIX = 'ghostr_1to1_deleted_'; // Suppression locale: ids de messages supprimés (tombstones)
 
 // Padding pour messages normaux (texte, réactions, accusés)
 // ACTION 18: PADDED_MESSAGE_SIZE supprimé — remplacé par UNIFORM_PADDING_TIERS (voir addUniformPadding)
@@ -68,26 +83,38 @@ const UNREAD_COUNT_PREFIX = 'ghostr_1to1_unread_'; // v6.1: Compteur messages no
  * FAIL-SAFE: si le déchiffrement échoue pour quelque raison que ce soit,
  * retourne null au lieu de throw (le caller gère null comme "pas de données").
  */
+/**
+ * Déchiffre une valeur DÉJÀ lue depuis AsyncStorage.
+ *
+ * Extrait de `secureGet` pour être réutilisable par les lectures groupées
+ * (`multiGet`), qui récupèrent les valeurs brutes en un seul aller-retour natif
+ * et n'ont donc plus de `getItem` à faire par clé.
+ *
+ * FAIL-SAFE : retourne null plutôt que de lever, dans tous les cas d'échec.
+ */
+function decryptStoredValue(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    // FIX migration: utiliser hasAnyEncryptionKey() (PIN OR hardware) au lieu
+    // de isEncryptionEnabled() (PIN only). Sans ça, après un import de
+    // migration sans PIN, hardwareKey est en RAM mais encryptionKey est null
+    // → ce guard retournait null sur TOUTES les entrées chiffrées → messages
+    // invisibles, envoi/réception cassés. Voir hasAnyEncryptionKey() pour
+    // l'historique complet.
+    if (raw.startsWith('enc1:') && !hasAnyEncryptionKey()) {
+      return null; // Clé pas encore disponible (startup avant unlock)
+    }
+    return decryptIfNeeded(raw);
+  } catch {
+    // Déchiffrement échoué: donnée corrompue ou clé invalide
+    // Retourner null pour que le caller utilise ses valeurs par défaut
+    return null;
+  }
+}
+
 async function secureGet(key: string): Promise<string | null> {
   try {
-    const raw = await AsyncStorage.getItem(key);
-    if (!raw) return null;
-    try {
-      // FIX migration: utiliser hasAnyEncryptionKey() (PIN OR hardware) au lieu
-      // de isEncryptionEnabled() (PIN only). Sans ça, après un import de
-      // migration sans PIN, hardwareKey est en RAM mais encryptionKey est null
-      // → ce guard retournait null sur TOUTES les entrées chiffrées → messages
-      // invisibles, envoi/réception cassés. Voir hasAnyEncryptionKey() pour
-      // l'historique complet.
-      if (raw.startsWith('enc1:') && !hasAnyEncryptionKey()) {
-        return null; // Clé pas encore disponible (startup avant unlock)
-      }
-      return decryptIfNeeded(raw);
-    } catch {
-      // Déchiffrement échoué: donnée corrompue ou clé invalide
-      // Retourner null pour que le caller utilise ses valeurs par défaut
-      return null;
-    }
+    return decryptStoredValue(await AsyncStorage.getItem(key));
   } catch {
     return null;
   }
@@ -102,6 +129,270 @@ async function secureSet(key: string, value: string): Promise<void> {
   const encrypted = encryptIfEnabled(value);
   await AsyncStorage.setItem(key, encrypted);
 }
+
+// ============================================
+// INDEX DES APERÇUS DE DERNIER MESSAGE (correctif perf démarrage)
+// ============================================
+//
+// PROBLÈME RÉSOLU
+// ───────────────
+// `ConversationListScreen` construisait sa liste ainsi, au premier chargement :
+//
+//     sessions.map(async (session) => {
+//       const messages = await getLocalMessages1to1(session.id);   // ← tout l'historique
+//       const sorted = messages.sort((a, b) => b.timestamp - a.timestamp);
+//       lastMessage = messageToLastInfo(sorted[0]);                 // ← on n'en garde QU'UN
+//     })
+//
+// Autrement dit : pour afficher une ligne d'aperçu par conversation, on lisait
+// sur disque, déchiffrait, parsait en JSON et triait l'INTÉGRALITÉ de chaque
+// historique — jusqu'à 1000 messages par conversation, médias externalisés mis
+// à part mais avatars des messages reçus inclus. Avec 30 conversations d'environ
+// 1 Mo, cela représente ~30 Mo déchiffrés et parsés sur le thread JS avant que
+// le premier pixel de la liste ne s'affiche. Et comme `sessions.map` lance
+// toutes les promesses d'un coup, le pont natif reçoit N getItem simultanés.
+//
+// SOLUTION
+// ────────
+// Un index unique, léger, tenu à jour à l'écriture : UNE entrée AsyncStorage
+// contenant `{ sessionId → stub }`. La liste se charge alors avec un seul
+// getItem de quelques kilo-octets au lieu de N lectures massives.
+//
+// CE QUI N'EST PAS STOCKÉ
+// ───────────────────────
+// Surtout pas le texte d'aperçu déjà traduit : `messageToLastInfo` utilise
+// `t()` pour produire « Photo », « Message vocal », etc. Figer ce texte
+// casserait le changement de langue à chaud. On persiste donc les champs BRUTS
+// dont `messageToLastInfo` a besoin, et l'écran continue de faire la mise en
+// forme lui-même.
+//
+// COHÉRENCE
+// ─────────
+// L'index est un CACHE, jamais une source de vérité. S'il est absent, vide ou
+// incohérent, l'écran retombe sur la lecture complète (et repeuple l'index au
+// passage). Aucune perte de données possible : la vérité reste
+// `ghostr_1to1_messages_<sessionId>`.
+
+const LAST_PREVIEW_KEY = 'ghostr_1to1_previews_v1';
+
+/** Longueur max du texte conservé dans l'aperçu (la liste tronque de toute façon). */
+const PREVIEW_CONTENT_MAX = 200;
+
+/** Champs bruts nécessaires à `messageToLastInfo` côté écran. */
+export interface LastMessageStub {
+  content: string;
+  timestamp: number;
+  isMine: boolean;
+  status?: string;
+  /** Type déjà résolu à l'écriture (image/file/voice déduits des données jointes). */
+  messageType?: string;
+  fileName?: string;
+}
+
+/** Cache mémoire de l'index. `null` = pas encore chargé depuis le disque. */
+let _previewIndex: Record<string, LastMessageStub> | null = null;
+let _previewDirty = false;
+let _previewFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Écritures groupées : une rafale de messages ne provoque qu'un seul setItem. */
+const PREVIEW_FLUSH_DELAY_MS = 250;
+
+/**
+ * Charge l'index d'aperçus, avec mise en cache mémoire.
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * NE JAMAIS METTRE EN CACHE UN ÉCHEC DE LECTURE
+ * ════════════════════════════════════════════════════════════════════════════
+ * `secureGet` renvoie `null` aussi bien pour « aucune entrée » que pour
+ * « entrée présente mais indéchiffrable » (clé pas encore active, données
+ * corrompues). Confondre les deux et mémoriser `{}` a deux conséquences :
+ *
+ *   1. AFFICHAGE — l'index paraît vide pour toute la session : chaque
+ *      conversation retombe sur la lecture de son historique COMPLET
+ *      (déchiffrement + JSON.parse de tout le fil), soit précisément le coût
+ *      que cet index existe pour supprimer. Symptôme : les aperçus de la liste
+ *      mettent des secondes à apparaître.
+ *   2. DESTRUCTION — la première écriture (`updateLastMessagePreview` +
+ *      flush) écrirait `{une seule entrée}` par-dessus l'index complet.
+ *
+ * On distingue donc les deux cas : absence d'entrée = état légitime, mis en
+ * cache ; échec de déchiffrement = transitoire, on renvoie un index vide SANS
+ * le mémoriser, pour que l'appel suivant retente. Un JSON corrompu, lui, est
+ * définitif : l'index se reconstruit tout seul au fil des messages.
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+async function loadPreviewIndex(): Promise<Record<string, LastMessageStub>> {
+  if (_previewIndex) return _previewIndex;
+
+  let raw: string | null;
+  try {
+    raw = await AsyncStorage.getItem(LAST_PREVIEW_KEY);
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] Index d\'aperçus illisible (stockage), réessai plus tard:', e);
+    return {};
+  }
+
+  // Aucune entrée : état légitime et définitif (rien n'a encore été écrit).
+  if (!raw) {
+    _previewIndex = {};
+    return _previewIndex;
+  }
+
+  const json = decryptStoredValue(raw);
+  if (json === null) {
+    // Entrée présente mais indéchiffrable → transitoire, pas de mise en cache.
+    __DEV__ && console.warn('[api1to1] Index d\'aperçus non déchiffrable (clé pas prête ?), réessai plus tard');
+    return {};
+  }
+
+  try {
+    _previewIndex = JSON.parse(json);
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] Index d\'aperçus corrompu, réinitialisé:', e);
+    _previewIndex = {};
+  }
+  return _previewIndex!;
+}
+
+/**
+ * Écrit l'index sur disque immédiatement.
+ *
+ * SÛRETÉ — pourquoi le garde `hasAnyEncryptionKey()` :
+ * `encryptIfEnabled()` renvoie le texte EN CLAIR s'il n'y a aucune clé
+ * disponible. Un flush déclenché après `clearEncryptionKey()` (verrouillage,
+ * passage en arrière-plan) écrirait donc les aperçus — donc des extraits de
+ * messages — en clair dans AsyncStorage. On refuse purement et simplement
+ * d'écrire dans ce cas : l'index n'est qu'un cache, il se reconstruira au
+ * prochain message. Perdre un aperçu est sans conséquence, en fuiter un ne
+ * l'est pas.
+ *
+ * ORDONNANCEMENT — tout ce qui précède le premier `await` s'exécute de façon
+ * synchrone, y compris le chiffrement effectué par `secureSet`. Appeler
+ * `flushLastMessagePreviews()` en tête d'un handler AppState garantit donc que
+ * le chiffrement a lieu avant tout `clearEncryptionKey()` situé plus bas dans
+ * le même handler.
+ */
+export async function flushLastMessagePreviews(): Promise<void> {
+  if (_previewFlushTimer) {
+    clearTimeout(_previewFlushTimer);
+    _previewFlushTimer = null;
+  }
+  if (!_previewDirty || !_previewIndex) return;
+
+  if (!hasAnyEncryptionKey()) {
+    // Plus de clé : on abandonne les aperçus en attente plutôt que de les
+    // écrire en clair. `_previewDirty` reste à true — si une clé redevient
+    // disponible avant le prochain flush, l'écriture aura bien lieu.
+    __DEV__ && console.log('[api1to1] Flush d\'aperçus ignoré : aucune clé de chiffrement');
+    return;
+  }
+
+  _previewDirty = false;
+  try {
+    await secureSet(LAST_PREVIEW_KEY, JSON.stringify(_previewIndex));
+  } catch (e) {
+    // On remet le drapeau : une prochaine écriture retentera.
+    _previewDirty = true;
+    __DEV__ && console.warn('[api1to1] Échec d\'écriture de l\'index d\'aperçus:', e);
+  }
+}
+
+function schedulePreviewFlush(): void {
+  _previewDirty = true;
+  if (_previewFlushTimer) return;
+  _previewFlushTimer = setTimeout(() => {
+    _previewFlushTimer = null;
+    void flushLastMessagePreviews();
+  }, PREVIEW_FLUSH_DELAY_MS);
+}
+
+/** Déduit le type effectif d'un message pour l'aperçu. */
+function resolvePreviewType(msg: any): string | undefined {
+  if (msg.messageType === 'image' || msg.imageData) return 'image';
+  if (msg.messageType === 'file' || msg.fileData) return 'file';
+  if (msg.messageType === 'voice' || msg.voiceData) return 'voice';
+  return msg.messageType;
+}
+
+/**
+ * Met à jour l'aperçu d'une session si le message fourni est le plus récent.
+ * Idempotent et non bloquant : n'échoue jamais bruyamment, l'aperçu n'étant
+ * qu'un cache d'affichage.
+ */
+export async function updateLastMessagePreview(sessionId: string, msg: any): Promise<void> {
+  try {
+    if (!msg || typeof msg.timestamp !== 'number') return;
+    const index = await loadPreviewIndex();
+    const current = index[sessionId];
+    // `>=` et non `>` : un ré-enregistrement du même message (mise à jour de
+    // statut, téléchargement de média) doit rafraîchir l'aperçu.
+    if (current && current.timestamp > msg.timestamp) return;
+
+    const content = typeof msg.content === 'string'
+      ? msg.content.slice(0, PREVIEW_CONTENT_MAX)
+      : '';
+
+    index[sessionId] = {
+      content,
+      timestamp: msg.timestamp,
+      isMine: !!msg.isMine,
+      status: msg.status,
+      messageType: resolvePreviewType(msg),
+      fileName: msg.fileName,
+    };
+    schedulePreviewFlush();
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] updateLastMessagePreview:', e);
+  }
+}
+
+/** Supprime l'aperçu d'une session (purge d'historique, suppression de contact). */
+export async function clearLastMessagePreview(sessionId: string): Promise<void> {
+  try {
+    const index = await loadPreviewIndex();
+    if (index[sessionId]) {
+      delete index[sessionId];
+      schedulePreviewFlush();
+    }
+  } catch { /* cache d'affichage : échec non bloquant */ }
+}
+
+/**
+ * Renvoie tous les aperçus connus, en UNE lecture.
+ * Une session absente signifie « aperçu inconnu » — l'appelant doit alors
+ * retomber sur `getLocalMessages1to1` pour cette session-là uniquement.
+ */
+export async function getAllLastMessagePreviews(): Promise<Record<string, LastMessageStub>> {
+  return { ...(await loadPreviewIndex()) };
+}
+
+/** Vide le cache mémoire (au verrouillage de l'app : plus rien en clair en RAM). */
+export function resetLastMessagePreviewCache(): void {
+  if (_previewFlushTimer) {
+    clearTimeout(_previewFlushTimer);
+    _previewFlushTimer = null;
+  }
+  _previewIndex = null;
+  _previewDirty = false;
+}
+
+// Purge automatique au verrouillage, via le registre de hooks de storage.ts.
+// Ce registre existe précisément pour éviter le cycle d'import
+// storage.ts ↔ modules tiers ; `sessionService` l'utilise déjà de la même façon.
+//
+// Le hook est SYNCHRONE et ne fait que jeter le cache mémoire : il ne tente
+// PAS d'écrire. `clearEncryptionKey()` a déjà effacé la clé au moment où les
+// hooks sont invoqués (elle est effacée en première ligne de la fonction),
+// donc toute écriture ici partirait en clair. Les aperçus non encore persistés
+// sont abandonnés — sans conséquence, l'index se reconstruit au message suivant.
+// La persistance ordonnée se fait en amont, au passage en arrière-plan
+// (cf. App.tsx), pendant que la clé est encore disponible.
+registerLockHook(() => {
+  resetLastMessagePreviewCache();
+  // Tombstones de suppression locale : cache mémoire jeté au verrouillage
+  // (il se recharge depuis le disque, déchiffré, au prochain accès déverrouillé)
+  _deletedIdsCache.clear();
+});
 
 // ============================================
 // TYPES DE MESSAGES
@@ -122,14 +413,43 @@ export type MessageType =
   | 'handshake_ack'    // Accusé de réception du handshake
   | 'media_chunk'      // v25.0: Legacy — réception uniquement (backward compat)
   | 'push_token_update' // v2.0: Partage du push token via E2E
-  | 'mute_preference';  // v28.0: Sync de la préférence mute via E2E → bloque le push côté émetteur
+  | 'mute_preference'   // v28.0: Sync de la préférence mute via E2E → bloque le push côté émetteur
+  | 'catch_up_request'  // v29.0: Demande de rattrapage (Phase 2) — le pair renvoie les messages postérieurs à un timestamp
+  // ── v30.0: Conversations de groupe (Phase 3) ──
+  | 'group_msg'             // Message de contenu de groupe (VISIBLE) — porte un GroupCiphertext
+  | 'group_welcome'         // Admin → nouveau membre : roster + groupSeed + senderKeys (guaranteed)
+  | 'group_senderkey'       // Membre → membre : distribution/rotation de sa senderKey (guaranteed)
+  | 'group_member_added'    // Admin → membres : un membre a rejoint (guaranteed)
+  | 'group_member_removed'  // Admin → membres : un membre a été retiré → rotation (guaranteed)
+  | 'group_member_promoted' // Admin → membres : promotion co-admin (guaranteed)
+  | 'group_meta_update'     // Admin → membres : nom/avatar/description changé
+  | 'group_join_request'    // Joiner → admin : demande de jonction (preuve de ticket)
+  | 'group_join_response'   // Admin → joiner : approbation/refus
+  | 'group_key_request'     // Membre → membre : redemande une senderKey manquante (trou)
+  | 'group_roster_sync_request' // Membre → admin : demande l'état courant du roster (réconciliation)
+  | 'group_roster_state'    // Admin → membre : état complet du roster + clés (réconciliation)
+  | 'group_leave';          // Membre → membres : départ volontaire
 
 // v20.0: Types de messages de protocole à ne jamais afficher dans l'UI
 const PROTOCOL_MESSAGE_TYPES: MessageType[] = [
   'handshake_ack',
   'media_chunk',
   'push_token_update', // Invisible dans l'UI
+  // v30.0: messages de contrôle de groupe — invisibles (group_msg reste VISIBLE)
+  'group_welcome',
+  'group_senderkey',
+  'group_member_added',
+  'group_member_removed',
+  'group_member_promoted',
+  'group_meta_update',
+  'group_join_request',
+  'group_join_response',
+  'group_key_request',
+  'group_roster_sync_request',
+  'group_roster_state',
+  'group_leave',
   'mute_preference',   // v28.0: Invisible dans l'UI
+  'catch_up_request',  // v29.0: Invisible dans l'UI (message de protocole)
 ];
 
 // ============================================
@@ -250,11 +570,14 @@ export interface Message1to1 {
   blobNonce?: string;    // Nonce (base64)
   blobSize?: number;     // Taille du ciphertext avant padding
   blobMediaType?: 'image' | 'file' | 'voice'; // Type de média original
-  
+
+  // v30.0: Groupes — présent sur les messages de groupe (stockés sous groupId).
+  groupId?: string;      // si défini, ce message appartient à un groupe
+  isSystem?: boolean;    // bandeau système (X a rejoint, etc.) — rendu centré, non chiffré
 }
 
 // Structure du payload INTERNE (chiffré)
-interface InnerPayload {
+export interface InnerPayload {
   // Commun
   type: MessageType;
   content: string;
@@ -858,7 +1181,9 @@ async function setMessageStatus(
 // ENVOI DE MESSAGES - FONCTION GÉNÉRIQUE
 // ============================================
 
-async function sendInnerPayload(
+// v29.0: Exporté pour apiGroups (fan-out de groupe réutilise EXACTEMENT ce
+// pipeline : padding → Triple Ratchet → sealed sender → trafic constant).
+export async function sendInnerPayload(
   sessionId: string,
   innerPayload: InnerPayload,
   priority: 'normal' | 'urgent' | 'deferred' = 'normal'
@@ -2136,6 +2461,11 @@ async function doFetchMessages1to1(
       } catch {
         continue;
       }
+      // ROBUSTESSE : un payload qui parse en null/non-objet (ex: "null")
+      // planterait sur sealedPayload.type ci-dessous. On l'ignore proprement.
+      if (!sealedPayload || typeof sealedPayload !== 'object') {
+        continue;
+      }
       
       // Ignorer les messages de handshake X3DH/PQXDH
       // FIX: les marquer comme traités pour ne pas les re-parser à chaque poll
@@ -2334,6 +2664,13 @@ async function doFetchMessages1to1(
             await setMessageStatus(sessionId, msgId, 'delivered');
           }
           notifyStatusChange(sessionId, message.readMessageIds, 'delivered');
+          // v29.0: L'ACK libère l'outbox (sémantique Sesame). Le destinataire
+          // = expéditeur du receipt → on lève la retransmission de NOS messages
+          // qu'il vient de confirmer.
+          try {
+            const fp = sessionService.getSession(sessionId)?.theirIdentityKeyFingerprint;
+            if (fp) reliabilityMarkAcked(fp, message.readMessageIds);
+          } catch {}
         } else if (message.messageType === 'reaction') {
           __DEV__ && console.log(`[api1to1] 👍 Received reaction: ${message.emoji} on ${message.targetMessageId}`);
           // v21.0: Persister la réaction IMMÉDIATEMENT à la réception (sans toggle)
@@ -2375,6 +2712,34 @@ async function doFetchMessages1to1(
             }
           } catch (muteErr) {
             __DEV__ && console.warn('[api1to1] Mute preference parse error:', muteErr);
+          }
+        } else if (message.messageType === 'catch_up_request') {
+          // v29.0: Le pair revient d'une absence et demande les messages qu'il
+          // a pu manquer. On renvoie nos messages postérieurs au timestamp.
+          await handleIncomingCatchUpRequest(sessionId, message);
+        } else if (typeof message.messageType === 'string' && message.messageType.startsWith('group_')) {
+          // v30.0: Message de groupe → délégué à apiGroups (import dynamique
+          // pour rompre le cycle). Le message est stocké sous son groupId par
+          // le handler, PAS dans `messages` (store 1:1). On notifie l'UI groupe.
+          try {
+            const gm = await import('./apiGroups');
+            const visible = await gm.handleIncomingGroupMessage(sessionId, message);
+            if (visible && (message as any).content) {
+              try {
+                const p = JSON.parse((message as any).content);
+                const gid = p?.ciphertext?.groupId || p?.groupId;
+                if (gid) {
+                  // v30.0: compteur de non-lus du groupe (réutilise le mécanisme
+                  // 1:1, indexé par groupId). `visible` n'est vrai que pour un
+                  // group_msg de contenu d'un AUTRE membre (les messages de
+                  // contrôle renvoient false), donc on ne compte pas les nôtres.
+                  await incrementUnreadCount(gid);
+                  notifyGroupUpdate(gid);
+                }
+              } catch {}
+            }
+          } catch (e) {
+            __DEV__ && console.warn('[api1to1] group message handler error:', e);
           }
         } else {
           // Message normal
@@ -3185,6 +3550,11 @@ export async function pollAllSessions(): Promise<void> {
                 }
                 notifyStatusChange(sessionId, message.readMessageIds, 'delivered');
                 await updateLocalMessageStatus(sessionId, message.readMessageIds, 'delivered');
+                // v29.0: L'ACK libère l'outbox (sémantique Sesame).
+                try {
+                  const fp = sessionService.getSession(sessionId)?.theirIdentityKeyFingerprint;
+                  if (fp) reliabilityMarkAcked(fp, message.readMessageIds);
+                } catch {}
                 
               } else if (message.messageType === 'reaction') {
                 await receiveReaction(sessionId, message.targetMessageId!, message.emoji!, message.senderFingerprint!);
@@ -3224,6 +3594,29 @@ export async function pollAllSessions(): Promise<void> {
                   }
                 } catch (muteErr) {
                   __DEV__ && console.warn('[api1to1] Mute preference parse error in pollAll:', muteErr);
+                }
+
+              } else if (message.messageType === 'catch_up_request') {
+                // v29.0: Rattrapage demandé par le pair (Phase 2)
+                await handleIncomingCatchUpRequest(sessionId, message);
+
+              } else if (typeof message.messageType === 'string' && message.messageType.startsWith('group_')) {
+                // v30.0: Message de groupe → apiGroups (import dynamique).
+                try {
+                  const gm = await import('./apiGroups');
+                  const visible = await gm.handleIncomingGroupMessage(sessionId, message);
+                  if (visible && (message as any).content) {
+                    try {
+                      const p = JSON.parse((message as any).content);
+                      const gid = p?.ciphertext?.groupId || p?.groupId;
+                      if (gid) {
+                        await incrementUnreadCount(gid);
+                        notifyGroupUpdate(gid);
+                      }
+                    } catch {}
+                  }
+                } catch (e) {
+                  __DEV__ && console.warn('[api1to1] group message handler error (pollAll):', e);
                 }
 
               } else {
@@ -3315,6 +3708,11 @@ async function processServerMessages(
     try {
       sealedPayload = JSON.parse(row.sealed_payload);
     } catch {
+      continue;
+    }
+    // ROBUSTESSE : payload null/non-objet → ignoré (sinon crash sur .type).
+    if (!sealedPayload || typeof sealedPayload !== 'object') {
+      await markIdAsProcessed(sessionId, row.id);
       continue;
     }
     
@@ -3465,7 +3863,17 @@ async function processServerMessages(
   if (realMessages.length > 0) {
     __DEV__ && console.log(`[api1to1] 🔍 DIAG processServerMessages: ${realMessages.length} real msgs → ${_diagSkippedProcessed} already-processed, ${_diagSkippedHandshake} handshake, ${_diagSkippedUnknownType} unknown-type, ${_diagSkippedOwnMsg} own-msg, ${_diagDecrypted} decrypted → ${messages.length} new messages`);
   }
-  
+
+  // Suppression locale : ne pas ré-émettre vers l'UI un message tombstoné
+  // (la sauvegarde est déjà bloquée dans saveLocalMessage1to1, mais sans ce
+  // filtre le message réapparaîtrait à l'écran jusqu'au prochain remount)
+  if (messages.length > 0) {
+    const deletedIds = await getDeletedMessageIds1to1(sessionId);
+    if (deletedIds.size > 0) {
+      return messages.filter(m => !deletedIds.has(m.id));
+    }
+  }
+
   return messages;
 }
 
@@ -3583,9 +3991,26 @@ export async function saveLocalMessage1to1(sessionId: string, message: Message1t
     __DEV__ && console.log(`[api1to1] Skipping save of protocol message: ${message.messageType}`);
     return;
   }
-  
+
+  // Suppression locale : un message tombstoné ne doit jamais être ré-inséré
+  // (retransmission outbox du pair, catch-up, re-save après download de blob)
+  const deletedIds = await getDeletedMessageIds1to1(sessionId);
+  if (deletedIds.has(message.id)) {
+    __DEV__ && console.log(`[api1to1] Skipping save of locally deleted message: ${message.id.slice(0, 8)}...`);
+    return;
+  }
+
   // P6 FIX: Tout le read-modify-write est sérialisé par session
-  return withStorageLock(sessionId, () => _doSaveLocalMessage1to1(sessionId, message));
+  return withStorageLock(sessionId, () => _doSaveLocalMessage1to1(sessionId, message))
+    .then(async (result) => {
+      // Index d'aperçus : mis à jour APRÈS l'écriture réussie, hors du verrou.
+      // Placé ici plutôt que dans `_doSaveLocalMessage1to1` car cette fonction
+      // possède plusieurs points de sortie (fusion de doublon, dédup d'appel,
+      // insertion normale) : un seul point d'accroche évite les oublis.
+      // Une erreur ici ne doit jamais faire échouer l'enregistrement du message.
+      await updateLastMessagePreview(sessionId, message);
+      return result;
+    });
 }
 
 async function _doSaveLocalMessage1to1(sessionId: string, message: Message1to1): Promise<void> {
@@ -3759,12 +4184,62 @@ export function updateSingleMessageStatus1to1(
         
         // Notifier les listeners du changement de statut
         notifyMessageStatusChange(sessionId, messageId, status);
+
+        // ─────────────────────────────────────────────────────────────
+        // v29.0: FIABILITÉ — point de suivi unique pour TOUS les chemins
+        // d'envoi (texte/image/fichier/vocal/media_ref convergent tous ici
+        // avec 'sent'). Fail-safe : ne doit JAMAIS casser la mise à jour
+        // de statut, d'où le try/catch isolé.
+        // ─────────────────────────────────────────────────────────────
+        try {
+          if (msg.isMine && RELIABILITY_TRACKED_TYPES.has((msg.messageType || 'text') as MessageType)) {
+            if (status === 'sent') {
+              // Le message vient d'être déposé : on le suit jusqu'à l'ACK.
+              // IDEMPOTENT côté reliabilityService (une retransmission qui
+              // repose 'sent' ne réinitialise pas le backoff).
+              const fp = sessionService.getSession(sessionId)?.theirIdentityKeyFingerprint;
+              if (fp) {
+                reliabilityTrack({ msgId: messageId, sessionId, recipientFingerprint: fp, cls: 'best_effort' });
+              }
+            } else if (status === 'failed') {
+              // Abandon (échec d'envoi ou give-up) : plus rien à retransmettre.
+              reliabilityDrop(messageId);
+            }
+            // 'delivered'/'read' : la libération de l'outbox est faite par
+            // reliabilityMarkAcked dans le handler de delivered_receipt
+            // (clé recipientFingerprint+msgId).
+          }
+        } catch (relErr) {
+          __DEV__ && console.warn('[api1to1] reliability hook (status) error:', relErr);
+        }
       }
     } catch (error) {
       __DEV__ && console.error('[api1to1] Error updating single message status:', error);
     }
   });
 }
+
+/**
+ * v29.0: Types de messages suivis par la couche de fiabilité (Phase 1/2).
+ *
+ * IMPORTANT — pourquoi SEULEMENT 'text' :
+ * Les médias (image/file/voice) transitent en 'media_ref' = une référence vers
+ * un blob chiffré sur le storage. Or le message LOCAL de l'émetteur ne conserve
+ * PAS blobKey/blobNonce/blobSize (cf. sendMediaRef1to1 : seul blobId est gardé,
+ * pour debug). Reconstruire un media_ref pour une retransmission produirait donc
+ * un payload avec blobKey=undefined → le destinataire ne pourrait JAMAIS
+ * déchiffrer le blob. Plutôt que de re-livrer un média cassé, on ne track pas
+ * les médias en Phase 1/2 : ils gardent le comportement existant (échec visible
+ * → renvoi manuel, qui re-uploade le blob avec une clé fraîche).
+ *
+ * La retransmission média propre nécessite de persister les refs blob complètes
+ * côté émetteur — prévu en Phase 3 (cf. README). On EXCLUT aussi receipts,
+ * typing, signaux d'appel et messages de protocole (jamais de retransmission ni
+ * d'ACK en boucle).
+ */
+const RELIABILITY_TRACKED_TYPES: Set<MessageType> = new Set<MessageType>([
+  'text',
+]);
 
 // v23.0: Listeners pour les changements de statut de message
 type MessageStatusListener = (sessionId: string, messageId: string, status: string) => void;
@@ -3783,6 +4258,23 @@ function notifyMessageStatusChange(sessionId: string, messageId: string, status:
       __DEV__ && console.error('[api1to1] Message status listener error:', e);
     }
   });
+}
+
+// ── v30.0: Événements de mise à jour de groupe (l'UI groupe s'y abonne) ──
+type GroupUpdateListener = (groupId: string) => void;
+const groupUpdateListeners = new Set<GroupUpdateListener>();
+
+/** Notifie l'UI qu'un groupe a reçu un nouveau message/changement de roster. */
+export function notifyGroupUpdate(groupId: string): void {
+  groupUpdateListeners.forEach(l => {
+    try { l(groupId); } catch (e) { __DEV__ && console.warn('[api1to1] group update listener error:', e); }
+  });
+}
+
+/** S'abonner aux mises à jour de groupe. Retourne une fonction de désabonnement. */
+export function onGroupUpdate(cb: GroupUpdateListener): () => void {
+  groupUpdateListeners.add(cb);
+  return () => { groupUpdateListeners.delete(cb); };
 }
 
 /**
@@ -4086,10 +4578,124 @@ export function deleteFailedMessage1to1(
   });
 }
 
+// ============================================
+// SUPPRESSION LOCALE D'UN MESSAGE (tombstones)
+// ============================================
+//
+// Une suppression locale retire le message du stockage de CET appareil
+// uniquement — rien ne part sur le réseau, les autres participants gardent
+// leur copie. Problème : le pair peut retransmettre le message (catch-up
+// v29, retransmission outbox), et la dédup à la réception se fait par
+// présence de l'id dans le store → un message supprimé réapparaîtrait.
+// On persiste donc la liste des ids supprimés par session ("tombstones")
+// et on refuse toute ré-insertion, à la sauvegarde ET à l'émission UI.
+
+/** Cap de la liste de tombstones (le store lui-même est cappé à 500 messages). */
+const DELETED_IDS_MAX = 500;
+
+/** Cache mémoire des tombstones. Jeté au verrouillage (cf. registerLockHook). */
+const _deletedIdsCache = new Map<string, Set<string>>();
+
+async function getDeletedMessageIds1to1(sessionId: string): Promise<Set<string>> {
+  const cached = _deletedIdsCache.get(sessionId);
+  if (cached) return cached;
+  let set = new Set<string>();
+  try {
+    const raw = await secureGet(DELETED_IDS_PREFIX + sessionId);
+    if (raw) set = new Set(JSON.parse(raw));
+  } catch { /* liste absente ou illisible → repartir vide */ }
+  // Ne pas mettre en cache un résultat lu SANS clé de chiffrement : secureGet
+  // renvoie null sur les entrées `enc1:` tant que l'app est verrouillée, et un
+  // Set vide caché ici masquerait les vrais tombstones après déverrouillage.
+  if (hasAnyEncryptionKey()) {
+    _deletedIdsCache.set(sessionId, set);
+  }
+  return set;
+}
+
+async function addDeletedMessageId1to1(sessionId: string, messageId: string): Promise<void> {
+  const set = await getDeletedMessageIds1to1(sessionId);
+  set.add(messageId);
+  let ids = Array.from(set);
+  if (ids.length > DELETED_IDS_MAX) {
+    ids = ids.slice(ids.length - DELETED_IDS_MAX);
+    if (_deletedIdsCache.has(sessionId)) {
+      _deletedIdsCache.set(sessionId, new Set(ids));
+    }
+  }
+  await secureSet(DELETED_IDS_PREFIX + sessionId, JSON.stringify(ids));
+}
+
+/**
+ * Supprime un message LOCALEMENT (cet appareil uniquement). Fonctionne pour
+ * les conversations 1:1 et les groupes (même store, sessionId = groupId).
+ * Nettoie aussi les fichiers média externalisés, les réactions attachées,
+ * l'aperçu de la liste des conversations et l'outbox de retransmission.
+ * Retourne false uniquement en cas d'erreur d'écriture.
+ */
+export function deleteLocalMessage1to1(
+  sessionId: string,
+  messageId: string
+): Promise<boolean> {
+  // P6 FIX: Sérialisé par session (read-modify-write)
+  return withStorageLock(sessionId, async () => {
+    try {
+      // Tombstone d'abord : même si le message n'est pas (encore) dans le
+      // store, toute (ré)insertion future doit être refusée.
+      await addDeletedMessageId1to1(sessionId, messageId);
+
+      const key = MESSAGES_1TO1_PREFIX + sessionId;
+      const messages = await getAllLocalMessages1to1Internal(sessionId);
+      const index = messages.findIndex(m => m.id === messageId);
+      if (index >= 0) {
+        messages.splice(index, 1);
+        await secureSet(key, JSON.stringify(messages));
+      }
+
+      // v29.0: annuler une éventuelle retransmission en attente de ce message
+      try { reliabilityDrop(messageId); } catch {}
+
+      // Fichiers média externalisés du message (images, vocaux, fichiers)
+      await deleteMediaFiles(sessionId, messageId);
+
+      // Réactions attachées au message supprimé
+      try {
+        const reactions = await loadReactions(sessionId);
+        if (reactions.delete(messageId)) {
+          await saveReactions(sessionId, reactions);
+        }
+      } catch { /* cache d'affichage : échec non bloquant */ }
+
+      // Aperçu de la liste des conversations : recalculer depuis le nouveau
+      // dernier message. `updateLastMessagePreview` ignore un message plus
+      // ancien que l'aperçu courant → purger l'entrée avant de la réécrire.
+      const visible = messages.filter(m =>
+        !PROTOCOL_MESSAGE_TYPES.includes(m.messageType as MessageType)
+      );
+      const last = visible[visible.length - 1];
+      await clearLastMessagePreview(sessionId);
+      if (last) {
+        await updateLastMessagePreview(sessionId, last);
+      }
+
+      __DEV__ && console.log(`[api1to1] 🗑️ Locally deleted message ${messageId.slice(0, 8)}...`);
+      return true;
+    } catch (error) {
+      __DEV__ && console.error('[api1to1] Error deleting local message:', error);
+      return false;
+    }
+  });
+}
+
 export async function clearLocalMessages1to1(sessionId: string): Promise<void> {
   try {
     const key = MESSAGES_1TO1_PREFIX + sessionId;
     await AsyncStorage.removeItem(key);
+
+    // L'aperçu est un cache d'affichage : le purger en même temps que
+    // l'historique, sinon la liste continuerait d'afficher un dernier
+    // message qui n'existe plus.
+    await clearLastMessagePreview(sessionId);
     
     const processedKey = PROCESSED_IDS_PREFIX + sessionId;
     await AsyncStorage.removeItem(processedKey);
@@ -4109,10 +4715,21 @@ export async function clearLocalMessages1to1(sessionId: string): Promise<void> {
     
     const reactionsKey = `${REACTIONS_STORAGE_KEY}${sessionId}`;
     await AsyncStorage.removeItem(reactionsKey);
-    
+
+    // Tombstones de suppression locale : l'historique disparaît entièrement,
+    // repartir d'une liste vierge (sessionId déterministe → reconnexion propre)
+    await AsyncStorage.removeItem(DELETED_IDS_PREFIX + sessionId);
+    _deletedIdsCache.delete(sessionId);
+
     // Nettoyer le cache de migration mémoire pour cette session
     _migratedSessions.delete(sessionId);
-    
+
+    // v29.0: Lever toute retransmission en attente pour cette session.
+    try { reliabilityDropSession(sessionId); } catch {}
+    // Nettoyer aussi l'état throttle catch-up local.
+    _lastCatchUpReqAt.delete(sessionId);
+    _lastCatchUpHandledAt.delete(sessionId);
+
     // Nettoyer les fichiers médias locaux (images, vocaux, fichiers téléchargés)
     await deleteSessionMedia(sessionId);
     
@@ -4236,9 +4853,327 @@ async function setLastPollTime(sessionId: string, time: Date): Promise<void> {
 // avant startGlobalPolling1to1(). Le chiffrement local doit être opérationnel
 // pour pouvoir lire et réécrire les messages.
 
+// ════════════════════════════════════════════════════════════════════════════
+// v29.0 — COUCHE DE FIABILITÉ : RENVOI, RATTRAPAGE (CATCH-UP), INTÉGRATION
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Reconstruit l'InnerPayload d'un message local et le RENVOIE via le pipeline
+ * standard (padding → Triple Ratchet → Sealed Sender → slot constant), SANS
+ * toucher au statut visible (le message reste 'sent').
+ *
+ * Utilisé par :
+ *   • la boucle de retransmission (reliabilityService → resend handler)
+ *   • le rattrapage (catch-up) à la reconnexion
+ *
+ * SÉCURITÉ / ANONYMAT : aucun chemin spécifique — c'est le MÊME envoi qu'un
+ * message normal. Le re-chiffrement fait avancer le ratchet ; le destinataire
+ * compense via skipped-message-keys, et la déduplication finale se fait par
+ * messageId à la sauvegarde (saveLocalMessage1to1) → aucun doublon en UI.
+ *
+ * Retourne :
+ *   • 'dispatched' : renvoi ré-enqueué
+ *   • 'gone'       : message introuvable / non renvoyable (best_effort abandonné)
+ *   • 'error'      : échec transitoire (réessai au prochain backoff)
+ */
+async function _resendMessageById(
+  sessionId: string,
+  msgId: string,
+  priority: 'normal' | 'urgent' | 'deferred' = 'normal'
+): Promise<ResendOutcome> {
+  try {
+    const session = sessionService.getSession(sessionId);
+    if (!session) return 'error'; // session momentanément indisponible → réessai
+
+    const messages = await getAllLocalMessages1to1Internal(sessionId);
+    const m = messages.find(x => x.id === msgId);
+    if (!m || !m.isMine) return 'gone'; // supprimé par l'utilisateur ou pas le nôtre
+
+    // Phase 1/2 : on ne retransmet QUE le texte (cf. RELIABILITY_TRACKED_TYPES).
+    // Un média ne devrait jamais arriver ici (il n'est pas tracké), mais on
+    // garde la garde par sécurité : on n'essaie pas de reconstruire un media_ref
+    // (blobKey non persistée → payload cassé). 'gone' = on cesse de suivre.
+    if (m.messageType && m.messageType !== 'text') return 'gone';
+
+    const myFingerprint = session.myIdentityKeyFingerprint;
+    const myProfile = sessionService.getMyProfile();
+
+    const inner: InnerPayload = {
+      type: 'text',
+      content: m.content,
+      senderFingerprint: myFingerprint,
+      displayName: myProfile.displayName,
+      senderAvatarBase64: myProfile.avatarBase64,
+      timestamp: m.timestamp,
+      messageId: m.id,
+      ...(m.replyToId && {
+        replyToId: m.replyToId,
+        replyToContent: m.replyToContent,
+        replyToSender: m.replyToSender,
+      }),
+    };
+
+    const r = await sendInnerPayload(sessionId, inner, priority);
+    return r.success ? 'dispatched' : 'error';
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] _resendMessageById error:', e);
+    return 'error';
+  }
+}
+
+/**
+ * v29.0 (Phase 2) : envoie une demande de rattrapage au pair. Le pair renverra
+ * les messages qu'il nous a adressés APRÈS `sinceTimestamp` (bornés). Sert à
+ * combler les absences dépassant la fenêtre de rétention serveur (48h), que la
+ * retransmission outbox seule ne couvre pas.
+ *
+ * Message de protocole (invisible UI, non sauvegardé), envoyé en 'deferred'.
+ */
+export async function sendCatchUpRequest1to1(
+  sessionId: string,
+  sinceTimestamp: number
+): Promise<{ success: boolean; error?: string }> {
+  const session = sessionService.getSession(sessionId);
+  if (!session) return { success: false, error: 'Session not found' };
+
+  const myFingerprint = session.myIdentityKeyFingerprint;
+  const myProfile = sessionService.getMyProfile();
+
+  const innerPayload: InnerPayload = {
+    type: 'catch_up_request',
+    content: JSON.stringify({ sinceTimestamp }),
+    senderFingerprint: myFingerprint,
+    displayName: myProfile.displayName,
+    timestamp: Date.now(),
+    messageId: generateMessageId(),
+  };
+
+  const result = await sendInnerPayload(sessionId, innerPayload, 'deferred');
+  if (result.success) {
+    __DEV__ && console.log(`[api1to1] 🔁 Catch-up request sent to ${sessionId.slice(0, 12)}… since=${new Date(sinceTimestamp).toISOString()}`);
+  }
+  return result;
+}
+
+/** Nombre maximum de messages renvoyés en réponse à un catch_up_request (borne
+ *  anti-abus : un pair malveillant ne peut pas forcer un renvoi massif). */
+const CATCHUP_RESEND_MAX = 30;
+/** Anti-spam : on ignore les catch_up_request répétés d'une même session sous
+ *  ce délai. */
+const CATCHUP_HANDLE_MIN_INTERVAL_MS = 60_000;
+const _lastCatchUpHandledAt = new Map<string, number>();
+
+/**
+ * v29.0 (Phase 2) : traite un catch_up_request reçu. Renvoie nos messages de
+ * contenu adressés à ce pair, postérieurs au timestamp demandé, bornés à
+ * CATCHUP_RESEND_MAX (les plus récents). Re-chiffrés et ré-enqueués en
+ * 'deferred'. Le destinataire déduplique par messageId.
+ */
+async function handleIncomingCatchUpRequest(sessionId: string, message: Message1to1): Promise<void> {
+  try {
+    // Anti-spam par session
+    const now = Date.now();
+    const last = _lastCatchUpHandledAt.get(sessionId) || 0;
+    if (now - last < CATCHUP_HANDLE_MIN_INTERVAL_MS) {
+      __DEV__ && console.log('[api1to1] 🔁 Catch-up request ignored (throttled)');
+      return;
+    }
+    _lastCatchUpHandledAt.set(sessionId, now);
+
+    let since = 0;
+    try {
+      const parsed = JSON.parse(message.content || '{}');
+      if (typeof parsed.sinceTimestamp === 'number') since = parsed.sinceTimestamp;
+    } catch {
+      return; // payload illisible → on ignore
+    }
+
+    const messages = await getAllLocalMessages1to1Internal(sessionId);
+    // Nos messages de contenu, postérieurs au timestamp, triés du plus ancien
+    // au plus récent, puis on garde les CATCHUP_RESEND_MAX plus récents.
+    const candidates = messages
+      .filter(m =>
+        m.isMine &&
+        RELIABILITY_TRACKED_TYPES.has((m.messageType || 'text') as MessageType) &&
+        m.timestamp > since
+      )
+      .sort((a, b) => a.timestamp - b.timestamp);
+
+    const toResend = candidates.slice(-CATCHUP_RESEND_MAX);
+    if (toResend.length === 0) return;
+
+    __DEV__ && console.log(`[api1to1] 🔁 Catch-up: resending ${toResend.length} message(s) to ${sessionId.slice(0, 12)}…`);
+
+    // Renvoi en ordre chronologique, en 'deferred' (pas de corrélation
+    // temporelle, et n'inonde pas la file urgente).
+    for (const m of toResend) {
+      await _resendMessageById(sessionId, m.id, 'deferred');
+    }
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] handleIncomingCatchUpRequest error:', e);
+  }
+}
+
+// ── Cadencement périodique : tick de retransmission + balayage catch-up ──────
+//
+// Greffés sur le cycle de polling existant (performGlobalPoll), throttlés en
+// interne. Pas de nouveau timer (économie d'énergie, pas de désync).
+
+let _lastReliabilityTickAt = 0;
+const RELIABILITY_TICK_INTERVAL_MS = 60_000; // au plus une tick / minute
+
+let _lastGlobalPollAt = 0;
+let _lastCatchUpSweepAt = 0;
+const CATCHUP_SWEEP_MIN_INTERVAL_MS = 30 * 60_000; // au plus un balayage / 30 min
+/** Si l'écart entre deux polls dépasse ce seuil, on considère que l'appareil a
+ *  été absent (background/offline) et on déclenche un balayage catch-up. */
+const CATCHUP_OFFLINE_GAP_MS = 6 * 60 * 60_000; // 6 h
+/** On ignore le catch-up pour une session sans réception depuis plus longtemps
+ *  (session morte) ou avec un catch-up récent. */
+const CATCHUP_SESSION_MIN_INTERVAL_MS = 60 * 60_000; // 1 h / session
+const CATCHUP_SESSION_MAX_IDLE_MS = 60 * 24 * 60 * 60_000; // 60 j (skip sessions mortes)
+const CATCHUP_MAX_SESSIONS_PER_SWEEP = 20;
+const _lastCatchUpReqAt = new Map<string, number>();
+
+// Persistance du dernier poll global → permet de détecter une absence longue
+// même après un redémarrage à froid (app tuée pendant plusieurs jours). Écriture
+// throttlée pour éviter d'écrire à chaque tick (~30s).
+const GLOBAL_LASTPOLL_KEY = '@ghostr_lastpoll_global_v1';
+let _globalLastPollPersistAt = 0;
+const GLOBAL_LASTPOLL_PERSIST_INTERVAL_MS = 5 * 60_000; // 5 min
+
+function persistGlobalLastPoll(ts: number): void {
+  const now = Date.now();
+  if (now - _globalLastPollPersistAt < GLOBAL_LASTPOLL_PERSIST_INTERVAL_MS) return;
+  _globalLastPollPersistAt = now;
+  // Fire-and-forget, chiffré, non bloquant.
+  secureSet(GLOBAL_LASTPOLL_KEY, String(ts)).catch(() => {});
+}
+
+async function loadGlobalLastPoll(): Promise<void> {
+  try {
+    const raw = await secureGet(GLOBAL_LASTPOLL_KEY);
+    if (raw) {
+      const ts = parseInt(raw, 10);
+      if (!isNaN(ts) && ts > 0) _lastGlobalPollAt = ts;
+    }
+  } catch {}
+}
+
+/** Lance une tick de retransmission si l'intervalle est écoulé. Idempotent et
+ *  fail-safe. */
+async function maybeReliabilityTick(): Promise<void> {
+  const now = Date.now();
+  if (now - _lastReliabilityTickAt < RELIABILITY_TICK_INTERVAL_MS) return;
+  _lastReliabilityTickAt = now;
+  try {
+    await reliabilityTick();
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] maybeReliabilityTick error:', e);
+  }
+}
+
+/**
+ * Balaye les sessions et envoie un catch_up_request là où c'est pertinent.
+ * Déclenché seulement après une absence de l'appareil (gap de poll > seuil),
+ * et throttlé par session. Borné en nombre de sessions par balayage.
+ */
+async function runCatchUpSweep(): Promise<void> {
+  const now = Date.now();
+  if (now - _lastCatchUpSweepAt < CATCHUP_SWEEP_MIN_INTERVAL_MS) return;
+  _lastCatchUpSweepAt = now;
+  try {
+    const sessions = sessionService.getAllSessions();
+    let sent = 0;
+    for (const s of sessions) {
+      if (sent >= CATCHUP_MAX_SESSIONS_PER_SWEEP) break;
+      try {
+        // Throttle par session
+        if (now - (_lastCatchUpReqAt.get(s.id) || 0) < CATCHUP_SESSION_MIN_INTERVAL_MS) continue;
+
+        const msgs = await getAllLocalMessages1to1Internal(s.id);
+        // Dernier message REÇU (non-mine) = borne « depuis quand rattraper ».
+        let lastRecv = 0;
+        for (const m of msgs) {
+          if (!m.isMine && m.timestamp > lastRecv) lastRecv = m.timestamp;
+        }
+        if (lastRecv === 0) continue; // jamais rien reçu → rien à rattraper
+        if (now - lastRecv > CATCHUP_SESSION_MAX_IDLE_MS) continue; // session morte
+
+        _lastCatchUpReqAt.set(s.id, now);
+        await sendCatchUpRequest1to1(s.id, lastRecv);
+        sent++;
+      } catch {
+        // session illisible → skip
+      }
+    }
+    if (sent > 0) __DEV__ && console.log(`[api1to1] 🔁 Catch-up sweep: ${sent} request(s) sent`);
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] runCatchUpSweep error:', e);
+  }
+}
+
+// ── Enregistrement des handlers du reliabilityService (une seule fois) ───────
+
+let _reliabilityIntegrationReady = false;
+
+/**
+ * Branche les handlers de la couche de fiabilité sur api1to1. Idempotent.
+ * Appelé au boot (recoverOrphanedSendingMessages) ET au chargement du module
+ * (les déclarations de fonctions sont hoistées, donc l'appel module-scope plus
+ * bas est sûr).
+ */
+function initReliabilityIntegration(): void {
+  if (_reliabilityIntegrationReady) return;
+  _reliabilityIntegrationReady = true;
+
+  // Handler de renvoi : appelé par la boucle pour retransmettre un message non
+  // encore acquitté. On renvoie en 'normal' (le message attend déjà depuis un
+  // moment, inutile de le mettre en urgent).
+  reliabilitySetResendHandler((sessionId, _recipientFp, msgId, _cls) =>
+    _resendMessageById(sessionId, msgId, 'normal')
+  );
+
+  // Handler d'abandon : best_effort au-delà de 48h → repasser 'failed' pour
+  // proposer un renvoi manuel (comportement cohérent avec l'existant).
+  // guaranteed (Phase 3) → on log (pas de message UI 1:1 concerné en Phase 1/2).
+  reliabilitySetGiveUpHandler((sessionId, msgId, cls) => {
+    if (cls === 'best_effort') {
+      updateSingleMessageStatus1to1(sessionId, msgId, 'failed').catch(() => {});
+    } else {
+      __DEV__ && console.warn(`[api1to1] ⚠️ Guaranteed message abandoned after cap: ${msgId.slice(0, 8)}…`);
+    }
+  });
+
+  __DEV__ && console.log('[api1to1] ✅ Reliability integration ready');
+}
+
+// Branche les handlers dès le chargement du module (idempotent). Garantit que
+// la première tick de retransmission dispose déjà du resend handler, même si
+// elle précède le boot (recoverOrphanedSendingMessages).
+initReliabilityIntegration();
+
 export async function recoverOrphanedSendingMessages(): Promise<number> {
   let totalRecovered = 0;
-  
+
+  // v29.0: S'assurer que les handlers de fiabilité sont branchés, et charger
+  // l'outbox persistée (sinon les retransmissions en cours seraient perdues au
+  // redémarrage). Fail-safe.
+  try {
+    initReliabilityIntegration();
+    await reliabilityLoadOutbox();
+    await loadGlobalLastPoll();
+    // NOTE : le chargement des groupes persistés était fait ICI. Il en a été
+    // retiré — cette fonction est délibérément déférée de 5 s au boot (cas
+    // d'erreur rare), ce qui rendait les groupes invisibles dans la liste de
+    // conversations et inconnus des handlers de réception pendant toute cette
+    // fenêtre. `loadGroups()` est désormais sur le chemin critique du boot
+    // (App.tsx, aux côtés de sessionService.initialize()), avec un filet
+    // idempotent dans ConversationListScreen.loadConversations().
+  } catch (e) {
+    __DEV__ && console.warn('[api1to1] reliability bootstrap failed (non-fatal):', e);
+  }
+
   try {
     const sessions = sessionService.getAllSessions();
     if (sessions.length === 0) return 0;
@@ -4307,12 +5242,25 @@ export async function clearAll1to1Data(): Promise<void> {
     const { clearAllMuteCache } = await import('./muteService');
     clearAllMuteCache();
     _peerMuteCache.clear();
+
+    // Guideline 1.2 : nettoyer le cache mémoire de la liste de blocage
+    // (la clé AsyncStorage est effacée avec le reste par le reset global)
+    const { clearBlockCache } = await import('./blockService');
+    clearBlockCache();
     
     // BUG FIX #7: Vider les sets mémoire globaux qui survivent entre sessions
     // Sans cela, les IDs de messages de l'ancienne session filtrent les nouveaux messages
     recentlySentIds.clear();
     inFlightOrProcessedIds.clear();
     _migratedSessions.clear();
+    _deletedIdsCache.clear();
+
+    // v29.0: Vider entièrement l'outbox de fiabilité + l'état catch-up.
+    try { await reliabilityClearOutbox(); } catch {}
+    _lastCatchUpReqAt.clear();
+    _lastCatchUpHandledAt.clear();
+    _lastGlobalPollAt = 0;
+    try { await AsyncStorage.removeItem(GLOBAL_LASTPOLL_KEY); } catch {}
     
     // BUG FIX #9: Vider le cache de l'InviteWatcher et les invitations
     try {
@@ -4406,8 +5354,17 @@ export async function getAllUnreadCounts(): Promise<Map<string, number>> {
     
     if (unreadKeys.length === 0) return result;
     
-    for (const key of unreadKeys) {
-      const value = await secureGet(key);
+    // PERF : UN seul aller-retour natif au lieu d'un par conversation.
+    // La boucle `await secureGet(key)` d'origine sérialisait N allers-retours
+    // AsyncStorage. Au cold start, le thread JS est saturé par le PoW du
+    // sealed sender (SHA-256 itératif, 5-30 s sur Hermes — cf. le rationale
+    // d'ordonnancement dans startGlobalPolling1to1) : chaque aller-retour
+    // attend son créneau derrière un bloc de PoW, et le coût cumulé retardait
+    // de plusieurs secondes l'affichage des aperçus de la liste.
+    // Le déchiffrement, lui, reste par valeur (il est purement CPU et local).
+    const entries = await AsyncStorage.multiGet(unreadKeys);
+    for (const [key, raw] of entries) {
+      const value = decryptStoredValue(raw);
       if (value) {
         const sessionId = key.replace(UNREAD_COUNT_PREFIX, '');
         result.set(sessionId, parseInt(value, 10) || 0);
@@ -4721,6 +5678,15 @@ async function _fetchSealedCertificate(signal: AbortSignal): Promise<SenderCerti
 // fois grâce au cache Metro.
 // ───────────────────────────────────────────────────────────────────────────
 setSealedSenderCertificateFetcher(_fetchSealedCertificate);
+
+// Hooks de persistance du certificat (cf. sealedSenderCache.ts) — permet au
+// bootstrap de restaurer un certificat valide au cold start (mode no-PIN)
+// sans refaire PoW + manifest + RPC. Même pattern d'injection que le fetcher.
+setSealedSenderCacheHooks({
+  load: loadSealedSenderCache,
+  save: saveSealedSenderCache,
+  clear: clearSealedSenderCache,
+});
 
 // ════════════════════════════════════════════════════════════════════════════
 // PUBLIC API — Bootstrap orchestration
@@ -5083,6 +6049,15 @@ export function subscribeToAllMessages1to1(
 // scheduleNextGlobalPoll supprimé — le constant-rate traffic gère le scheduling
 
 async function performGlobalPoll(): Promise<void> {
+  // v29.0: Détection d'absence de l'appareil (gap entre deux polls). Sert à
+  // déclencher un balayage catch-up après une longue absence (background/offline
+  // ou app tuée). Calculé AVANT le early-return pour rester fiable.
+  const _pollNow = Date.now();
+  const _prevPoll = _lastGlobalPollAt;
+  _lastGlobalPollAt = _pollNow;
+  persistGlobalLastPoll(_pollNow);
+  const _deviceWasAway = _prevPoll > 0 && (_pollNow - _prevPoll) > CATCHUP_OFFLINE_GAP_MS;
+
   try {
     // S'assurer que sessionService est initialisé
     await sessionService.initialize();
@@ -5123,6 +6098,33 @@ async function performGlobalPoll(): Promise<void> {
       } catch (e) {
         __DEV__ && console.error('[api1to1] Global poll error for session:', session.id, e);
       }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // v29.0: FIABILITÉ — greffé en fin de cycle de poll (pas de timer dédié).
+    //   1. Tick de retransmission (throttlée à 1/min en interne).
+    //   2. Balayage catch-up SI l'appareil revient d'une longue absence.
+    // Fail-safe : encapsulé, n'impacte jamais le polling.
+    // ─────────────────────────────────────────────────────────────────────
+    try {
+      await maybeReliabilityTick();
+      if (_deviceWasAway) {
+        __DEV__ && console.log(`[api1to1] 🔁 Device was away ${Math.round((_pollNow - _prevPoll) / 3600000)}h → catch-up sweep`);
+        await runCatchUpSweep();
+        // v30.0: Réconciliation de roster pour chaque groupe (comble les
+        // ajouts/retraits manqués pendant l'absence, même expirés côté serveur).
+        try {
+          const gm = await import('./apiGroups');
+          const gs = await import('./groupService');
+          for (const grp of gs.getAllGroups()) {
+            try { await gm.requestRosterSync(grp.groupId); } catch {}
+          }
+        } catch (gErr) {
+          __DEV__ && console.warn('[api1to1] group roster sync error:', gErr);
+        }
+      }
+    } catch (relErr) {
+      __DEV__ && console.warn('[api1to1] reliability post-poll error:', relErr);
     }
   } catch (error) {
     __DEV__ && console.error('[api1to1] Global poll exception:', error);

@@ -1,0 +1,12 @@
+{
+  "ios": {
+    "NSCameraUsageDescription": "Ghostr usa la fotocamera per scansionare il codice QR di un contatto e avviare una conversazione crittografata, scansionare un numero di sicurezza per verificare l'identità di un contatto, scattare una foto da inviare in una conversazione e impostare o aggiornare la tua immagine del profilo.",
+    "NSMicrophoneUsageDescription": "Ghostr usa il microfono per le chiamate vocali crittografate end-to-end e per registrare i messaggi vocali che invii in una conversazione.",
+    "NSPhotoLibraryUsageDescription": "Ghostr accede alle tue foto quando scegli di inviare un'immagine in una conversazione o di impostarla come immagine del profilo.",
+    "NSPhotoLibraryAddUsageDescription": "Ghostr salva le immagini nelle tue foto quando tocchi Salva su una foto ricevuta in una conversazione, per conservarla sul dispositivo.",
+    "NSFaceIDUsageDescription": "Consenti a Ghostr di usare Face ID per sbloccare l'app."
+  },
+  "android": {
+    "app_name": "Ghostr"
+  }
+}

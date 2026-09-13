@@ -13,14 +13,17 @@
 // ════════════════════════════════════════════════════════════════════════════
 // COMPORTEMENT VISUEL
 // ════════════════════════════════════════════════════════════════════════════
-// L'écran lui-même est entièrement réactif (utilise useTheme + useThemedStyles)
-// donc bascule INSTANTANÉMENT au tap. C'est important pour un picker — le
-// choix doit produire un feedback visible immédiatement.
+// Le tap applique le thème INSTANTANÉMENT, sur cet écran comme sur tous les
+// autres. Plus de confirmation « redémarrer l'application », plus d'encart
+// « sera appliqué au prochain lancement ».
 //
-// Si le nouveau scheme diffère de celui du boot (= les autres écrans ont
-// été initialisés sur l'autre thème), on affiche un encart explicatif
-// (`requiresReload`). Cf. THEME_MIGRATION.md pour la roadmap qui élimine ce
-// caveat.
+// Ce détour existait parce que certains écrans construisaient leur
+// `StyleSheet.create` au niveau module à partir d'une palette capturée au
+// démarrage : elles ne pouvaient donc pas suivre un changement à chaud, et
+// l'app aurait affiché un mélange des deux thèmes. Ces captures ont toutes
+// été converties en fabriques consommées par `useThemedStyles`, et
+// `theme.colors` a été supprimé pour empêcher leur réapparition. Le
+// redémarrage n'a plus de raison d'être.
 //
 // ════════════════════════════════════════════════════════════════════════════
 // PRIVACY
@@ -28,32 +31,23 @@
 // Aucun appel réseau. Le choix est strictement local (AsyncStorage,
 // cf. services/themeStorage.ts).
 
-import React, { useState } from 'react';
+import React from 'react';
 import { View, Text, ScrollView, TouchableOpacity, StyleSheet, Appearance } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
 import { Ionicons } from '@expo/vector-icons';
 
-import { Header, AlertModal, useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
+import { Header, useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 import type { AppearancePreference } from '../services/themeStorage';
-import { restartApp, canRestartApp } from '../services/themeStorage';
+import haptics from '../services/haptics';
 
 export function ThemeScreen() {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const { t } = useTranslation();
-  const { colors, preference, setAppearance, requiresReload } = useTheme();
+  const { colors, preference, setAppearance } = useTheme();
   const styles = useThemedStyles(makeStyles);
-
-  // Restart-confirmation state. When the user picks an option that requires
-  // a reload to fully propagate (i.e., differs from the boot palette), we
-  // ask first instead of leaving them with a half-themed app.
-  const [pendingChoice, setPendingChoice] = useState<AppearancePreference | null>(null);
-  const [restarting, setRestarting] = useState(false);
-  // Compute restart capability once — `expo-updates` may be unavailable in
-  // dev. If it isn't, we fall back to the legacy banner.
-  const canRestart = canRestartApp();
 
   // Pour le sous-titre de l'option "Système", on lit l'OS au render. Ça
   // bouge si l'utilisateur change le thème système pendant qu'il est sur
@@ -69,63 +63,12 @@ export function ThemeScreen() {
   })();
 
   const handleSelect = (pref: AppearancePreference) => {
-    // No-op if the user picked the option they already have.
+    // No-op si l'utilisateur retape son choix courant.
     if (pref === preference) return;
-
-    // Compute what the EFFECTIVE colour scheme would be after this choice.
-    // For 'system', we resolve against the current OS scheme. For 'light'
-    // and 'dark', it's just the value itself.
-    const resolveEffective = (p: AppearancePreference) =>
-      p === 'system'
-        ? (Appearance.getColorScheme() === 'light' ? 'light' : 'dark')
-        : p;
-
-    const currentEffective = resolveEffective(preference);
-    const nextEffective = resolveEffective(pref);
-
-    // If the effective scheme isn't actually changing (e.g., currently on
-    // 'system' resolving to dark, user picks 'dark'), the on-screen colors
-    // won't change visually — just the preference label. Apply silently,
-    // no restart needed.
-    if (currentEffective === nextEffective) {
-      void setAppearance(pref);
-      return;
-    }
-
-    // The effective scheme IS changing. To guarantee every screen renders
-    // in the new palette without any half-themed transition, we restart
-    // the JS bundle. This is symmetric: same flow whether you switch to
-    // Light or to Dark, as long as the visible colours will change.
-    if (canRestart) {
-      setPendingChoice(pref);
-      return;
-    }
-
-    // Fallback path: expo-updates not available. Apply the choice and
-    // let the `requiresReload` banner inform the user.
+    // Application immédiate : le contexte re-rend tous les consommateurs de
+    // `useTheme()`, c'est-à-dire l'application entière.
     void setAppearance(pref);
-  };
-
-  const handleConfirmRestart = async () => {
-    if (!pendingChoice) return;
-    setRestarting(true);
-    try {
-      await setAppearance(pendingChoice);
-      // Tiny delay so AsyncStorage write completes before the restart
-      // tears down the JS context. AsyncStorage writes are atomic but the
-      // promise resolution can race with bundle teardown on slow devices.
-      await new Promise((r) => setTimeout(r, 150));
-      await restartApp();
-    } catch (e) {
-      // If restart fails, fall back to applying without restart. The user
-      // will see the legacy banner.
-      setRestarting(false);
-      setPendingChoice(null);
-    }
-  };
-
-  const handleCancelRestart = () => {
-    setPendingChoice(null);
+    haptics.selection();
   };
 
   return (
@@ -141,25 +84,6 @@ export function ThemeScreen() {
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
       >
-        {requiresReload && !canRestart && (
-          <View style={styles.banner}>
-            <Ionicons
-              name="information-circle"
-              size={20}
-              color={colors.info}
-              style={styles.bannerIcon}
-            />
-            <View style={styles.bannerContent}>
-              <Text style={styles.bannerTitle} numberOfLines={2}>
-                {t('themeScreen.applyOnRestartTitle')}
-              </Text>
-              <Text style={styles.bannerMessage} numberOfLines={4}>
-                {t('themeScreen.applyOnRestartMessage')}
-              </Text>
-            </View>
-          </View>
-        )}
-
         {/* Section "Système" */}
         <View style={styles.section}>
           <Row
@@ -200,29 +124,6 @@ export function ThemeScreen() {
         </View>
       </ScrollView>
 
-      {/*
-        Restart confirmation modal — appears when the user picks a scheme
-        that needs a JS reload to fully propagate. Auto-restarting on
-        confirm avoids the half-themed state where some screens (the ones
-        with legacy module-level styles) keep showing the previous theme
-        until the next launch. The user retains the option to cancel and
-        live with the banner instead.
-      */}
-      <AlertModal
-        visible={pendingChoice !== null}
-        title={t('themeScreen.restartConfirmTitle')}
-        message={t('themeScreen.restartConfirmMessage')}
-        primaryButton={{
-          title: t('themeScreen.restartConfirmAction'),
-          onPress: handleConfirmRestart,
-          loading: restarting,
-        }}
-        secondaryButton={{
-          title: t('common.cancel'),
-          onPress: handleCancelRestart,
-        }}
-        onClose={handleCancelRestart}
-      />
     </View>
   );
 }
@@ -319,34 +220,6 @@ const makeStyles = (colors: ColorPalette) =>
       borderRadius: 16,
       marginBottom: 16,
       overflow: 'hidden',
-    },
-    banner: {
-      flexDirection: 'row',
-      alignItems: 'flex-start',
-      backgroundColor: colors.surface,
-      borderRadius: 12,
-      padding: 14,
-      marginBottom: 16,
-      borderLeftWidth: 3,
-      borderLeftColor: colors.info,
-    },
-    bannerIcon: {
-      marginRight: 10,
-      marginTop: 1,
-    },
-    bannerContent: {
-      flex: 1,
-    },
-    bannerTitle: {
-      fontSize: 14,
-      fontWeight: '600',
-      color: colors.text,
-      marginBottom: 4,
-    },
-    bannerMessage: {
-      fontSize: 13,
-      color: colors.textSecondary,
-      lineHeight: 18,
     },
   } as const);
 

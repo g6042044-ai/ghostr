@@ -58,6 +58,9 @@ import {
 } from './storage';
 import { resetLockConfiguredCache } from './tripleRatchet/sessionService';
 import { deleteSendCounter } from './tripleRatchet/monotonicCounter';
+// v29.0: Outbox de fiabilité (à inclure dans le dump pour survivre à la migration)
+import { serializeOutbox, replaceOutboxFromImport } from './reliabilityService';
+import { serializeGroups, replaceGroupsFromImport, getAllGroups } from './groupService';
 
 declare const __DEV__: boolean;
 
@@ -214,6 +217,22 @@ export interface MigrationDump {
   /** KT registration cache (informational — the server can re-issue this).
    *  Migrating it avoids one network round-trip at first launch on new device. */
   ktRegistration?: string | null;
+
+  /** v29.0: Outbox de fiabilité (messages déposés en attente d'ACK + leur état
+   *  de retransmission). Sans ce champ, un changement d'appareil interromprait
+   *  net toutes les retransmissions en cours → perte silencieuse possible des
+   *  messages que le destinataire hors-ligne n'a pas encore reçus.
+   *  JSON brut d'un OutboxRecord[] (chiffré avec le reste du dump). */
+  outbox?: string | null;
+
+  /** v30.0: Groupes (GroupRecord[]) — roster, groupSeed, Sender Keys détenues,
+   *  ma chaîne d'émission, rosterVersion, tickets. Sans ce champ, un changement
+   *  d'appareil ferait disparaître tous les groupes ET couperait les rotations
+   *  en cours → violation directe de « aucune perte ». */
+  groups?: string | null;
+  /** v30.0: Messages de groupe par groupId (clé = MSG_1TO1_PREFIX + groupId,
+   *  réutilise le même store que le 1:1). */
+  groupMessages?: Array<{ groupId: string; messages: string }> | null;
 }
 
 // ============================================
@@ -434,6 +453,30 @@ export async function collectExportData(appVersion: string): Promise<MigrationDu
     if (ktReg != null) dump.ktRegistration = ktReg;
   } catch (e) {
     __DEV__ && console.warn('[migrationService] ktRegistration read failed (non-fatal):', e);
+  }
+
+  // ── 17. v29.0: Outbox de fiabilité (état des retransmissions en cours) ──
+  // Lu depuis la mémoire vive du reliabilityService (source de vérité, toujours
+  // à jour pendant que l'app tourne). Permet de reprendre les retransmissions
+  // sur le nouvel appareil sans perte.
+  try {
+    dump.outbox = serializeOutbox();
+  } catch (e) {
+    __DEV__ && console.warn('[migrationService] outbox read failed (non-fatal):', e);
+  }
+
+  // ── 18. v30.0: Groupes + messages de groupe ──────────────────────────
+  try {
+    dump.groups = serializeGroups();
+    // Messages de groupe : stockés sous MSG_1TO1_PREFIX + groupId.
+    const gms: Array<{ groupId: string; messages: string }> = [];
+    for (const g of getAllGroups()) {
+      const raw = await readDecrypted(MSG_1TO1_PREFIX + g.groupId);
+      if (raw) gms.push({ groupId: g.groupId, messages: raw });
+    }
+    dump.groupMessages = gms;
+  } catch (e) {
+    __DEV__ && console.warn('[migrationService] groups read failed (non-fatal):', e);
   }
 
   return dump;
@@ -814,6 +857,35 @@ export async function applyMigrationDump(
       await AsyncStorage.setItem(KT_MY_REGISTRATION_KEY, dump.ktRegistration);
     } catch (e) {
       __DEV__ && console.warn('[migrationService] ktRegistration restore failed:', e);
+    }
+  }
+
+  // ── 11e. v29.0: Outbox de fiabilité ──────────────────────────────────
+  // Restaure l'état des retransmissions en cours pour qu'elles reprennent sur
+  // le nouvel appareil (aucune perte des messages non encore acquittés).
+  if (dump.outbox != null) {
+    try {
+      await replaceOutboxFromImport(dump.outbox);
+    } catch (e) {
+      __DEV__ && console.warn('[migrationService] outbox restore failed:', e);
+    }
+  }
+
+  // ── 11f. v30.0: Groupes + messages de groupe ─────────────────────────
+  if (dump.groups != null) {
+    try {
+      await replaceGroupsFromImport(dump.groups);
+    } catch (e) {
+      __DEV__ && console.warn('[migrationService] groups restore failed:', e);
+    }
+  }
+  if (Array.isArray(dump.groupMessages)) {
+    for (const gm of dump.groupMessages) {
+      try {
+        if (gm.groupId && gm.messages) await writeEncrypted(MSG_1TO1_PREFIX + gm.groupId, gm.messages);
+      } catch (e) {
+        __DEV__ && console.warn('[migrationService] group messages restore failed:', e);
+      }
     }
   }
 

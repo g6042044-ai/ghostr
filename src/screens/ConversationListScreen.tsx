@@ -4,7 +4,7 @@
 // v16.0 - Design unifié avec dernier message, statut et heure
 
 import React, { useCallback, useRef, useState, useEffect } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, RefreshControl, Animated, Image, Easing, Alert, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, RefreshControl, Animated, Image, Easing, ActivityIndicator } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -16,13 +16,16 @@ import { sessionService } from '../services/tripleRatchet';
 import { pendingInviteStore, PendingInvite } from '../services/pendingInvites';
 import { inviteWatcher } from '../services/inviteWatcher';
 import { showInAppNotification } from '../components/InAppNotification';
-import { subscribeToAllMessages1to1, getAllUnreadCounts, pollAllSessions, getLocalMessages1to1, clearLocalMessages1to1, clearUnreadCount, waitForSealedSenderReady } from '../services/api1to1';
+import { subscribeToAllMessages1to1, getAllUnreadCounts, pollAllSessions, getLocalMessages1to1, clearLocalMessages1to1, clearUnreadCount, waitForSealedSenderReady, getAllLastMessagePreviews, updateLastMessagePreview, onGroupUpdate } from '../services/api1to1';
 import { isSealedSenderReady } from '../services/sealedSender';
 import { isSessionMutedSync } from '../services/muteService';
 import { isInCall1to1 } from '../services/call1to1Service';
-import { theme, ActionSheet, AlertModal, useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
+import * as groupService from '../services/groupService';
+import { theme, ActionSheet, AlertModal, useTheme, useThemedStyles, type ColorPalette, showAlert } from '../components/ui';
 import { getAvatarColor } from '../components/ui/theme';
 import { CallIndicator } from '../components/CallIndicator';
+import { GroupAvatar } from '../components/GroupAvatar';
+import { GROUPS_ENABLED } from '../config/features';
 import { startHeartbeatService } from '../services/callHeartbeat';
 import { formatCallDuration } from '../services/callMessages';
 import { generateAvatarInitials } from '../services/crypto';
@@ -82,6 +85,10 @@ interface ConversationItem {
   theirFingerprint?: string;
   avatarBase64?: string;
   lastMessage?: LastMessageInfo;
+  // v30.0 — Groupes
+  kind?: 'direct' | 'group';
+  memberCount?: number;
+  groupMembers?: Array<{ fingerprint: string; displayName: string; avatarBase64?: string }>;
 }
 
 // ============================================
@@ -161,18 +168,39 @@ const _keyExtractor = (item: ConversationItem) => item.id;
 // se remplissent en cascade — acceptable et bien plus propre qu'une liste
 // vide.
 //
+// GROUPES : lus de la même façon, depuis la Map RAM de groupService, peuplée
+// par `loadGroups()` sur le chemin critique du boot (App.tsx, aux côtés de
+// sessionService.initialize()). Avant, loadGroups n'était appelé qu'en effet
+// de bord de recoverOrphanedSendingMessages(), déféré de 5 s : les groupes
+// étaient absents ici ET du premier loadConversations, et n'apparaissaient
+// qu'au premier rafraîchissement déclenché par le réseau — d'où les 10 s+
+// avant qu'ils ne s'affichent.
+//
+// Faute de champ d'activité dans GroupRecord, le tri initial d'un groupe
+// utilise `createdAt`. Le 1er loadConversations (< 200 ms) le remplace par
+// le timestamp du dernier message et re-trie : même compromis assumé que
+// pour les aperçus 1:1 ci-dessus.
+//
 // SÉCURITÉ : aucune donnée chiffrée n'est touchée ici. Tous les champs lus
-// (id, displayName, lastActivityAt, fingerprint, avatarBase64) sont en RAM
-// dans des objets JS pur après que la clé locale ait déchiffré l'index de
-// sessions au boot. Si pour une raison quelconque sessionService n'est PAS
-// initialisé (cas extrême : composant rendu hors flux normal), getAllSessions
-// retourne [] et le snapshot est vide — pas de crash, juste un fallback
-// silencieux vers le comportement antérieur (loadConversations remplira).
+// (id, displayName, lastActivityAt, fingerprint, avatarBase64 ; côté groupe
+// groupId, name, avatarBase64, members) sont en RAM dans des objets JS purs
+// après que la clé locale ait déchiffré l'index de sessions et celui des
+// groupes au boot. Aucun secret cryptographique du groupe (groupSeed,
+// sendChainKey) n'est lu. Si pour une raison quelconque sessionService ou
+// groupService n'est PAS initialisé (cas extrême : composant rendu hors flux
+// normal), les accesseurs retournent [] et le snapshot est vide — pas de
+// crash, juste un fallback silencieux vers le comportement antérieur
+// (loadConversations remplira).
 // ════════════════════════════════════════════════════════════════════════════
 function getInitialConversationsSnapshot(): ConversationItem[] {
   try {
     const sessions = sessionService.getAllSessions();
-    if (sessions.length === 0) return [];
+    // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. La Map RAM de
+    // groupService peut être peuplée (loadGroups() reste sur le chemin de boot
+    // pour préserver l'intégrité des données), mais rien n'en sort vers l'UI :
+    // le snapshot ne contient que des conversations 1:1.
+    const groups = GROUPS_ENABLED ? groupService.getAllGroups() : [];
+    if (sessions.length === 0 && groups.length === 0) return [];
     // Fallback name : utilise i18n.t directement (le module i18n est initialisé
     // tôt au boot via initI18n() dans App.tsx, typiquement résolu < 30 ms après
     // le module load — donc bien avant que ConversationListScreen ne mount).
@@ -188,11 +216,30 @@ function getInitialConversationsSnapshot(): ConversationItem[] {
       theirFingerprint: s.theirIdentityKeyFingerprint,
       avatarBase64: s.theirProfile.avatarBase64,
       lastMessage: undefined,
+      kind: 'direct' as const,
     }));
+    for (const g of groups) {
+      items.push({
+        id: g.groupId,
+        name: g.name,
+        lastMessageAt: undefined,
+        createdAt: g.createdAt,
+        unreadCount: 0,
+        avatarBase64: g.avatarBase64,
+        lastMessage: undefined,
+        kind: 'group' as const,
+        memberCount: g.members.length,
+        groupMembers: g.members.map((m) => ({
+          fingerprint: m.fingerprint,
+          displayName: m.displayName,
+          avatarBase64: m.avatarBase64,
+        })),
+      });
+    }
     items.sort((a, b) => (b.lastMessageAt || b.createdAt) - (a.lastMessageAt || a.createdAt));
     return items;
   } catch {
-    // sessionService non initialisé ou erreur quelconque : fallback silencieux.
+    // sessionService/groupService non initialisé ou erreur quelconque : fallback silencieux.
     // loadConversations se chargera de remplir la liste au 1er useFocusEffect.
     return [];
   }
@@ -247,7 +294,7 @@ export function ConversationListScreen() {
   // ════════════════════════════════════════════════════════════════════════
   
   // Cible de navigation en attente. Sentinel `null` = pas d'attente en cours.
-  type GatedTarget = 'Create1to1' | 'Join1to1';
+  type GatedTarget = 'Create1to1' | 'Join1to1' | 'CreateGroup';
   const [pendingTarget, setPendingTarget] = useState<GatedTarget | null>(null);
   // Status affiché dans le modal d'attente (mis à jour par waitForSealedSenderReady)
   const [pendingStatus, setPendingStatus] = useState<string>('');
@@ -330,11 +377,10 @@ export function ConversationListScreen() {
           // Échec après le retry interne du bootstrap : message clair,
           // l'utilisateur peut re-tenter quand il veut (re-tap relancera
           // un cycle frais automatiquement).
-          Alert.alert(
-            t('common.error'),
-            t('errors.secureConnectionTimeout'),
-            [{ text: t('common.ok') }],
-          );
+          showAlert({
+            title: t('common.error'),
+            message: t('errors.secureConnectionTimeout'),
+          });
         }
       })
       .catch(() => {
@@ -476,12 +522,23 @@ export function ConversationListScreen() {
 
   // v16.0: Charger les conversations avec le dernier message
   const loadConversations = useCallback(async () => {
+    // Instrumentation (dev only) : au cold start le thread JS est disputé par
+    // le PoW du sealed sender, et un seul await lent suffit à retarder TOUS les
+    // aperçus — la liste reste alors en « Nouvelle conversation ». Ces relevés
+    // disent lequel, au lieu de laisser deviner.
+    const _t0 = Date.now();
+    const _lap = (label: string) =>
+      __DEV__ && console.log(`[ConversationList] ⏱️ ${label}: ${Date.now() - _t0}ms`);
+    let fullReads1to1 = 0;
+    let fullReadsGroups = 0;
+
     try {
       await sessionService.initialize();
       const sessions = sessionService.getAllSessions();
       
       // v6.1: Charger les compteurs de messages non lus
       const unreadCounts = await getAllUnreadCounts();
+      _lap('unreadCounts');
       
       // PERF A6: Utiliser le cache du dernier message quand il est rempli.
       // Premier appel (cacheFilledRef.current === false) :
@@ -491,21 +548,55 @@ export function ConversationListScreen() {
       //   → Utiliser directement le cache (O(n))
       //   → Le cache est mis à jour incrémentalement par subscribeToAllMessages1to1
       const needsFullLoad = !cacheFilledRef.current;
-      
+
+      // PERF (correctif) : au premier chargement, on lit l'index d'aperçus —
+      // UNE seule entrée AsyncStorage de quelques Ko — au lieu de déchiffrer et
+      // parser l'historique complet de CHAQUE conversation (jusqu'à 1000
+      // messages chacun). C'était le principal coût d'affichage au démarrage.
+      //
+      // L'index n'est qu'un cache : toute session absente déclenche le
+      // chargement complet d'origine, qui repeuple l'index au passage. Après la
+      // première ouverture suivant la mise à jour, plus aucune session ne
+      // manque à l'appel.
+      //
+      // L'index est chargé INCONDITIONNELLEMENT : après la première lecture, il
+      // est en RAM (cf. `_previewIndex` dans api1to1) et l'appel se réduit à une
+      // copie superficielle d'un objet de quelques dizaines d'entrées. Il sert
+      // de repli aux groupes lors des rafraîchissements incrémentaux, quand le
+      // cache RAM ne connaît pas encore une conversation (groupe rejoint alors
+      // que l'écran est déjà affiché) — sans lui, cette ligne resterait sans
+      // aperçu jusqu'au prochain chargement complet.
+      const previews = await getAllLastMessagePreviews();
+      _lap(`previews (${Object.keys(previews).length} entrée(s))`);
+
       const convsPromises = sessions.map(async (session) => {
         let lastMessage: LastMessageInfo | undefined;
         
         if (needsFullLoad) {
-          // Premier chargement : lire depuis le stockage et remplir le cache
-          try {
-            const messages = await getLocalMessages1to1(session.id);
-            if (messages.length > 0) {
-              const sorted = messages.sort((a, b) => b.timestamp - a.timestamp);
-              lastMessage = messageToLastInfo(sorted[0]);
-              lastMessageCacheRef.current.set(session.id, lastMessage);
+          const stub = previews[session.id];
+          if (stub) {
+            // Chemin rapide : l'aperçu suffit. `messageToLastInfo` reste appelé
+            // ici pour que la mise en forme (« Photo », « Message vocal »…)
+            // suive la langue courante au lieu d'être figée à l'écriture.
+            lastMessage = messageToLastInfo(stub);
+            lastMessageCacheRef.current.set(session.id, lastMessage);
+          } else {
+            // Repli : aucun aperçu connu (historique antérieur à la mise à
+            // jour, ou index purgé). On lit tout, et l'index se remplira au
+            // prochain message enregistré pour cette session.
+            try {
+              fullReads1to1++;
+              const messages = await getLocalMessages1to1(session.id);
+              if (messages.length > 0) {
+                const sorted = messages.sort((a, b) => b.timestamp - a.timestamp);
+                lastMessage = messageToLastInfo(sorted[0]);
+                lastMessageCacheRef.current.set(session.id, lastMessage);
+                // Amorcer l'index pour que le prochain démarrage soit rapide.
+                void updateLastMessagePreview(session.id, sorted[0]);
+              }
+            } catch (e) {
+              // Ignorer les erreurs de chargement de messages
             }
-          } catch (e) {
-            // Ignorer les erreurs de chargement de messages
           }
         } else {
           // Appels suivants : utiliser le cache (instantané)
@@ -521,12 +612,170 @@ export function ConversationListScreen() {
           theirFingerprint: session.theirIdentityKeyFingerprint,
           avatarBase64: session.theirProfile.avatarBase64,
           lastMessage,
+          kind: 'direct' as const,
         };
       });
       
-      const convs = await Promise.all(convsPromises);
+      // Annotation explicite : sans elle, TS infère le type des seules lignes
+      // 1:1 (`kind: 'direct'`) et refuse le push des groupes plus bas.
+      let convs: ConversationItem[] = await Promise.all(convsPromises);
+      _lap(`1:1 (${convs.length} conv, ${fullReads1to1} repli(s) historique complet)`);
+
+      // Filet idempotent : garantit que la Map des groupes est peuplée même si
+      // cet écran est atteint par un chemin qui n'a pas awaité `loadGroups()`
+      // au boot (App.tsx le fait sur les trois chemins d'entrée). Retour
+      // immédiat une fois chargé (garde `_loaded`), et no-op silencieux si la
+      // clé de chiffrement n'est pas encore disponible — auquel cas un appel
+      // ultérieur réessaiera.
+      //
+      // DOIT précéder le filtre ci-dessous ET la fusion des groupes : les deux
+      // lisent la Map. C'est l'absence de ce chargement au premier
+      // loadConversations qui faisait apparaître les groupes 10 s trop tard.
+      // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. Inutile de payer ce
+      // chargement quand aucun groupe ne sera affiché.
+      if (GROUPS_ENABLED) {
+        try {
+          await groupService.loadGroups();
+        } catch (e) {
+          __DEV__ && console.warn('[ConversationList] loadGroups failed:', e);
+        }
+      }
+
+      // Masquer les conversations 1:1 VIDES dont le contact est membre d'un
+      // groupe : leur session est préservée pour le transport mesh du groupe,
+      // mais il n'y a aucun historique 1:1 à afficher (conversation « supprimée »).
+      // Elles réapparaissent dès qu'un message 1:1 arrive (lastMessage défini).
+      //
+      // [GROUPES DÉSACTIVÉS] Ce filtre DOIT sauter quand les groupes sont
+      // coupés, sinon il masque une conversation 1:1 vide sans que le groupe
+      // qui justifie ce masquage soit visible : le contact disparaîtrait
+      // purement et simplement de la liste, sans aucun moyen de le retrouver.
+      if (GROUPS_ENABLED) {
+        convs = convs.filter((c) =>
+          c.lastMessage !== undefined ||
+          (c.unreadCount || 0) > 0 ||
+          !c.theirFingerprint ||
+          !groupService.isContactInAnyGroup(c.theirFingerprint)
+        );
+      }
+
+      // v30.0 — Fusionner les GROUPES dans la liste unifiée.
+      //
+      // PERF : les groupes suivent désormais EXACTEMENT la même stratégie
+      // d'aperçu que le 1:1 quelques lignes plus haut. Avant, ce bloc appelait
+      // `getGroupMessages()` — c'est-à-dire `getLocalMessages1to1()`, donc
+      // lecture disque + déchiffrement + JSON.parse + tri de l'historique
+      // COMPLET — pour CHAQUE groupe, en séquentiel, et cela à chaque
+      // rafraîchissement (donc à chaque message entrant, via le subscribe).
+      // C'est précisément le coût que l'index d'aperçus avait supprimé côté
+      // 1:1 et qui avait été oublié ici.
+      //
+      // L'index contient déjà les groupes : les messages de groupe sont
+      // persistés par `saveLocalMessage1to1(groupId, …)` (cf. apiGroups), qui
+      // appelle `updateLastMessagePreview` — les stubs étaient simplement
+      // jamais relus.
+
+      // Les bandeaux système (isSystem) ne sont jamais « de moi » : sans ça,
+      // getMessagePreview() leur collerait un préfixe « Vous: ». Ils sont déjà
+      // persistés avec isMine=false (cf. appendSystemMessage) ; la garde rend
+      // l'invariant explicite là où le champ existe encore — `LastMessageInfo`
+      // ne le transporte pas.
+      const groupLastInfo = (msg: any): LastMessageInfo => {
+        const info = messageToLastInfo(msg);
+        return msg?.isSystem && info.isMine ? { ...info, isMine: false } : info;
+      };
+
+      try {
+        // NOTE — apiGroups n'est PAS importé ici.
+        // Il ne sert qu'au repli « historique complet » ci-dessous, cas rare
+        // (un groupe absent de l'index d'aperçus). L'importer en tête de bloc
+        // coûtait, en dev, un chargement paresseux Metro de ~950 modules —
+        // mesuré à +3,6 s sur l'affichage de la liste, pour un repli utilisé
+        // zéro fois. L'import est donc fait à l'intérieur de la branche qui en
+        // a besoin, et l'abstraction `getGroupMessages` reste préservée.
+        //
+        // Résolution CONCURRENTE, comme pour le 1:1 juste au-dessus. En
+        // séquentiel, un seul groupe dont l'aperçu manque à l'index (donc
+        // lecture de l'historique complet) retardait l'affichage de TOUTE la
+        // liste, aperçus 1:1 compris — le `setConversations` final est unique.
+        // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. La fusion est
+        // neutralisée À LA SOURCE plutôt qu'en sautant le bloc : la liste des
+        // groupes à fusionner est vide, donc `Promise.all` résout sur [] et
+        // rien n'est poussé dans la liste unifiée. Aucune donnée n'est
+        // détruite — les groupes restent sur disque, simplement invisibles.
+        // Neutraliser la source plutôt que la structure garde ce bloc (et ses
+        // trois niveaux de repli d'aperçu) typé et lisible pour la
+        // réactivation.
+        const groupsToMerge = GROUPS_ENABLED ? groupService.getAllGroups() : [];
+        const groupItems = await Promise.all(groupsToMerge.map(async (g) => {
+          let lastMessage: LastMessageInfo | undefined;
+
+          // 1) Cache RAM (rafraîchissements incrémentaux) — instantané.
+          if (!needsFullLoad) {
+            lastMessage = lastMessageCacheRef.current.get(g.groupId);
+          }
+
+          // 2) Index d'aperçus — UNE entrée de quelques centaines d'octets.
+          if (!lastMessage) {
+            const stub = previews[g.groupId];
+            if (stub) {
+              lastMessage = groupLastInfo(stub);
+              lastMessageCacheRef.current.set(g.groupId, lastMessage);
+            }
+          }
+
+          // 3) Repli : aucun aperçu connu (groupe antérieur à l'index, ou index
+          //    purgé). On lit l'historique complet une fois et on amorce
+          //    l'index pour que le prochain démarrage soit rapide. Réservé au
+          //    chargement complet : hors de lui, un groupe sans aperçu est un
+          //    groupe sans message, inutile de payer une lecture disque à
+          //    chaque message entrant.
+          if (!lastMessage && needsFullLoad) {
+            try {
+              fullReadsGroups++;
+              const apiG = await import('../services/apiGroups');
+              const msgs = await apiG.getGroupMessages(g.groupId);
+              if (msgs && msgs.length > 0) {
+                const sorted = msgs.slice().sort((a: any, b: any) => b.timestamp - a.timestamp);
+                const last: any = sorted[0];
+                lastMessage = groupLastInfo(last);
+                lastMessageCacheRef.current.set(g.groupId, lastMessage);
+                void updateLastMessagePreview(g.groupId, last);
+              }
+            } catch (e) {
+              __DEV__ && console.warn('[ConversationList] group history fallback failed:', g.groupId.slice(0, 12), e);
+            }
+          }
+
+          const lastAt = lastMessage?.timestamp || g.createdAt;
+          return {
+            id: g.groupId,
+            name: g.name,
+            lastMessageAt: lastAt,
+            createdAt: g.createdAt,
+            unreadCount: unreadCounts.get(g.groupId) || 0,
+            avatarBase64: g.avatarBase64,
+            lastMessage,
+            kind: 'group' as const,
+            memberCount: g.members.length,
+            groupMembers: g.members.map((m: any) => ({ fingerprint: m.fingerprint, displayName: m.displayName, avatarBase64: m.avatarBase64 })),
+          };
+        }));
+        // push(...tableau) évité : un spread trop large dépasse la limite
+        // d'arguments de l'appel.
+        for (const item of groupItems) convs.push(item);
+        _lap(`groupes (${groupItems.length}, ${fullReadsGroups} repli(s) historique complet)`);
+      } catch (e) {
+        // Dégradation : liste 1:1 seulement. Le `catch {}` muet d'origine est
+        // ce qui rendait invisible l'absence des groupes au démarrage — aucune
+        // trace, aucun moyen de distinguer « pas de groupe » de « groupes pas
+        // encore chargés ». On journalise désormais en dev.
+        __DEV__ && console.warn('[ConversationList] group merge failed:', e);
+      }
+
       convs.sort((a, b) => (b.lastMessageAt || b.createdAt) - (a.lastMessageAt || a.createdAt));
       setConversations(convs);
+      _lap(`TOTAL — liste affichée (${convs.length} conv)`);
       
       if (needsFullLoad) {
         cacheFilledRef.current = true;
@@ -623,6 +872,30 @@ export function ConversationListScreen() {
       };
     }, [loadConversations])
   );
+
+  // v30.0 — Rafraîchir la liste quand un groupe change (nouveau message,
+  // roster modifié, welcome reçu…). onGroupUpdate est émis par api1to1 à la
+  // réception de tout message de groupe visible.
+  //
+  // `onGroupUpdate` est importé STATIQUEMENT : api1to1 fait déjà partie du
+  // graphe statique de cet écran (cf. l'import en tête de fichier), donc
+  // l'`await import()` d'origine n'apportait aucun chargement paresseux — il
+  // ne faisait que déclencher une requête de bundle séparée côté Metro en dev.
+  //
+  // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. Aucun groupe n'étant
+  // affiché, un message de groupe entrant n'a rien à rafraîchir : on ne
+  // s'abonne pas, plutôt que de déclencher un rechargement complet de la liste
+  // pour un changement invisible. Le dispatch réseau côté api1to1/apiGroups
+  // reste, lui, intact.
+  useEffect(() => {
+    if (!GROUPS_ENABLED) return;
+    const unsub = onGroupUpdate(() => {
+      // Invalider le cache du dernier message puis recharger.
+      cacheFilledRef.current = false;
+      loadConversations().catch(() => {});
+    });
+    return () => unsub();
+  }, [loadConversations]);
 
   useEffect(() => {
     startHeartbeatService().catch(console.error);
@@ -760,10 +1033,10 @@ export function ConversationListScreen() {
     if (conversationToDelete) {
       // BUG FIX #5: Bloquer la suppression si un appel est en cours avec ce contact
       if (isInCall1to1()) {
-        Alert.alert(
-          t('conversationList.callInProgressTitle'),
-          t('conversationList.callInProgressMessage'),
-        );
+        showAlert({
+          title: t('conversationList.callInProgressTitle'),
+          message: t('conversationList.callInProgressMessage'),
+        });
         setShowDeleteConfirm(false);
         return;
       }
@@ -775,7 +1048,20 @@ export function ConversationListScreen() {
       try { await AsyncStorage.removeItem(`@ghostr_reactions_${conversationToDelete.id}`); } catch {}
       // PERF A6: Nettoyer le cache du dernier message pour cette session
       lastMessageCacheRef.current.delete(conversationToDelete.id);
-      await sessionService.deleteSession(conversationToDelete.id);
+      // Préserver la session si le contact est membre d'un groupe (transport
+      // mesh) : on ne supprime alors que l'historique 1:1. La conversation vidée
+      // est masquée par le filtre « vide + dans un groupe » de loadConversations.
+      //
+      // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. Cette préservation
+      // n'a plus de sens quand les groupes sont coupés : le filtre qui masquait
+      // la conversation vidée est lui aussi désactivé (il ferait disparaître le
+      // contact sans raison visible), donc la « suppression » laisserait une
+      // conversation vide dans la liste. On supprime alors la session pour de
+      // bon — comportement 1:1 attendu par l'utilisateur.
+      const delFp = sessionService.getSession(conversationToDelete.id)?.theirIdentityKeyFingerprint;
+      if (!delFp || !GROUPS_ENABLED || !groupService.isContactInAnyGroup(delFp)) {
+        await sessionService.deleteSession(conversationToDelete.id);
+      }
       await loadConversations();
       setShowDeleteConfirm(false);
       setConversationToDelete(null);
@@ -814,20 +1100,30 @@ export function ConversationListScreen() {
         onLongPress={() => handleConversationLongPress(item)}
         activeOpacity={0.7}
       >
-        {/* Avatar rond */}
+        {/* Avatar rond — groupe (composite) ou contact 1:1 */}
         <View style={styles.avatarContainer}>
-          <View style={[styles.avatar, styles.avatarRound, !item.avatarBase64 && { backgroundColor: getAvatarColor(item.id) }]}>
-            {item.avatarBase64 ? (
-              <Image 
-                source={{ uri: item.avatarBase64 }} 
-                style={[styles.avatarImage, styles.avatarImageRound]}
-              />
-            ) : (
-              <Text style={styles.avatarText}>
-                {generateAvatarInitials(item.name)}
-              </Text>
-            )}
-          </View>
+          {item.kind === 'group' ? (
+            <GroupAvatar
+              name={item.name}
+              members={item.groupMembers}
+              groupId={item.id}
+              avatarUri={item.avatarBase64}
+              size="large"
+            />
+          ) : (
+            <View style={[styles.avatar, styles.avatarRound, !item.avatarBase64 && { backgroundColor: getAvatarColor(item.id) }]}>
+              {item.avatarBase64 ? (
+                <Image 
+                  source={{ uri: item.avatarBase64 }} 
+                  style={[styles.avatarImage, styles.avatarImageRound]}
+                />
+              ) : (
+                <Text style={styles.avatarText}>
+                  {generateAvatarInitials(item.name)}
+                </Text>
+              )}
+            </View>
+          )}
           <CallIndicator 
             conversationId={item.id} 
             size="medium"
@@ -897,37 +1193,65 @@ export function ConversationListScreen() {
       </Text>
       
       <View style={styles.emptyActions}>
-        <TouchableOpacity 
+        {/*
+          `adjustsFontSizeToFit` retiré des trois boutons : il servait à
+          compenser la contrainte de largeur du layout en rangée. En pile,
+          le libellé tient, et laisser la police rétrécir automatiquement
+          annulerait le réglage de taille de texte système de
+          l'utilisateur — exactement ce que l'accessibilité interdit.
+        */}
+        <TouchableOpacity
           style={styles.emptyButtonPrimary}
           onPress={() => handleSecureNavigate('Create1to1')}
           activeOpacity={0.8}
+          accessibilityRole="button"
+          accessibilityLabel={t('conversationList.emptyCreate')}
         >
           <Ionicons name="add-circle-outline" size={20} color={colors.textOnPrimary} />
-          <Text
-            style={styles.emptyButtonTextPrimary}
-            numberOfLines={1}
-            adjustsFontSizeToFit
-            minimumFontScale={0.82}
-          >
+          <Text style={styles.emptyButtonTextPrimary} numberOfLines={2}>
             {t('conversationList.emptyCreate')}
           </Text>
         </TouchableOpacity>
-        
-        <TouchableOpacity 
+
+        <TouchableOpacity
           style={styles.emptyButtonSecondary}
           onPress={() => handleSecureNavigate('Join1to1')}
           activeOpacity={0.8}
+          accessibilityRole="button"
+          accessibilityLabel={t('conversationList.emptyJoin')}
         >
           <Ionicons name="scan-outline" size={20} color={colors.text} />
-          <Text
-            style={styles.emptyButtonTextSecondary}
-            numberOfLines={1}
-            adjustsFontSizeToFit
-            minimumFontScale={0.82}
-          >
+          <Text style={styles.emptyButtonTextSecondary} numberOfLines={2}>
             {t('conversationList.emptyJoin')}
           </Text>
         </TouchableOpacity>
+
+        {/*
+          3ᵉ action — parité avec le FAB. L'état vide ne proposait que
+          « Créer » et « Rejoindre » alors que le menu du FAB offre aussi
+          « Nouveau groupe ». Un utilisateur qui découvre l'app se fie à
+          l'état vide, pas au FAB : la fonctionnalité groupe lui était de
+          fait invisible tant qu'il n'avait aucune conversation.
+
+          [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. L'état vide
+          retombe donc à deux actions (« Créer » / « Rejoindre »), exactement
+          comme le menu du FAB : la parité entre les deux surfaces est
+          maintenue dans les deux états du drapeau.
+        */}
+        {GROUPS_ENABLED && (
+          <TouchableOpacity
+            style={styles.emptyButtonSecondary}
+            onPress={() => handleSecureNavigate('CreateGroup')}
+            activeOpacity={0.8}
+            accessibilityRole="button"
+            accessibilityLabel={t('groups.menu.createTitle')}
+          >
+            <Ionicons name="people-outline" size={20} color={colors.text} />
+            <Text style={styles.emptyButtonTextSecondary} numberOfLines={2}>
+              {t('groups.menu.createTitle')}
+            </Text>
+          </TouchableOpacity>
+        )}
       </View>
 
 
@@ -1065,6 +1389,16 @@ export function ConversationListScreen() {
             icon: <Ionicons name="scan-outline" size={24} color={colors.primary} />,
             onPress: () => handleSecureNavigate('Join1to1'),
           },
+          // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. L'entrée
+          // « Nouveau groupe » est retirée du menu du FAB. Le spread
+          // conditionnel évite un `null` dans le tableau, que l'ActionSheet ne
+          // sait pas rendre (il map sur `items` sans filtrer).
+          ...(GROUPS_ENABLED ? [{
+            title: t('groups.menu.createTitle'),
+            subtitle: t('groups.menu.createSubtitle'),
+            icon: <Ionicons name="people-outline" size={24} color={colors.primary} />,
+            onPress: () => handleSecureNavigate('CreateGroup'),
+          }] : []),
         ]}
       />
 
@@ -1478,13 +1812,28 @@ const makeStyles = (colors: ColorPalette) => ({
     lineHeight: 22,
     marginBottom: 32,
   },
+  // ══════════════════════════════════════════════════════════════════════
+  // Passage d'une RANGÉE à une PILE verticale.
+  //
+  // Avec deux boutons `flex: 1` côte à côte, chaque libellé disposait de la
+  // moitié de l'écran. En ajoutant la 3ᵉ action (« Nouveau groupe »), on
+  // tombait à un tiers — soit ~100 px pour « Gruppe erstellen » ou
+  // « Создать группу », icône comprise. Les libellés auraient été réduits
+  // au `minimumFontScale` de 0,82 puis tronqués, et les cibles tactiles
+  // seraient passées sous le seuil confortable.
+  //
+  // En pile, chaque action occupe toute la largeur : libellé entier quelle
+  // que soit la langue, cible tactile pleine largeur × 48 px, et la
+  // hiérarchie reste lisible (le bouton plein en premier, les deux
+  // secondaires ensuite).
+  // ══════════════════════════════════════════════════════════════════════
   emptyActions: {
-    flexDirection: 'row',
+    flexDirection: 'column',
     gap: 12,
     width: '100%',
   },
   emptyButtonPrimary: {
-    flex: 1,
+    width: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -1495,7 +1844,7 @@ const makeStyles = (colors: ColorPalette) => ({
     ...theme.shadow.glow,
   },
   emptyButtonSecondary: {
-    flex: 1,
+    width: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',

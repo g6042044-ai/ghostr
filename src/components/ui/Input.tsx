@@ -152,13 +152,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   value,
   onChangeText,
   onSend,
-  placeholder = 'Message...',
+  placeholder,
   sending = false,
   disabled = false,
   maxLength = 5000,
 }) => {
   const { colors } = useTheme();
   const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
+  const resolvedPlaceholder = placeholder ?? t('conversation.messageInputPlaceholder');
   const inputRef = useRef<TextInput>(null);
   const canSend = value.trim().length > 0 && !sending && !disabled;
 
@@ -170,7 +172,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
           style={styles.chatInput}
           value={value}
           onChangeText={onChangeText}
-          placeholder={placeholder}
+          placeholder={resolvedPlaceholder}
           placeholderTextColor={colors.placeholder}
           multiline
           maxLength={maxLength}
@@ -204,12 +206,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 export const SearchInput: React.FC<SearchInputProps> = ({
   value,
   onChangeText,
-  placeholder = 'Rechercher...',
+  placeholder,
   onClear,
   autoFocus = false,
 }) => {
   const { colors } = useTheme();
   const styles = useThemedStyles(makeStyles);
+  const { t } = useTranslation();
+  const resolvedPlaceholder = placeholder ?? t('input.searchPlaceholder');
   return (
     <View style={styles.searchContainer}>
       <View style={styles.searchIconWrapper}>
@@ -220,7 +224,7 @@ export const SearchInput: React.FC<SearchInputProps> = ({
         style={styles.searchInput}
         value={value}
         onChangeText={onChangeText}
-        placeholder={placeholder}
+        placeholder={resolvedPlaceholder}
         placeholderTextColor={colors.placeholder}
         autoFocus={autoFocus}
         returnKeyType="search"

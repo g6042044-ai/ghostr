@@ -46,21 +46,15 @@ const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 // Tailles de padding (paliers pour masquer la longueur réelle)
 const PADDING_SIZES = [256, 1024, 4096, 16384, 65536];
 
-// Couleurs pour les avatars (palette harmonieuse)
-export const AVATAR_COLORS = [
-  '#FF6B6B', // Rouge corail
-  '#4ECDC4', // Turquoise
-  '#45B7D1', // Bleu ciel
-  '#96CEB4', // Vert menthe
-  '#FFEAA7', // Jaune pastel
-  '#DDA0DD', // Prune
-  '#98D8C8', // Vert d'eau
-  '#F7DC6F', // Or
-  '#BB8FCE', // Violet
-  '#85C1E9', // Bleu poudre
-  '#F8B500', // Ambre
-  '#00CED1', // Cyan foncé
-];
+// La palette d'avatars a été DÉPLACÉE dans le design system
+// (`components/ui/theme.ts` → `avatarColors` / `getAvatarColor`).
+//
+// Elle n'avait rien à faire ici : ce module est un service cryptographique,
+// il n'a pas à connaître la charte graphique. Surtout, cette copie divergeait
+// des deux autres palettes du projet, si bien qu'un même contact changeait
+// de couleur entre sa fiche et la liste des conversations.
+//
+// `generateColorIndex` reste ci-dessous : c'est un hash pur, sans couleur.
 
 // ============================================
 // UTILITAIRES (déclarés en premier car utilisés par HMAC)
@@ -842,29 +836,14 @@ export async function generateRoomAuthToken(
   return encodeBase64(tokenBytes);
 }
 
-/**
- * Génère un index de couleur déterministe à partir d'un senderToken
- * @param senderToken - Le token de l'expéditeur
- * @returns Index de couleur (0-11)
- */
-export function generateColorIndex(senderToken: string): number {
-  let hash = 0;
-  for (let i = 0; i < senderToken.length; i++) {
-    const char = senderToken.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
-  }
-  return Math.abs(hash) % AVATAR_COLORS.length;
-}
+// `generateColorIndex` a été supprimée avec la palette : elle n'avait plus
+// aucun appelant une fois `generateColorFromToken` retirée. Le hash équivalent
+// vit désormais dans `getAvatarColor` (components/ui/theme.ts), au plus près
+// de la palette qu'il indexe.
 
-/**
- * Génère une couleur déterministe à partir d'un senderToken
- * @param senderToken - Le token de l'expéditeur
- * @returns Couleur hexadécimale
- */
-export function generateColorFromToken(senderToken: string): string {
-  return AVATAR_COLORS[generateColorIndex(senderToken)];
-}
+// `generateColorFromToken` a été retirée : voir `getAvatarColor` dans
+// `components/ui/theme.ts`, qui applique le MÊME hash sur la palette unique
+// du design system.
 
 /**
  * Génère les initiales pour un avatar

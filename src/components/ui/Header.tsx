@@ -6,9 +6,9 @@
 // MIGRATION NOTE
 // ────────────────────────────────────────────────────────────────────────────
 // L'ancienne version v2 utilisait un `StyleSheet.create` au top-level qui
-// capturait `theme.colors.X` au moment de l'import (= dark uniquement). Les
-// styles ne pouvaient pas répondre à un changement de thème — cf.
-// THEME_MIGRATION.md.
+// capturait `theme.colors.X` au moment de l'import (= sombre uniquement).
+// Les styles ne pouvaient donc pas répondre à un changement de thème.
+// `theme.colors` a depuis été entièrement supprimé (cf. ./theme.ts).
 //
 // Ici on déplace `StyleSheet.create` à l'intérieur de chaque sous-composant
 // via `useThemedStyles(builder)`. Le builder est mémoïsé par référence de
@@ -32,6 +32,7 @@ import {
   ViewStyle,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Ionicons } from '@expo/vector-icons';
 import { useTranslation } from 'react-i18next';
 import { useTheme, useThemedStyles } from './ThemeContext';
 import { theme as themeStatic } from './theme';
@@ -60,13 +61,24 @@ interface ChatHeaderProps {
   subtitle?: string;
   avatar?: React.ReactNode;
   onBackPress: () => void;
-  onMenuPress?: () => void;
   onTitlePress?: () => void;
   isOnline?: boolean;
-  isTyping?: boolean;
+  /**
+   * Affiche le cadenas « chiffré de bout en bout » à côté du titre.
+   *
+   * NOTE Phase 2 : la prop est aujourd'hui reçue mais pas encore rendue —
+   * le bandeau et le sous-titre « Chiffré post-quantique » sont l'item 17
+   * de la refonte. La prop est conservée parce que l'appelant la passe déjà
+   * et qu'elle documente l'intention.
+   */
   isEncrypted?: boolean;
   rightActions?: React.ReactNode;
 }
+// `onMenuPress` et `isTyping` ont été retirés de cette interface : aucun
+// appelant ne les fournissait, et `onMenuPress` n'était même pas déstructuré
+// par le composant — un menu passé en prop n'aurait jamais été affiché.
+// L'indicateur de frappe est par ailleurs un signal de présence, contraire
+// au positionnement métadonnées-minimales de l'app.
 
 interface SelectionHeaderProps {
   selectedCount: number;
@@ -103,6 +115,7 @@ export const Header: React.FC<HeaderProps> = ({
   elevated = false,
 }) => {
   const insets = useSafeAreaInsets();
+  const { t } = useTranslation();
   const { colors, isDark } = useTheme();
   const styles = useThemedStyles(makeStyles);
   // Default backgroundColor resolved lazily from the live palette — callers
@@ -143,8 +156,10 @@ export const Header: React.FC<HeaderProps> = ({
               onPress={onBackPress}
               activeOpacity={0.7}
               hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityRole="button"
+              accessibilityLabel={t('common.back')}
             >
-              <Text style={styles.backIcon}>‹</Text>
+              <Ionicons name="chevron-back" size={24} color={colors.primary} />
             </TouchableOpacity>
           ) : leftComponent ? (
             leftComponent
@@ -189,10 +204,8 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
   subtitle,
   avatar,
   onBackPress,
-  onMenuPress,
   onTitlePress,
   isOnline = false,
-  isTyping = false,
   isEncrypted = true,
   rightActions,
 }) => {
@@ -201,7 +214,7 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
   const { colors, isDark } = useTheme();
   const styles = useThemedStyles(makeStyles);
 
-  const subtitleText = isTyping ? t('conversation.typing') : (subtitle || '');
+  const subtitleText = subtitle || '';
   const showSubtitle = subtitleText.length > 0;
 
   const headerInfoContent = (
@@ -225,13 +238,7 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
           {title}
         </Text>
         {showSubtitle && (
-          <Text
-            style={[
-              styles.chatHeaderSubtitle,
-              isTyping && styles.chatHeaderTyping,
-            ]}
-            numberOfLines={1}
-          >
+          <Text style={styles.chatHeaderSubtitle} numberOfLines={1}>
             {subtitleText}
           </Text>
         )}
@@ -256,8 +263,10 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
           onPress={onBackPress}
           activeOpacity={0.7}
           hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
+          accessibilityRole="button"
+          accessibilityLabel={t('common.back')}
         >
-          <Text style={styles.chatBackIcon}>‹</Text>
+          <Ionicons name="chevron-back" size={24} color={colors.primary} />
         </TouchableOpacity>
 
         {onTitlePress ? (
@@ -318,8 +327,10 @@ export const SelectionHeader: React.FC<SelectionHeaderProps> = ({
           style={styles.selectionClose}
           onPress={onClose}
           activeOpacity={0.7}
+          accessibilityRole="button"
+          accessibilityLabel={t('common.cancel')}
         >
-          <Text style={styles.selectionCloseIcon}>✕</Text>
+          <Ionicons name="close" size={24} color={colors.textOnPrimary} />
         </TouchableOpacity>
 
         <Text style={styles.selectionCount}>
@@ -333,8 +344,10 @@ export const SelectionHeader: React.FC<SelectionHeaderProps> = ({
               style={styles.selectionAction}
               onPress={onSelectAll}
               activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel={t('header.selectAll')}
             >
-              <Text style={styles.selectionActionIcon}>☑️</Text>
+              <Ionicons name="checkbox-outline" size={22} color={colors.textOnPrimary} />
             </TouchableOpacity>
           )}
           {onDelete && (
@@ -342,8 +355,10 @@ export const SelectionHeader: React.FC<SelectionHeaderProps> = ({
               style={styles.selectionAction}
               onPress={onDelete}
               activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel={t('common.delete')}
             >
-              <Text style={styles.selectionActionIcon}>🗑️</Text>
+              <Ionicons name="trash-outline" size={22} color={colors.textOnPrimary} />
             </TouchableOpacity>
           )}
         </View>
@@ -452,11 +467,6 @@ const makeStyles = (colors: ColorPalette) =>
       alignItems: 'center',
       justifyContent: 'center',
     },
-    backIcon: {
-      fontSize: 32,
-      color: colors.primary,
-      fontWeight: '300',
-    },
     placeholder: {
       width: 44,
     },
@@ -478,11 +488,6 @@ const makeStyles = (colors: ColorPalette) =>
       height: HEADER_CONTENT_HEIGHT,
       alignItems: 'center',
       justifyContent: 'center',
-    },
-    chatBackIcon: {
-      fontSize: 32,
-      color: colors.primary,
-      fontWeight: '300',
     },
     chatHeaderTouchable: {
       flex: 1,
@@ -537,9 +542,6 @@ const makeStyles = (colors: ColorPalette) =>
       color: colors.textSecondary,
       marginTop: 1,
     },
-    chatHeaderTyping: {
-      color: colors.typing,
-    },
     chatHeaderActions: {
       flexDirection: 'row',
       alignItems: 'center',
@@ -571,11 +573,6 @@ const makeStyles = (colors: ColorPalette) =>
       alignItems: 'center',
       justifyContent: 'center',
     },
-    selectionCloseIcon: {
-      fontSize: 18,
-      color: colors.textOnPrimary,
-      fontWeight: '600',
-    },
     selectionCount: {
       flex: 1,
       fontSize: themeStatic.fontSize.lg,
@@ -591,9 +588,6 @@ const makeStyles = (colors: ColorPalette) =>
       height: 44,
       alignItems: 'center',
       justifyContent: 'center',
-    },
-    selectionActionIcon: {
-      fontSize: 20,
     },
 
     // Large Header

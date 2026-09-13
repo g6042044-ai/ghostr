@@ -16,18 +16,49 @@
 //
 //   1. Tente d'abord `getPermissionsAsync()` (cache OS) — si déjà `granted`,
 //      retourne immédiatement sans dialog.
-//   2. Sinon, appelle `requestPermissionsAsync()` — déclenche le dialog OS.
-//      Le `suppressLock()` est posé automatiquement avant, et libéré après
-//      avec un délai de grâce (sur Android, le dialog fait passer l'app en
-//      background et le retour 'active' arrive avec quelques ms de retard).
-//   3. Mappe le résultat sur 3 états utiles :
+//   2. Sinon, appelle TOUJOURS `requestPermissionsAsync()` — déclenche le
+//      dialog OS. Le `suppressLock()` est posé automatiquement avant, et
+//      libéré après avec un délai de grâce (sur Android, le dialog fait passer
+//      l'app en background et le retour 'active' arrive avec quelques ms de
+//      retard). Voir la section "canAskAgain non fiable" ci-dessous : on ne
+//      court-circuite JAMAIS cette étape sur la foi du `get`.
+//   3. Mappe le résultat OBTENU APRÈS TENTATIVE sur 3 états utiles :
 //        - 'granted' : utilisable
 //        - 'denied'  : refusé cette fois, mais l'utilisateur peut re-prompter
 //                      → on lui redemande la prochaine fois (pas de cache local)
-//        - 'blocked' : refusé définitivement (Android "Ne plus demander",
-//                      iOS refus initial sans possibilité de redemander).
+//        - 'blocked' : refusé définitivement (Android "Ne plus demander" ou
+//                      2e refus depuis Android 11, iOS refus initial sans
+//                      possibilité de redemander).
 //                      → seule solution : Paramètres système. On affiche un
 //                      Alert avec un bouton "Ouvrir les paramètres".
+//
+// Les 5 permissions (micro, caméra, galerie, sauvegarde photo, notifications)
+// passent par le MÊME helper `ensurePermission()` : un seul comportement à
+// comprendre, à tester et à corriger.
+//
+// ─── PIÈGE : `canAskAgain` n'est pas fiable AVANT tentative ─────────────
+//
+// Sur Android, expo calcule `canAskAgain` avec
+// `ActivityCompat.shouldShowRequestPermissionRationale()`
+// (expo-modules-core/.../PermissionsService.kt). Cette API système renvoie
+// `false` dans DEUX cas indistinguables :
+//   (a) l'utilisateur n'a jamais refusé — le dialog s'afficherait très bien ;
+//   (b) l'utilisateur a refusé définitivement — le dialog ne s'affichera plus.
+// Expo tente de les départager avec un cache maison (SharedPreferences
+// `expo.modules.permissions.asked`). Ce cache se désynchronise de l'OS :
+// Android Auto Backup le restaure à la réinstallation alors que les
+// permissions runtime, elles, repartent à zéro ; l'option "Toujours demander"
+// produit le même faux positif. Résultat : `getPermissionsAsync()` répond
+// status=denied + canAskAgain=false sur une install NEUVE, et l'app envoyait
+// l'utilisateur dans les Réglages système sans lui avoir jamais montré le
+// moindre dialog (bugs expo #23805, #36883, #41123, #19047 — toujours ouverts).
+//
+// Règle qui en découle, appliquée à toutes les permissions de ce fichier :
+// on ne conclut "bloqué" QUE sur le retour de `requestPermissionsAsync()`.
+// Quand la permission est réellement bloquée, cet appel est inoffensif : l'OS
+// retourne 'denied' en quelques ms sans rien afficher. Quand elle ne l'est
+// pas, l'utilisateur voit enfin son dialog. On ne perd rien, on gagne le cas
+// (a) — d'où : tenter d'abord, conclure ensuite.
 //
 // ─── Stratégie "redemander à chaque fois" ───────────────────────────────
 //
@@ -205,6 +236,70 @@ export interface EnsureOptions {
   showAlertOnFailure?: boolean;
 }
 
+/** Forme minimale commune aux retours `getPermissionsAsync` / `requestPermissionsAsync`. */
+type RawPermission = { status: string; canAskAgain?: boolean };
+
+/**
+ * Cœur commun des 5 `ensureXxxPermission()`. Toute permission de l'app suit
+ * ce parcours, sans exception :
+ *
+ *   1. `get()` → si 'granted', on sort sans rien afficher.
+ *   2. Sinon `request()` — TOUJOURS, même si `get()` a répondu canAskAgain=false.
+ *      C'est le point clé : ce flag est un faux positif fréquent sur Android
+ *      (cf. l'en-tête du fichier). Sur une permission réellement bloquée,
+ *      l'appel retourne 'denied' immédiatement sans afficher de dialog — donc
+ *      aucun risque de dialog parasite, et on récupère le cas où le dialog
+ *      était en fait affichable.
+ *   3. On ne classe 'blocked' — donc on ne propose les Réglages système — que
+ *      sur le résultat de cette tentative.
+ *
+ * @param kind    type de permission, pour les libellés des Alerts
+ * @param get     lecture de l'état courant (aucun dialog)
+ * @param request demande effective (dialog OS si l'OS l'autorise encore)
+ */
+async function ensurePermission(
+  kind: PermissionKind,
+  get: () => Promise<RawPermission>,
+  request: () => Promise<RawPermission>,
+  options: EnsureOptions = {},
+): Promise<PermissionResult> {
+  const showAlert = options.showAlertOnFailure !== false;
+
+  // 1. Déjà accordée ? On sort immédiatement, sans dialog ni suppressLock.
+  try {
+    const current = normalize(await get());
+    if (current.status === 'granted') {
+      return current;
+    }
+  } catch {
+    // getPermissionsAsync ne devrait pas throw, mais s'il le fait on continue
+    // vers le request : c'est lui qui fait autorité.
+  }
+
+  // 2. Tentative réelle. `withLockSuppression` évite que l'app se verrouille
+  //    pendant que le dialog OS a le focus (Android passe en 'background').
+  let normalized: PermissionResult;
+  try {
+    normalized = normalize(await withLockSuppression(request));
+  } catch {
+    // Un throw ici (module natif indisponible, activité détruite) ne doit pas
+    // remonter en exception non gérée chez le caller : on le traite comme un
+    // refus re-tentable, l'utilisateur pourra réessayer au prochain tap.
+    return { status: 'denied', canAskAgain: true };
+  }
+
+  // 3. Verdict, uniquement après tentative.
+  if (showAlert && normalized.status !== 'granted') {
+    if (normalized.status === 'blocked') {
+      showBlockedAlert(kind);
+    } else {
+      showDeniedAlert(kind);
+    }
+  }
+
+  return normalized;
+}
+
 // ─── Microphone ─────────────────────────────────────────────────────────
 
 /**
@@ -220,38 +315,12 @@ export interface EnsureOptions {
 export async function ensureMicrophonePermission(
   options: EnsureOptions = {},
 ): Promise<PermissionResult> {
-  const showAlert = options.showAlertOnFailure !== false;
-
-  // 1. Vérifier l'état actuel (sans prompt si déjà granted)
-  try {
-    const current = await Audio.getPermissionsAsync();
-    const currentNormalized = normalize(current);
-    if (currentNormalized.status === 'granted') {
-      return currentNormalized;
-    }
-    // Si déjà bloqué (canAskAgain=false), ne pas tenter un prompt qui ne
-    // donnera rien — afficher direct le dialog Settings.
-    if (currentNormalized.status === 'blocked') {
-      if (showAlert) showBlockedAlert('microphone');
-      return currentNormalized;
-    }
-  } catch {
-    // getPermissionsAsync n'a pas dû fail mais on continue vers le request.
-  }
-
-  // 2. Tenter le request (prompt OS)
-  const result = await withLockSuppression(() => Audio.requestPermissionsAsync());
-  const normalized = normalize(result);
-
-  if (showAlert && normalized.status !== 'granted') {
-    if (normalized.status === 'blocked') {
-      showBlockedAlert('microphone');
-    } else {
-      showDeniedAlert('microphone');
-    }
-  }
-
-  return normalized;
+  return ensurePermission(
+    'microphone',
+    () => Audio.getPermissionsAsync(),
+    () => Audio.requestPermissionsAsync(),
+    options,
+  );
 }
 
 // ─── Camera ─────────────────────────────────────────────────────────────
@@ -262,37 +331,20 @@ export async function ensureMicrophonePermission(
  * Note : si tu utilises `expo-camera` (Camera.requestCameraPermissionsAsync)
  * dans un écran spécifique (ex: Join1to1Screen avec useCameraPermissions),
  * tu peux soit utiliser ce service, soit garder le hook — le résultat est
- * identique côté OS (même permission Android/iOS sous-jacente).
+ * identique côté OS (même permission Android/iOS sous-jacente). En revanche
+ * le hook ne protège PAS du faux `canAskAgain=false` : un écran qui l'utilise
+ * doit tenter `requestPermission()` avant de conclure au blocage, comme le
+ * fait Join1to1Screen avec son flag `permissionPrompted`.
  */
 export async function ensureCameraPermission(
   options: EnsureOptions = {},
 ): Promise<PermissionResult> {
-  const showAlert = options.showAlertOnFailure !== false;
-
-  try {
-    const current = await ImagePicker.getCameraPermissionsAsync();
-    const currentNormalized = normalize(current);
-    if (currentNormalized.status === 'granted') {
-      return currentNormalized;
-    }
-    if (currentNormalized.status === 'blocked') {
-      if (showAlert) showBlockedAlert('camera');
-      return currentNormalized;
-    }
-  } catch {}
-
-  const result = await withLockSuppression(() => ImagePicker.requestCameraPermissionsAsync());
-  const normalized = normalize(result);
-
-  if (showAlert && normalized.status !== 'granted') {
-    if (normalized.status === 'blocked') {
-      showBlockedAlert('camera');
-    } else {
-      showDeniedAlert('camera');
-    }
-  }
-
-  return normalized;
+  return ensurePermission(
+    'camera',
+    () => ImagePicker.getCameraPermissionsAsync(),
+    () => ImagePicker.requestCameraPermissionsAsync(),
+    options,
+  );
 }
 
 // ─── Galerie (lecture) ──────────────────────────────────────────────────
@@ -312,34 +364,12 @@ export async function ensureCameraPermission(
 export async function ensureMediaLibraryPermission(
   options: EnsureOptions = {},
 ): Promise<PermissionResult> {
-  const showAlert = options.showAlertOnFailure !== false;
-
-  try {
-    const current = await ImagePicker.getMediaLibraryPermissionsAsync();
-    const currentNormalized = normalize(current);
-    if (currentNormalized.status === 'granted') {
-      return currentNormalized;
-    }
-    if (currentNormalized.status === 'blocked') {
-      if (showAlert) showBlockedAlert('mediaLibrary');
-      return currentNormalized;
-    }
-  } catch {}
-
-  const result = await withLockSuppression(() =>
-    ImagePicker.requestMediaLibraryPermissionsAsync(),
+  return ensurePermission(
+    'mediaLibrary',
+    () => ImagePicker.getMediaLibraryPermissionsAsync(),
+    () => ImagePicker.requestMediaLibraryPermissionsAsync(),
+    options,
   );
-  const normalized = normalize(result);
-
-  if (showAlert && normalized.status !== 'granted') {
-    if (normalized.status === 'blocked') {
-      showBlockedAlert('mediaLibrary');
-    } else {
-      showDeniedAlert('mediaLibrary');
-    }
-  }
-
-  return normalized;
 }
 
 // ─── Galerie (écriture) ─────────────────────────────────────────────────
@@ -355,40 +385,21 @@ export async function ensureMediaLibraryPermission(
 export async function ensureSaveToLibraryPermission(
   options: EnsureOptions = {},
 ): Promise<PermissionResult> {
-  const showAlert = options.showAlertOnFailure !== false;
-
-  try {
-    // MediaLibrary.getPermissionsAsync({ writeOnly: true }) : iOS uniquement
-    // demande la perm "add" (NSPhotoLibraryAdd) si dispo. Sur Android, écrire
-    // dans le shared MediaStore via MediaLibrary.saveToLibraryAsync ne demande
-    // PAS de permission depuis API 29 — donc on retourne granted directement.
-    if (Platform.OS === 'android' && Platform.Version >= 29) {
-      return { status: 'granted', canAskAgain: true };
-    }
-
-    const current = await MediaLibrary.getPermissionsAsync(true);
-    const currentNormalized = normalize(current);
-    if (currentNormalized.status === 'granted') {
-      return currentNormalized;
-    }
-    if (currentNormalized.status === 'blocked') {
-      if (showAlert) showBlockedAlert('saveToLibrary');
-      return currentNormalized;
-    }
-  } catch {}
-
-  const result = await withLockSuppression(() => MediaLibrary.requestPermissionsAsync(true));
-  const normalized = normalize(result);
-
-  if (showAlert && normalized.status !== 'granted') {
-    if (normalized.status === 'blocked') {
-      showBlockedAlert('saveToLibrary');
-    } else {
-      showDeniedAlert('saveToLibrary');
-    }
+  // MediaLibrary.getPermissionsAsync({ writeOnly: true }) : iOS uniquement
+  // demande la perm "add" (NSPhotoLibraryAdd) si dispo. Sur Android, écrire
+  // dans le shared MediaStore via MediaLibrary.saveToLibraryAsync ne demande
+  // PAS de permission depuis API 29 — donc on retourne granted directement,
+  // sans même interroger le module natif.
+  if (Platform.OS === 'android' && Platform.Version >= 29) {
+    return { status: 'granted', canAskAgain: true };
   }
 
-  return normalized;
+  return ensurePermission(
+    'saveToLibrary',
+    () => MediaLibrary.getPermissionsAsync(true),
+    () => MediaLibrary.requestPermissionsAsync(true),
+    options,
+  );
 }
 
 // ─── Notifications ──────────────────────────────────────────────────────
@@ -408,56 +419,37 @@ export async function ensureSaveToLibraryPermission(
 export async function ensureNotificationPermission(
   options: EnsureOptions = {},
 ): Promise<PermissionResult> {
-  const showAlert = options.showAlertOnFailure !== false;
-
-  try {
-    const current = await Notifications.getPermissionsAsync();
-    // expo-notifications a un schéma légèrement différent : on lit `granted`
-    // dans le champ `status` ET dans `ios.status` (settings spécifiques iOS).
-    const status =
-      current.status === 'granted' ||
+  // expo-notifications a un schéma légèrement différent des autres modules :
+  // le "granted" iOS peut se lire dans `ios.status` (AUTHORIZED/PROVISIONAL)
+  // alors que `status` reste 'undetermined'. On aplatit ça vers la forme
+  // commune `{ status, canAskAgain }` avant de passer le relais au helper.
+  const toRaw = (r: Notifications.NotificationPermissionsStatus): RawPermission => ({
+    status:
+      r.status === 'granted' ||
       (Platform.OS === 'ios' &&
-        (current.ios?.status === 2 /* AUTHORIZED */ ||
-          current.ios?.status === 3 /* PROVISIONAL */))
+        (r.ios?.status === 2 /* AUTHORIZED */ || r.ios?.status === 3 /* PROVISIONAL */))
         ? 'granted'
-        : current.status;
-    const canAskAgain = current.canAskAgain !== false;
-
-    if (status === 'granted') {
-      return { status: 'granted', canAskAgain: true };
-    }
-    if (!canAskAgain) {
-      if (showAlert) showBlockedAlert('notifications');
-      return { status: 'blocked', canAskAgain: false };
-    }
-  } catch {}
-
-  const result = await withLockSuppression(() =>
-    Notifications.requestPermissionsAsync({
-      ios: {
-        allowAlert: true,
-        allowBadge: true,
-        allowSound: true,
-        // Time-sensitive : autorise les notifs d'appel à percer Focus/DoNotDisturb.
-        allowProvisional: false,
-      },
-    }),
-  );
-
-  const normalized = normalize({
-    status: result.status,
-    canAskAgain: result.canAskAgain,
+        : r.status,
+    canAskAgain: r.canAskAgain,
   });
 
-  if (showAlert && normalized.status !== 'granted') {
-    if (normalized.status === 'blocked') {
-      showBlockedAlert('notifications');
-    } else {
-      showDeniedAlert('notifications');
-    }
-  }
-
-  return normalized;
+  return ensurePermission(
+    'notifications',
+    async () => toRaw(await Notifications.getPermissionsAsync()),
+    async () =>
+      toRaw(
+        await Notifications.requestPermissionsAsync({
+          ios: {
+            allowAlert: true,
+            allowBadge: true,
+            allowSound: true,
+            // Time-sensitive : autorise les notifs d'appel à percer Focus/DoNotDisturb.
+            allowProvisional: false,
+          },
+        }),
+      ),
+    options,
+  );
 }
 
 // ─── Helpers utilitaires ────────────────────────────────────────────────
@@ -477,6 +469,13 @@ export function openAppSettings(): void {
 /**
  * Vérification non-intrusive : retourne l'état sans rien prompt.
  * Utile pour disabled un bouton dans l'UI sans déclencher de dialog.
+ *
+ * ATTENTION : un 'blocked' renvoyé ici n'est PAS une preuve que le dialog
+ * système ne s'ouvrirait pas (faux positif Android, cf. en-tête du fichier).
+ * Ne jamais s'en servir pour rediriger vers les Réglages ni pour masquer un
+ * bouton "Autoriser" — seul le retour d'un `ensureXxxPermission()`, qui a
+ * réellement tenté la demande, fait foi. Ces fonctions ne servent qu'à
+ * l'affichage (griser, afficher un badge, décider d'un texte).
  */
 export async function checkMicrophonePermission(): Promise<PermissionResult> {
   try {

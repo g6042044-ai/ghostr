@@ -2,7 +2,7 @@
 // Signal-style: flex-based, logo shrinks with keyboard, no scroll
 
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { View, Text, TextInput, Vibration, Animated, Platform, StatusBar, Keyboard, KeyboardAvoidingView, Image, TouchableOpacity } from 'react-native';
+import { View, Text, TextInput, Animated, Platform, StatusBar, Keyboard, KeyboardAvoidingView, Image, TouchableOpacity } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
 import { getEncryptionKeysWithInfo, getLockState, ArgonUnavailableError } from '../services/appLock';
@@ -10,6 +10,7 @@ import { setEncryptionKeys } from '../services/storage';
 import { precomputePoW } from '../services/api1to1';
 import { theme, useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 import { SplashScreen } from './SplashScreen';
+import haptics from '../services/haptics';
 
 interface Props { onUnlock: () => void; }
 
@@ -231,7 +232,10 @@ export function LockScreen({ onUnlock }: Props) {
   const formatLockout = (s: number) => s >= 60 ? `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}` : `${s}s`;
 
   const shake = useCallback(() => {
-    if (Platform.OS !== 'web') Vibration.vibrate(100);
+    // Haptique de notification « erreur » — le double-tap sec du système
+    // est immédiatement identifiable comme un échec, là où la vibration
+    // brute de 100 ms était juste bruyante.
+    haptics.error();
     Animated.sequence([
       Animated.timing(shakeAnim, { toValue: 15, duration: 50, useNativeDriver: true }),
       Animated.timing(shakeAnim, { toValue: -15, duration: 50, useNativeDriver: true }),

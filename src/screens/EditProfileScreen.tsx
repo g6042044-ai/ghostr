@@ -2,7 +2,7 @@
 // Modern profile editor — full-screen layout, avatar + input centered, footer pinned bottom
 
 import { useState, useRef, useEffect, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Image, TextInput, Alert, ActivityIndicator, Animated, Platform, KeyboardAvoidingView, Keyboard } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Image, TextInput, ActivityIndicator, Animated, Platform, KeyboardAvoidingView, Keyboard } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
@@ -13,9 +13,8 @@ import { ensureCameraPermission, ensureMediaLibraryPermission } from '../service
 import { Ionicons } from '@expo/vector-icons';
 import { setGlobalDisplayName, setGlobalAvatar } from '../services/storage';
 import { sessionService } from '../services/tripleRatchet';
-import { Header, useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
+import { Header, useTheme, useThemedStyles, getAvatarColor, type ColorPalette, showActionSheet } from '../components/ui';
 import { ImageCropper } from '../components/ImageCropper';
-import { AVATAR_COLORS } from '../services/crypto';
 import { invalidateAvatarCacheForAllSessions } from '../services/api1to1';
 import { SplashScreen } from './SplashScreen';
 
@@ -116,12 +115,10 @@ export function EditProfileScreen() {
   // RAM de sessionService. Cf. bloc commentaire au-dessus du useMemo.)
 
   // ─── Helpers ──
-  const getAvatarColor = (name: string): string => {
-    if (!name.trim()) return AVATAR_COLORS[0];
-    let h = 0;
-    for (let i = 0; i < name.length; i++) h = ((h << 5) - h) + name.charCodeAt(i);
-    return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
-  };
+  // `getAvatarColor` local supprimé : il réimplémentait le hash du design
+  // system sur une palette différente, si bien que l'aperçu du profil ne
+  // montrait PAS la couleur que les autres verront. La fonction partagée est
+  // importée depuis `components/ui`.
   const getInitials = (name: string): string => {
     if (!name.trim()) return '?';
     const p = name.trim().split(/\s+/);
@@ -195,12 +192,32 @@ export function EditProfileScreen() {
   };
   const handleAvatarPress = () => {
     Keyboard.dismiss();
-    Alert.alert(t('editProfile.photoOptions'), undefined, [
-      { text: t('common.cancel'), style: 'cancel' },
-      { text: t('setupProfile.takePhoto'), onPress: handleTakePhoto },
-      { text: t('setupProfile.chooseGallery'), onPress: handlePickGallery },
-      avatarUri && avatarUri !== '' ? { text: t('common.delete'), onPress: () => setAvatarUri(''), style: 'destructive' } : null,
-    ].filter(Boolean) as any);
+    // Même feuille d'actions que SetupProfileScreen — cf. le commentaire
+    // détaillé là-bas. Les deux écrans font le même geste, ils doivent
+    // ouvrir le même composant.
+    void showActionSheet({
+      title: t('editProfile.photoOptions'),
+      items: [
+        {
+          title: t('setupProfile.takePhoto'),
+          icon: <Ionicons name="camera-outline" size={24} color={colors.primary} />,
+          onPress: handleTakePhoto,
+        },
+        {
+          title: t('setupProfile.chooseGallery'),
+          icon: <Ionicons name="images-outline" size={24} color={colors.primary} />,
+          onPress: handlePickGallery,
+        },
+        ...(avatarUri && avatarUri !== ''
+          ? [{
+              title: t('common.delete'),
+              icon: <Ionicons name="trash-outline" size={24} color={colors.danger} />,
+              onPress: () => setAvatarUri(''),
+              destructive: true,
+            }]
+          : []),
+      ],
+    });
   };
 
   // ─── Save ──

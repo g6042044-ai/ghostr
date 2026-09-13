@@ -5,6 +5,7 @@
 import { useState, useEffect } from 'react';
 import { View, Text, TouchableOpacity, Share, Modal, ScrollView, Platform } from 'react-native';
 import QRCode from 'react-native-qrcode-svg';
+import { qrFitsCapacity } from '../services/groupInviteCodec';
 import * as Clipboard from 'expo-clipboard';
 import { useTranslation } from 'react-i18next';
 import { masterKeyToCode } from '../services/crypto';
@@ -107,7 +108,12 @@ export function InviteModal({
           <View style={styles.qrSection}>
             <View style={styles.qrContainer}>
               <View style={styles.qrInner}>
-                {code ? (
+                {/* Garde de capacité : `code` est un PIN court, donc le QR
+                    passe toujours aujourd'hui. Le garde est là pour que ce
+                    reste vrai — un rendu QR sans vérification de taille est
+                    une exception au rendu en attente, et une exception au
+                    rendu fait tomber l'écran. */}
+                {code && qrFitsCapacity(code.replace(/-/g, ''), 'M') ? (
                   <QRCode
                     value={code.replace(/-/g, '')}
                     size={180}

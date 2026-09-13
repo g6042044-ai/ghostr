@@ -7,7 +7,8 @@
 import * as React from 'react';
 import { sessionService, StoredSession } from '../services/tripleRatchet';
 import i18n from '../i18n';
-import { sendMessage1to1, sendReaction1to1, sendReadReceipt1to1, fetchMessages1to1, subscribe1to1, getLocalMessages1to1, clearLocalMessages1to1, clearUnreadCount, onStatusChange, onReaction, Message1to1, loadReactions, toggleReactionStorage, retryFailedMessage1to1, deleteFailedMessage1to1 } from '../services/api1to1';
+import { sendMessage1to1, sendReaction1to1, sendReadReceipt1to1, fetchMessages1to1, subscribe1to1, getLocalMessages1to1, clearLocalMessages1to1, clearUnreadCount, onStatusChange, onReaction, Message1to1, loadReactions, toggleReactionStorage, retryFailedMessage1to1, deleteFailedMessage1to1, deleteLocalMessage1to1 } from '../services/api1to1';
+import { getGroup as groupServiceGetGroup } from '../services/groupService';
 import { sendImageMessage1to1, sendFileMessage1to1, sendVoiceMessage1to1 } from '../services/media1to1';
 import { MessageStatus } from '../services/messageStatus';
 
@@ -62,10 +63,14 @@ export interface UnifiedMessage {
   blobNonce?: string;
   blobSize?: number;
   blobMediaType?: 'image' | 'file' | 'voice';
+
+  // v30.0 — Groupes
+  isSystem?: boolean;            // bandeau système (centré)
+  senderFingerprint?: string;   // pour la couleur déterministe d'expéditeur
 }
 
 export interface ConversationInfo {
-  type: '1to1';
+  type: '1to1' | 'group';
   id: string;
   name: string;
   avatarBase64?: string;
@@ -74,8 +79,11 @@ export interface ConversationInfo {
   session?: StoredSession | null;
   contactFingerprint?: string;
   myFingerprint?: string;
-  
-  
+
+  // Pour groupe (v30.0)
+  memberCount?: number;
+  groupMembers?: Array<{ fingerprint: string; displayName: string; avatarBase64?: string }>;
+
   // Commun
   isSecure: boolean;
   protocol: string;
@@ -121,7 +129,11 @@ export interface UseUnifiedMessagesResult {
 // HELPER: Détecter le type de conversation
 // ============================================
 
-export function getConversationType(id: string): '1to1' {
+export function getConversationType(id: string): '1to1' | 'group' {
+  // v30.0 — Un id connu de groupService est un groupe ; sinon 1:1.
+  try {
+    if (groupServiceGetGroup(id)) return 'group';
+  } catch {}
   return '1to1';
 }
 
@@ -162,6 +174,9 @@ function message1to1ToUnified(msg: Message1to1, conversationId: string): Unified
     blobNonce: msg.blobNonce,
     blobSize: msg.blobSize,
     blobMediaType: msg.blobMediaType,
+    // v30.0 — Groupes
+    isSystem: (msg as any).isSystem,
+    senderFingerprint: msg.senderFingerprint,
   };
 }
 
@@ -170,7 +185,29 @@ function message1to1ToUnified(msg: Message1to1, conversationId: string): Unified
 // ============================================
 
 export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesResult {
-  const conversationType = getConversationType(conversationId);
+  // v30.0 — conversationType réactif : au cold start, l'écran peut se monter
+  // AVANT que loadGroups() ait peuplé la Map des groupes. Un calcul figé
+  // détecterait '1to1' à tort (→ conversation vide). On le met dans un state et
+  // on re-vérifie au montage pour basculer sur 'group' dès que le groupe est
+  // chargé.
+  const [conversationType, setConversationType] = React.useState<'1to1' | 'group'>(
+    () => getConversationType(conversationId)
+  );
+  React.useEffect(() => {
+    const detected = getConversationType(conversationId);
+    setConversationType(detected);
+    // Si pas encore détecté comme groupe, re-tenter une fois après un court
+    // délai (laisse le temps à loadGroups de finir au cold start).
+    if (detected !== 'group') {
+      let cancelled = false;
+      const retry = setTimeout(() => {
+        if (cancelled) return;
+        const again = getConversationType(conversationId);
+        if (again === 'group') setConversationType('group');
+      }, 400);
+      return () => { cancelled = true; clearTimeout(retry); };
+    }
+  }, [conversationId]);
   
   // État commun
   const [messages, setMessages] = React.useState<UnifiedMessage[]>([]);
@@ -239,7 +276,34 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
   // ==========================================
   // INITIALISATION - GROUPE
   // ==========================================
-  
+  // v30.0 — Chemin DÉDIÉ aux groupes. NE cherche PAS de session 1:1 (un groupId
+  // n'en a pas) : initialize1to1 s'arrêtait sur `if (!sess) return`, d'où une
+  // conversation vide. Ici on charge directement les messages stockés sous le
+  // groupId (même store que le 1:1, via getLocalMessages1to1).
+  const initializeGroup = React.useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      await clearUnreadCount(conversationId);
+
+      const localMsgs = await getLocalMessages1to1(conversationId);
+      setMessages(localMsgs.map(m => message1to1ToUnified(m, conversationId)));
+
+      // Réactions persistées (le store est partagé par conversationId).
+      try {
+        const storedReactions = await loadReactions(conversationId);
+        setReactions(storedReactions);
+      } catch {}
+
+      setLoading(false);
+      isInitializedRef.current = true;
+    } catch (e) {
+      console.error('[useUnifiedMessages] Init group error:', e);
+      setError(i18n.t('messages.errors.loadFailed'));
+      setLoading(false);
+    }
+  }, [conversationId]);
 
   // ==========================================
   // EFFET D'INITIALISATION
@@ -248,7 +312,35 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
   React.useEffect(() => {
     if (conversationType === '1to1') {
       initialize1to1();
+    } else if (conversationType === 'group') {
+      // v30.0 — Chemin dédié : charge les messages du groupe sans session 1:1.
+      initializeGroup();
     }
+  }, [conversationId, conversationType]);
+
+  // ==========================================
+  // SUBSCRIPTION - GROUPE (temps réel)
+  // ==========================================
+  React.useEffect(() => {
+    if (conversationType !== 'group') return;
+    let unsub: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const api = await import('../services/api1to1');
+        const apiG = await import('../services/apiGroups');
+        if (cancelled) return;
+        unsub = api.onGroupUpdate(async (gid: string) => {
+          if (gid !== conversationId) return;
+          // Recharger les messages du groupe depuis le store local.
+          try {
+            const msgs = await apiG.getGroupMessages(conversationId);
+            setMessages(msgs.map((m: Message1to1) => message1to1ToUnified(m, conversationId)));
+          } catch {}
+        });
+      } catch {}
+    })();
+    return () => { cancelled = true; if (unsub) unsub(); };
   }, [conversationId, conversationType]);
 
   // ==========================================
@@ -376,6 +468,48 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
         
         return true;
         
+      } else if (conversationType === 'group') {
+        // v30.0 — Envoi de message de groupe (fan-out via apiGroups).
+        const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const optimisticMessage: UnifiedMessage = {
+          id: tempId,
+          conversationId,
+          content,
+          senderToken: 'me',
+          timestamp: Date.now(),
+          isMine: true,
+          displayName: sessionService.getMyProfile().displayName,
+          status: 'sending',
+          messageType: 'text',
+          replyToId: replyTo?.id,
+          replyToContent: replyTo?.content,
+          replyToSender: replyTo?.sender,
+        };
+        setMessages(prev => [...prev, optimisticMessage]);
+        await new Promise(resolve => setTimeout(resolve, 50));
+
+        const apiG = await import('../services/apiGroups');
+        const result = await apiG.sendGroupTextMessage(conversationId, content, replyTo);
+
+        if (!result.success) {
+          // Le message reste affiché en échec (l'utilisateur peut réessayer) ;
+          // on le marque 'failed' plutôt que de le supprimer (cohérent avec le
+          // fait qu'il est déjà sauvegardé localement par sendGroupTextMessage).
+          setMessages(prev => prev.map(m =>
+            (m.id === tempId || m.id === result.messageId)
+              ? { ...m, id: result.messageId || tempId, status: 'failed' as const }
+              : m
+          ));
+          setError(result.error || i18n.t('messages.errors.sendFailed'));
+          return false;
+        }
+
+        setMessages(prev => prev.map(m => {
+          if (m.id === tempId) return { ...m, id: result.messageId || tempId, status: 'sent' as const };
+          if (m.id === result.messageId && m.isMine) return { ...m, status: 'sent' as const };
+          return m;
+        }));
+        return true;
       }
       return false;
     } catch (e) {
@@ -617,13 +751,27 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
   
   const deleteMessages = React.useCallback(async (messageIds: string[]): Promise<boolean> => {
     try {
+      // Suppression LOCALE (cet appareil uniquement) — persistée dans le store,
+      // valable pour les 1:1 et les groupes (même stockage physique).
+      let allOk = true;
+      for (const id of messageIds) {
+        const ok = await deleteLocalMessage1to1(conversationId, id);
+        if (!ok) allOk = false;
+      }
       setMessages(prev => prev.filter(m => !messageIds.includes(m.id)));
-      return true;
+      // Retirer aussi les réactions attachées du state (le store est déjà purgé)
+      setReactions(prev => {
+        if (!messageIds.some(id => prev.has(id))) return prev;
+        const next = new Map(prev);
+        messageIds.forEach(id => next.delete(id));
+        return next;
+      });
+      return allOk;
     } catch (e) {
       console.error('[useUnifiedMessages] Delete error:', e);
       return false;
     }
-  }, []);
+  }, [conversationId]);
 
   const deleteAllMessages = React.useCallback(async (): Promise<boolean> => {
     try {
@@ -767,6 +915,23 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
         protocol: 'Triple Ratchet + ML-KEM-768 (Post-Quantum)',
       };
     }
+
+    // v30.0 — Groupe.
+    if (conversationType === 'group') {
+      const g = groupServiceGetGroup(conversationId);
+      if (g) {
+        return {
+          type: 'group' as const,
+          id: conversationId,
+          name: g.name,
+          avatarBase64: g.avatarBase64,
+          memberCount: g.members.length,
+          groupMembers: g.members.map(m => ({ fingerprint: m.fingerprint, displayName: m.displayName, avatarBase64: m.avatarBase64 })),
+          isSecure: true,
+          protocol: 'Sender Keys + Triple Ratchet + ML-KEM-768 (Post-Quantum)',
+        };
+      }
+    }
     
     return {
       type: '1to1' as const,
@@ -775,7 +940,7 @@ export function useUnifiedMessages(conversationId: string): UseUnifiedMessagesRe
       isSecure: false,
       protocol: i18n.t('messages.contactPlaceholderProtocol'),
     };
-  }, [conversationId, session]);
+  }, [conversationId, session, conversationType, messages.length]);
 
   // ==========================================
   // RETURN

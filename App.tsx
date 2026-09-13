@@ -4,7 +4,7 @@
 // Triple Ratchet + Appels vocaux + Vérification sécurité
 import 'react-native-get-random-values';
 import React, { useEffect, useState, useRef, useMemo } from 'react';
-import { StatusBar, View, StyleSheet, Text, AppState, AppStateStatus, Platform, Alert, Image } from 'react-native';
+import { StatusBar, View, StyleSheet, Text, AppState, AppStateStatus, Platform, Image } from 'react-native';
 import { useKeepAwake } from 'expo-keep-awake';
 import { NavigationContainer, DefaultTheme, useNavigationContainerRef } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
@@ -17,9 +17,12 @@ import 'react-native-gesture-handler';
 import * as Notifications from 'expo-notifications';
 import * as TaskManager from 'expo-task-manager';
 // Screen capture protection: bloque screenshots Android (FLAG_SECURE),
-// scrcpy, enregistrement d'écran, casting. Sur iOS, la capture ne peut être
-// que détectée (pas bloquée) — l'overlay privacy reste la protection primaire.
-import * as ScreenCapture from 'expo-screen-capture';
+// scrcpy, enregistrement d'écran, casting. Sur iOS, l'enregistrement d'écran
+// est bloqué, le screenshot seulement gêné (aucune API iOS ne l'interdit) —
+// l'overlay privacy reste la protection complémentaire.
+// La décision d'armer ou non vit dans screenCaptureGuard (allowlist de profils
+// de build) : NE JAMAIS appeler expo-screen-capture directement depuis ici.
+import { armScreenCaptureProtection, SCREEN_CAPTURE_ALLOWED } from './src/services/screenCaptureGuard';
 import { initPushNotifications, showIncomingCallNotification, BACKGROUND_NOTIFICATION_TASK, hasCompletedNotificationOnboarding, purgeAllPeerPushTokens, refreshOwnTokenIfChanged } from './src/services/pushNotificationService';
 
 // Import des composants d'appels vocaux
@@ -59,6 +62,12 @@ import { InvitationsScreen } from './src/screens/InvitationsScreen';
 import { ConnectionSuccessScreen } from './src/screens/ConnectionSuccessScreen';
 import { InAppNotificationHost } from './src/components/InAppNotification';
 import { Join1to1Screen } from './src/screens/Join1to1Screen';
+import { CreateGroupScreen } from './src/screens/CreateGroupScreen';
+import { GroupInfoScreen } from './src/screens/GroupInfoScreen';
+import { AddGroupMembersScreen } from './src/screens/AddGroupMembersScreen';
+import { GroupInviteQRScreen } from './src/screens/GroupInviteQRScreen';
+import { JoinGroupScreen } from './src/screens/JoinGroupScreen';
+import { GROUPS_ENABLED } from './src/config/features';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { LockScreen } from './src/screens/LockScreen';
 import { MigrationLockdownScreen } from './src/screens/MigrationLockdownScreen';
@@ -67,6 +76,7 @@ import { MigrationExportScreen } from './src/screens/MigrationExportScreen';
 import { SecurityScreen } from './src/screens/SecurityScreen';
 import { SetupProfileScreen } from './src/screens/SetupProfileScreen';
 import { WelcomeScreen } from './src/screens/WelcomeScreen';
+import { TermsScreen } from './src/screens/TermsScreen';
 import { EditProfileScreen } from './src/screens/EditProfileScreen';
 import { LanguageScreen } from './src/screens/LanguageScreen';
 import { ThemeScreen } from './src/screens/ThemeScreen';
@@ -75,7 +85,22 @@ import { SplashScreen } from './src/screens/SplashScreen';
 // Services
 import { getOrCreateDeviceState, clearEncryptionKey, hasGlobalDisplayName, initHardwareEncryptionAll, nuclearReset } from './src/services/storage';
 // api.ts ne contient plus que la config réseau (supabase, supabaseStorage, isRelayEnabled, getApiUrl)
-import { startGlobalPolling1to1, stopGlobalPolling1to1, pollAllSessions, waitForSealedSender, precomputePoW, recoverOrphanedSendingMessages } from './src/services/api1to1';
+import { startGlobalPolling1to1, stopGlobalPolling1to1, pollAllSessions, waitForSealedSender, precomputePoW, recoverOrphanedSendingMessages, flushLastMessagePreviews } from './src/services/api1to1';
+// Chargement des groupes persistés : sur le chemin critique du boot, au même
+// titre que sessionService.initialize(). Une seule lecture AsyncStorage +
+// déchiffrement d'un JSON de rosters (aucun message), donc quelques ms.
+// Avant, loadGroups n'était appelé QUE comme effet de bord de
+// recoverOrphanedSendingMessages(), lui-même déféré de 5 s : les groupes
+// étaient absents de la liste de conversations et des handlers de réception
+// pendant toute cette fenêtre. Cf. ConversationListScreen.
+// [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. `loadGroups()` est
+// CONSERVÉ sur le chemin de boot : c'est une opération de données, pas une
+// surface UI. La couper laisserait la Map RAM vide alors que les services
+// (migration, réconciliation de roster) supposent qu'elle reflète le disque —
+// et sur un profil sans groupe, ce qui est le cas de toute installation de
+// cette version, c'est un no-op. Rien de ce qui est chargé ici n'atteint
+// l'écran : la liste de conversations filtre les groupes en amont.
+import { loadGroups } from './src/services/groupService';
 import { inviteWatcher } from './src/services/inviteWatcher';
 import { useDeepLinkInvite } from './src/services/deepLinkInvite';
 import { loadSilentMode, ensureInCallStarted, stopInCallManager } from './src/services/callTones';
@@ -110,8 +135,17 @@ import { AppNoticeOverlay } from './src/components/AppNoticeOverlay';
 import i18n, { initI18n } from './src/i18n';
 
 // Theme
-import { theme, ThemeProvider, useTheme } from './src/components/ui';
+import {
+  ThemeProvider,
+  useTheme,
+  useThemedStyles,
+  ToastHost,
+  AlertHost,
+  showAlert,
+  type ColorPalette,
+} from './src/components/ui';
 import { appearanceBootPromise, loadStoredAppearanceSync } from './src/services/themeStorage';
+import { ErrorBoundary } from './src/components/ErrorBoundary';
 
 // ════════════════════════════════════════════════════════════════════════════
 // TIMING LOGGER GLOBAL — CHEMIN CRITIQUE DU BOOT
@@ -263,6 +297,11 @@ const RESET_ALL_DATA = false;
 const LAST_BACKGROUND_TIME_KEY = '@whisper_last_background_time';
 const SECURITY_CHECK_SHOWN_KEY = '@whisper_security_check_shown';
 const ONBOARDING_COMPLETED_KEY = '@ghostr_onboarding_completed';
+// Guideline 1.2 : acceptation des conditions d'utilisation (EULA). La valeur
+// stockée est la version des CGU acceptée — incrémenter TERMS_VERSION pour
+// re-présenter l'écran après un changement substantiel des conditions.
+const TERMS_ACCEPTED_KEY = '@ghostr_terms_accepted';
+const TERMS_VERSION = '1';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DÉTECTION VRAI vs FAUX BACKGROUND — STRATÉGIE EXPLICITE
@@ -302,11 +341,24 @@ const MODAL_NAV_GRACE_MS = 800;
 // et `presentation: 'fullScreenModal'` dans le Stack.Navigator ci-dessous.
 // Les écrans `presentation: 'card'` (défaut) ne déclenchent PAS de background
 // et n'ont donc pas besoin d'être listés.
+//
+// ATTENTION : cette liste avait divergé du Stack. `GroupInviteQR` et
+// `JoinGroup` ont été déclarés `presentation: 'modal'` sans être ajoutés
+// ici, si bien que la transition d'Activity qu'ils provoquent était lue
+// comme un vrai passage en arrière-plan → l'app se verrouillait toute
+// seule au milieu du partage d'une invitation de groupe. Toute nouvelle
+// entrée `presentation: 'modal' | 'fullScreenModal'` DOIT être ajoutée ici.
 const ANDROID_MODAL_SCREENS = new Set<string>([
   'Create1to1',         // fullScreenModal
   'ConnectionSuccess',  // fullScreenModal
   'Join1to1',           // modal
   'Security',           // modal
+  // [GROUPES DÉSACTIVÉS] Conservés volontairement : ces deux écrans ne sont
+  // plus enregistrés dans le Stack (cf. GROUPS_ENABLED plus bas), donc ces
+  // entrées sont inertes. Les retirer ferait juste réapparaître le bug de
+  // verrouillage intempestif le jour de la réactivation.
+  'GroupInviteQR',      // modal
+  'JoinGroup',          // modal
 ]);
 
 export type RootStackParamList = {
@@ -315,6 +367,17 @@ export type RootStackParamList = {
   ContactInfo: { sessionId: string };
   Create1to1: undefined;
   Join1to1: { pendingInviteString?: string } | undefined;
+  // v30.0 — Groupes
+  // [GROUPES DÉSACTIVÉS] Les types de routes sont CONSERVÉS même si les écrans
+  // ne sont pas enregistrés : ils typent encore les appels `navigate()` gardés
+  // par `GROUPS_ENABLED` dans les écrans appelants. Les supprimer ne
+  // désactiverait rien de plus et casserait la compilation de code par ailleurs
+  // correct.
+  CreateGroup: undefined;
+  GroupInfo: { groupId: string };
+  AddGroupMembers: { groupId: string };
+  GroupInviteQR: { groupId: string };
+  JoinGroup: { inviteString: string };
   Invitations: undefined;
   InviteDetail: { tag: string };
   ConnectionSuccess: { sessionId: string; contactName: string; inviteLabel: string; inviteTag?: string; contactAvatarBase64?: string };
@@ -466,6 +529,38 @@ function AppContent({ onSecurityChange, onRequestRestore }: { onSecurityChange: 
             gestureEnabled: true,
           }} 
         />
+        {/* v30.0 — Groupes */}
+        {/*
+          [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts.
+          Les 5 écrans de groupe ne sont PAS enregistrés dans le Stack tant que
+          `GROUPS_ENABLED` est faux : aucune route n'existe, donc aucun chemin
+          de navigation ne peut les atteindre, même par un deep link forgé ou
+          un `navigate()` oublié — react-navigation ignore une route inconnue
+          au lieu d'ouvrir un écran. C'est le verrou de dernier recours, en
+          plus du gating de chaque point d'entrée dans les écrans appelants.
+
+          Les composants restent IMPORTÉS et donc compilés/typés : ils ne
+          peuvent pas pourrir silencieusement pendant que la fonctionnalité
+          dort. Le fragment est conditionnel (et non commenté) pour que la
+          réactivation ne demande qu'un basculement du drapeau.
+        */}
+        {GROUPS_ENABLED && (
+          <>
+            <Stack.Screen name="CreateGroup" component={CreateGroupScreen} />
+            <Stack.Screen name="GroupInfo" component={GroupInfoScreen} />
+            <Stack.Screen name="AddGroupMembers" component={AddGroupMembersScreen} />
+            <Stack.Screen
+              name="GroupInviteQR"
+              component={GroupInviteQRScreen}
+              options={{ presentation: 'modal', gestureEnabled: true }}
+            />
+            <Stack.Screen
+              name="JoinGroup"
+              component={JoinGroupScreen}
+              options={{ presentation: 'modal', gestureEnabled: true }}
+            />
+          </>
+        )}
         <Stack.Screen name="Settings">
           {(props) => (
             <SettingsScreen
@@ -641,10 +736,10 @@ function ensurePinningReady(): Promise<void> {
         });
       }
       if (!pinStatus.active && !__DEV__) {
-        Alert.alert(
-          i18n.t('app.pinningInactiveTitle'),
-          i18n.t('app.pinningInactiveMessage', { reason: pinStatus.reason })
-        );
+        void showAlert({
+          title: i18n.t('app.pinningInactiveTitle'),
+          message: i18n.t('app.pinningInactiveMessage', { reason: pinStatus.reason }),
+        });
       }
     } catch (e) {
       console.error('[App] ensurePinningReady error:', e);
@@ -668,9 +763,11 @@ function ensurePinningReady(): Promise<void> {
 // only happens for the very first render at very cold start.
 export default function App() {
   return (
-    <ThemeProvider initialPreference={loadStoredAppearanceSync()}>
-      <AppInner />
-    </ThemeProvider>
+    <ErrorBoundary>
+      <ThemeProvider initialPreference={loadStoredAppearanceSync()}>
+        <AppInner />
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }
 
@@ -680,6 +777,11 @@ function AppInner() {
   // User can still lock manually via power button.
   useKeepAwake();
   bootlog('App component function entered');
+
+  // Styles racine, reconstruits à chaque changement de palette. Ce hook doit
+  // rester AVANT tout retour anticipé (il y en a une dizaine plus bas) pour
+  // que l'ordre des hooks soit stable d'un rendu à l'autre.
+  const styles = useThemedStyles(makeStyles);
 
   // ════════════════════════════════════════════════════════════════════════
   // ÉTATS INITIAUX BASÉS SUR LE HINT — ÉLIMINATION DE LA PHASE D'ATTENTE
@@ -765,6 +867,10 @@ function AppInner() {
   const [lockEnabled, setLockEnabled] = useState(hintSaysLocked);
   const [lockTimeout, setLockTimeout] = useState(1);
   const [needsOnboarding, setNeedsOnboarding] = useState(false);
+  // Guideline 1.2 : CGU non acceptées → écran TermsScreen bloquant.
+  // Vrai pour les nouveaux utilisateurs (entre le carrousel et le profil)
+  // ET pour les utilisateurs existants après mise à jour (une seule fois).
+  const [needsTerms, setNeedsTerms] = useState(false);
   const [needsProfileSetup, setNeedsProfileSetup] = useState(false);
 
   // ── Migration state ─────────────────────────────────────────────────────
@@ -1024,7 +1130,12 @@ function AppInner() {
     // ═══════════════════════════════════════════════════════════════════════
 
     // Protection capture d'écran — à activer au plus tôt. Idempotent.
-    ScreenCapture.preventScreenCaptureAsync('ghostr-global').catch(() => {});
+    // No-op dans les builds development/preview qui posent explicitement
+    // EXPO_PUBLIC_ALLOW_SCREEN_CAPTURE=1 (vidéo de démo App Review, cf.
+    // APP_REVIEW_RESUBMISSION.md §4). Toute autre configuration — production
+    // en tête — arme la protection : le défaut est le comportement strict.
+    armScreenCaptureProtection();
+    bootlog(`screen capture protection: ${SCREEN_CAPTURE_ALLOWED ? 'DISABLED (build de démo)' : 'armed'}`);
 
     // Pinning : dispatch en fire-and-forget. Idempotent.
     ensurePinningReady().catch(() => {});
@@ -1253,6 +1364,29 @@ function AppInner() {
       if (nextAppState === 'background') {
         bootlog(`AppState change → 'background' (from ${previousAppState.current})`);
         setShowPrivacyOverlay(true);
+
+        // ─────────────────────────────────────────────────────────────────
+        // Persister l'index d'aperçus de conversation PENDANT que la clé de
+        // chiffrement est encore chargée.
+        //
+        // L'index est écrit de façon groupée (250 ms) pour ne pas déclencher
+        // une écriture par message reçu. Un passage en arrière-plan peut donc
+        // survenir avec des aperçus encore en mémoire. On force l'écriture
+        // ici, en tout premier : tout le code de `flushLastMessagePreviews`
+        // jusqu'à son premier `await` — y compris le chiffrement — s'exécute
+        // de façon synchrone, donc AVANT tout `clearEncryptionKey()` déclenché
+        // plus bas dans ce même handler.
+        //
+        // Volontairement fire-and-forget : le seul travail asynchrone restant
+        // est le `setItem` sur des données DÉJÀ chiffrées. Ne jamais awaiter
+        // ici — bloquer le handler AppState retarderait l'affichage de
+        // l'overlay de confidentialité, donc exposerait le contenu de l'écran
+        // dans le sélecteur d'applications.
+        //
+        // Si la clé a déjà disparu, le flush s'abstient d'écrire plutôt que de
+        // persister des extraits de messages en clair (garde interne).
+        void flushLastMessagePreviews();
+        // ─────────────────────────────────────────────────────────────────
 
         // Le "moment du départ" : sur iOS on a vu un 'inactive' juste avant
         // le 'background', et c'est ce moment-là qu'on veut compter comme
@@ -1628,12 +1762,15 @@ function AppInner() {
       if (policy.shouldBlock) {
         const message = getSecurityWarningMessage(result);
 
-        Alert.alert(
-          i18n.t('app.compromisedTitle'),
-          i18n.t('app.compromisedMessage', { base: message || '' }),
-          [{ text: i18n.t('app.compromisedClose'), style: 'destructive' }],
-          { cancelable: false }
-        );
+        void showAlert({
+          title: i18n.t('app.compromisedTitle'),
+          message: i18n.t('app.compromisedMessage', { base: message || '' }),
+          buttons: [{ text: i18n.t('app.compromisedClose'), style: 'destructive' }],
+          // Non refermable par un tap à côté : l'utilisateur doit avoir vu
+          // que son appareil est compromis. (Reprend le `cancelable: false`
+          // de l'appel natif d'origine.)
+          dismissible: false,
+        });
         // L'app restera bloquée sur cet écran — l'utilisateur ne peut pas continuer
         return;
       }
@@ -1645,12 +1782,12 @@ function AppInner() {
         if (message) {
           await AsyncStorage.setItem(SECURITY_CHECK_SHOWN_KEY, today);
           
-          Alert.alert(
+          void showAlert({
             title,
             message,
-            [{ text: i18n.t('app.understandRisks'), style: 'default' }],
-            { cancelable: false }
-          );
+            buttons: [{ text: i18n.t('app.understandRisks'), style: 'default' }],
+            dismissible: false,
+          });
         }
       }
       
@@ -1686,20 +1823,6 @@ function AppInner() {
       } catch {
         // SecureStore read failed — continue normally rather than block.
       }
-
-      // NOTE — `ScreenCapture.preventScreenCaptureAsync`, `Image.resolveAssetSource`
-      // (préchauffage du logo LockScreen), `ensurePinningReady`,
-      // `performDeviceSecurityCheck` et `loadSilentMode` sont désormais
-      // dispatchés dans le `useEffect` de montage AVANT l'appel à
-      // `isLockEnabledFast`. Les re-déclencher ici créerait :
-      //   - un double `listenForPinningErrors` → deux listeners → logs doublés
-      //   - un double Alert "pinning inactif" en prod
-      //   - un double `performDeviceSecurityCheck` → double logging sécurité
-      // `ensurePinningReady()` est idempotent par sa promesse singleton :
-      // ci-dessous on se contente de l'awaiter au cas où on serait dans le
-      // chemin "timeout fastDetect" et où le réseau serait immédiatement
-      // sollicité — mais typiquement elle est déjà résolue à ce point.
-      await ensurePinningReady();
 
       // ═══════════════════════════════════════════════
       // PHASE 1 — RAPIDE (~100ms) : Checks AsyncStorage
@@ -1738,19 +1861,40 @@ function AppInner() {
       // This MUST run before startGlobalPolling1to1 / any push send path so
       // that the first push attempts produce decoy blobs (silently dropped at
       // the proxy) rather than pushes to known-stale tokens.
-      try {
-        await purgeAllPeerPushTokens('2025-05-token-rotation-fix');
-      } catch (e) {
-        __DEV__ && console.warn('[App] Peer token purge failed (non-fatal):', e);
-      }
-
-      // Vérifier l'état d'onboarding AVANT la crypto (juste un read AsyncStorage)
-      const onboardingCompleted = await AsyncStorage.getItem(ONBOARDING_COMPLETED_KEY);
+      //
+      // ═══════════════════════════════════════════════════════════════════
+      // PERF — LECTURES INDÉPENDANTES EN PARALLÈLE
+      // ═══════════════════════════════════════════════════════════════════
+      // Ces cinq opérations n'ont aucune dépendance de données entre elles :
+      //   - ensurePinningReady : idempotent (promesse singleton, déjà
+      //     dispatchée dans le useEffect de montage — on l'await seulement
+      //     pour le chemin "timeout fastDetect" où le réseau serait
+      //     immédiatement sollicité). Ne PAS la re-déclencher ailleurs :
+      //     double listenForPinningErrors = double Alert en prod.
+      //   - purgeAllPeerPushTokens : cleanup AsyncStorage idempotent, doit
+      //     seulement précéder startGlobalPolling1to1 (bien plus bas).
+      //   - onboarding / displayName : lectures AsyncStorage pures.
+      //   - isLockEnabled : lecture SecureStore (source de vérité PIN),
+      //     nécessaire à la branche crypto de la Phase 2.
+      // Avant : six allers-retours I/O séquentiels (~50-100ms chacun au
+      // cold start). Après : un seul round-trip du plus lent.
+      // ═══════════════════════════════════════════════════════════════════
+      const [, , onboardingCompleted, hasDisplayName, locked, termsAccepted] = await Promise.all([
+        ensurePinningReady(),
+        purgeAllPeerPushTokens('2025-05-token-rotation-fix').catch((e) => {
+          __DEV__ && console.warn('[App] Peer token purge failed (non-fatal):', e);
+        }),
+        AsyncStorage.getItem(ONBOARDING_COMPLETED_KEY),
+        hasGlobalDisplayName(),
+        isLockEnabled(),
+        AsyncStorage.getItem(TERMS_ACCEPTED_KEY),
+      ]);
       console.log('[App] initializeApp: onboardingCompleted =', onboardingCompleted);
-      
-      const hasDisplayName = await hasGlobalDisplayName();
       console.log('[App] initializeApp: hasDisplayName =', hasDisplayName);
-      
+
+      // Guideline 1.2 : CGU acceptées ? (version courante uniquement)
+      const termsOk = termsAccepted === TERMS_VERSION;
+
       // Fast path : si l'onboarding ou le profil n'est pas fait,
       // on affiche l'écran correspondant SANS attendre la crypto.
       // sessionService.initialize() sera appelé dans handleProfileSetupComplete.
@@ -1761,10 +1905,27 @@ function AppInner() {
           setIsInitializing(false);
           return;
         }
+        if (!termsOk) {
+          // Interruption entre le carrousel et le profil (kill de l'app) :
+          // on reprend au niveau des CGU, pas au carrousel.
+          console.log('[App] initializeApp: → terms (no crypto needed yet)');
+          setNeedsTerms(true);
+          setIsInitializing(false);
+          return;
+        }
         console.log('[App] initializeApp: → profile setup (no crypto needed yet)');
         setNeedsProfileSetup(true);
         setIsInitializing(false);
         return;
+      }
+
+      // Utilisateur existant (mise à jour de l'app) : les CGU n'existaient
+      // pas quand il a créé son profil → écran bloquant une seule fois,
+      // rendu APRÈS le LockScreen (cf. render path). L'init crypto continue
+      // normalement en dessous.
+      if (!termsOk) {
+        console.log('[App] initializeApp: existing user must accept terms');
+        setNeedsTerms(true);
       }
       
       // ═══════════════════════════════════════════════
@@ -1788,9 +1949,12 @@ function AppInner() {
       // car ils ne sont pas nécessaires à l'affichage du LockScreen ni du
       // post-unlock. Ils termineront en parallèle des opérations awaitées.
       //
-      // - precomputePoW : démarre le SHA-256 itératif (~200ms-1s). Le cache
-      //   interne rend l'appel idempotent, donc on peut le rappeler depuis
-      //   LockScreen.useEffect ou handleUnlock sans recalculer.
+      // - precomputePoW : DÉPLACÉ après les gros awaits de la branche no-PIN
+      //   (cf. plus bas) — le SHA-256 itératif tournait sur le thread JS en
+      //   concurrence avec sessionService.initialize/initHardwareEncryption,
+      //   volant des tranches CPU au chemin critique du splash (même
+      //   doctrine que le chemin lock, où le PoW est délégué à
+      //   LockScreen.onFocus). Le cache interne le rend idempotent.
       //
       // - preWarmNativeAudio : chauffage modules audio (speechmatics +
       //   expo-audio-stream) pour éviter cold-start lors du premier appel.
@@ -1806,10 +1970,8 @@ function AppInner() {
       // pas envoyer de messages ni démarrer un appel. Inutile de gaspiller
       // 20s de CPU sur PoW.
       if (getCurrentAppNotice()) {
-        console.log('[App] AppNotice present → skipping precomputePoW/preWarmAudio');
+        console.log('[App] AppNotice present → skipping preWarmAudio');
       } else {
-        precomputePoW();
-
         if (Platform.OS !== 'web') {
           ensureInCallStarted();
           setTimeout(() => stopInCallManager(), 500);
@@ -1817,20 +1979,15 @@ function AppInner() {
 
         preWarmNativeAudio();
       }
-      
+
       // ACTION-04 FIX: Check lock status FIRST, then init hardware encryption
       // BEFORE sessionService.initialize() reads ratchet states from AsyncStorage.
       // Without this, encryptionKey is null when sessionService loads encrypted data
       // → ratchet states unreadable → AEAD failures → messages invisible.
-      const locked = await isLockEnabled();
+      // PERF : `locked` provient du Promise.all de la Phase 1 (isLockEnabled,
+      // source de vérité SecureStore) — plus de re-lecture séquentielle ici.
       setLockEnabled(locked);
-      _ts('isLockEnabled');
-      
-      if (!locked) {
-        await initHardwareEncryptionAll();
-        _ts('initHardwareEncryptionAll');
-      }
-      
+
       // Initialize sodium always, but sessionService ONLY when not locked.
       // When locked, sessionService.initialize() would run without an encryption key,
       // fail to read encrypted data, and overwrite it with empty state → data loss.
@@ -1868,7 +2025,8 @@ function AppInner() {
         // ═══════════════════════════════════════════════════════════════════
         initSodiumZeroize();   // fire-and-forget (idempotent)
         isArgon2Available();   // fire-and-forget (warm module natif, idempotent)
-        // precomputePoW déjà lancé ligne ~871 plus haut (idempotent)
+        // precomputePoW : délégué à LockScreen.onFocus (post-paint), cf. la
+        // doctrine documentée dans le useEffect de montage. Idempotent.
         _ts('warm-ups dispatched (non-blocking)');
 
         // Attendre UNIQUEMENT les lectures nécessaires pour afficher
@@ -1913,12 +2071,51 @@ function AppInner() {
         // l'identifiant device + état hardware encryption). Le mettre en
         // parallèle aligne ce path sur handleUnlock et économise 50-200 ms
         // au cold start no-PIN. Cf. Phase 2 / Action 2.1 du plan d'action.
+        //
+        // PERF — initHardwareEncryptionAll est chaîné DEVANT sessionService
+        // et getOrCreateDeviceState (qui lisent des données chiffrées par la
+        // clé hardware qu'il installe — cf. ACTION-04 ci-dessus) mais tourne
+        // en PARALLÈLE d'initSodiumZeroize qui n'en dépend pas. Avant : les
+        // deux étages étaient strictement séquentiels.
         const [sodiumOk] = await Promise.all([
           initSodiumZeroize(),
-          sessionService.initialize(),
-          getOrCreateDeviceState(),
+          initHardwareEncryptionAll().then((hwOk) => {
+            _ts(`initHardwareEncryptionAll (ok=${hwOk})`);
+            // ════════════════════════════════════════════════════════════
+            // loadGroups DOIT être chaîné APRÈS sessionService.initialize()
+            // ════════════════════════════════════════════════════════════
+            // En mode sans PIN, la clé qui déchiffre réellement AsyncStorage
+            // est la clé DEVICE-LEVEL, installée dans `encryptionKey` par
+            // `ensureDeviceLevelEncryption()` — première étape de
+            // `sessionService.initialize()`, qui fait un await SecureStore.
+            // La `hardwareKey` posée juste au-dessus par
+            // initHardwareEncryptionAll est une clé DIFFÉRENTE (cf. la
+            // docstring de transitionPinToHardware dans localCrypto) : elle
+            // ne sert que de repli à getActiveKey().
+            //
+            // En parallèle, loadGroups gagnait la course (un simple getItem
+            // contre SecureStore + clés d'identité), passait le garde
+            // `!hasAnyEncryptionKey()` — puisque hardwareKey est présente —
+            // et échouait sur le MAC Poly1305. Son catch pose `_loaded`,
+            // donc les groupes disparaissaient pour TOUTE la session.
+            // Ne jamais remettre loadGroups en parallèle d'initialize().
+            return Promise.all([
+              sessionService.initialize().then(() => loadGroups()),
+              getOrCreateDeviceState(),
+            ]);
+          }),
         ]);
-        _ts(`parallel init (sodium=${sodiumOk ? 'libsodium' : 'JS fallback'} + session + deviceState)`);
+        _ts(`parallel init (sodium=${sodiumOk ? 'libsodium' : 'JS fallback'} + hw→((session→groups) ∥ deviceState))`);
+
+        // ── PoW anti-spam : lancé APRÈS les gros awaits crypto ──
+        // Il tourne en fire-and-forget pendant que le splash se libère.
+        // startGlobalPolling1to1 (ci-dessous) diffère de toute façon le
+        // polling jusqu'à ce que le sealed sender soit prêt, donc le PoW
+        // dispose du thread JS sans contention. Guard kill-switch : si un
+        // AppNotice est actif, inutile de chauffer le PoW.
+        if (!getCurrentAppNotice()) {
+          precomputePoW();
+        }
         
         // P3 FIX: Récupérer les messages orphelins en status 'sending' avant de démarrer
         // PERF A10: Déféré à 5s après le démarrage — cas d'erreur rare (~1/10000),
@@ -2085,18 +2282,27 @@ function AppInner() {
 
       await AsyncStorage.removeItem(LAST_BACKGROUND_TIME_KEY);
       
-      setSplashStatus(i18n.t('appBoot.initializingEncryption'));
-      // FIX 2.2: Paralléliser comme dans le boot principal — sauf si kill-switch
-      if (!getCurrentAppNotice()) {
-        precomputePoW();
-      }
-
       setSplashStatus(i18n.t('appBoot.loadingConversations'));
+      // loadGroups est chaîné APRÈS sessionService.initialize() — même règle
+      // que dans initializeApp : c'est initialize() qui garantit qu'une clé
+      // capable de déchiffrer AsyncStorage est active. Ici la clé PIN est déjà
+      // posée par le LockScreen (await setEncryptionKeys avant onUnlock), donc
+      // le chaînage est une ceinture ; on l'applique quand même pour n'avoir
+      // qu'UNE règle valable sur les trois chemins de boot.
       await Promise.all([
         initSodiumZeroize(),
         getOrCreateDeviceState(),
-        sessionService.initialize(),
+        sessionService.initialize().then(() => loadGroups()),
       ]);
+
+      // PoW anti-spam : lancé APRÈS les gros awaits (même doctrine que le
+      // boot no-PIN) — avant, il concourait avec sessionService.initialize
+      // sur le thread JS et rallongeait le splash post-PIN. Idempotent
+      // (souvent déjà résolu si LockScreen.onFocus l'a lancé pendant la
+      // saisie). Guard kill-switch inchangé.
+      if (!getCurrentAppNotice()) {
+        precomputePoW();
+      }
 
       // P3 FIX: Récupérer les messages orphelins après déverrouillage
       // PERF A10: Déféré — ne pas bloquer le splash post-PIN pour un cas d'erreur rare.
@@ -2267,9 +2473,12 @@ function AppInner() {
       }
 
       setSplashStatus(i18n.t('appBoot.creatingPostQuantumKeys'));
+      // loadGroups : normalement vide sur un profil neuf, mais pas après un
+      // import de migration (replaceGroupsFromImport a écrit l'enregistrement).
+      // Chaîné APRÈS initialize() — cf. la règle expliquée dans initializeApp.
       await Promise.all([
         initSodiumZeroize(),
-        sessionService.initialize(),
+        sessionService.initialize().then(() => loadGroups()),
       ]);
       
       const locked = await isLockEnabled();
@@ -2363,8 +2572,41 @@ function AppInner() {
     // has a working account", not "user has seen the slides". This is also the
     // semantic firstLaunchGuard.ts relies on — only an account that exists on
     // disk should make the device skip the fresh-install purge.
+    //
+    // Guideline 1.2 : les CGU s'intercalent entre le carrousel et la création
+    // du profil — l'EULA doit être accepté AVANT toute utilisation du service.
+    // Déjà acceptées (aller-retour via le back de SetupProfileScreen) → on
+    // saute directement au profil.
     setNeedsOnboarding(false);
-    setNeedsProfileSetup(true);
+    let alreadyAccepted = false;
+    try {
+      alreadyAccepted = (await AsyncStorage.getItem(TERMS_ACCEPTED_KEY)) === TERMS_VERSION;
+    } catch {}
+    if (alreadyAccepted) {
+      setNeedsProfileSetup(true);
+    } else {
+      setNeedsTerms(true);
+    }
+  };
+
+  /**
+   * Guideline 1.2 : l'utilisateur a accepté les CGU (TermsScreen).
+   * Persiste la version acceptée puis route vers l'étape suivante :
+   *   - nouvel utilisateur → création du profil ;
+   *   - utilisateur existant (mise à jour) → app principale.
+   */
+  const handleTermsAccepted = async () => {
+    try {
+      await AsyncStorage.setItem(TERMS_ACCEPTED_KEY, TERMS_VERSION);
+    } catch (e) {
+      // Non-fatal : au pire, l'écran sera re-présenté au prochain launch.
+      console.warn('[App] failed to persist terms acceptance:', e);
+    }
+    setNeedsTerms(false);
+    const hasProfile = await hasGlobalDisplayName();
+    if (!hasProfile) {
+      setNeedsProfileSetup(true);
+    }
   };
 
   // ============================================
@@ -2523,9 +2765,36 @@ function AppInner() {
       <SafeAreaProvider>
         <GestureHandlerRootView style={styles.container}>
           <ThemedStatusBar transparent />
-          <WelcomeScreen onComplete={handleOnboardingComplete} />
+          {/*
+            `onRestore` branche le lien « Restaurer une sauvegarde » du
+            carrousel sur le MÊME état que celui utilisé par les Réglages
+            (`restoringMigration`), qui monte MigrationImportScreen à la
+            place de l'onboarding. Le chemin de retour (`onCancel`) ramène
+            ici : aucune donnée n'est persistée tant que l'import n'a pas
+            réussi, donc l'aller-retour est sans effet de bord.
+          */}
+          <WelcomeScreen
+            onComplete={handleOnboardingComplete}
+            onRestore={() => setRestoringMigration(true)}
+          />
           {/* Kill-switch overlay : aussi monté sur onboarding pour qu'un avis
               critique apparaisse même avant que le user ait fini son setup. */}
+          <AppNoticeOverlay navigationRef={navigationRef} />
+        </GestureHandlerRootView>
+      </SafeAreaProvider>
+    );
+  }
+
+  // Guideline 1.2 : CGU bloquantes — après le carrousel pour les nouveaux
+  // utilisateurs, avant l'app principale pour les utilisateurs existants.
+  // Rendu HORS NavigationContainer, comme Welcome/SetupProfile.
+  if (needsTerms) {
+    return (
+      <SafeAreaProvider>
+        <GestureHandlerRootView style={styles.container}>
+          <ThemedStatusBar />
+          <TermsScreen onAccept={handleTermsAccepted} />
+          {/* Kill-switch overlay : même couverture que l'onboarding. */}
           <AppNoticeOverlay navigationRef={navigationRef} />
         </GestureHandlerRootView>
       </SafeAreaProvider>
@@ -2548,6 +2817,10 @@ function AppInner() {
               setNeedsOnboarding(true);
             }}
           />
+          {/* SetupProfileScreen ouvre une feuille d'actions pour le choix de
+              la photo : il lui faut un host, ce chemin de rendu étant
+              antérieur au NavigationContainer. */}
+          <AlertHost />
           {/* Kill-switch overlay : pareil sur l'écran de profil. */}
           <AppNoticeOverlay navigationRef={navigationRef} />
         </GestureHandlerRootView>
@@ -2615,6 +2888,16 @@ function AppInner() {
           <View pointerEvents="none" style={styles.privacyOverlay} />
         )}
         <InAppNotificationHost />
+        {/* Toast — monté HORS du NavigationContainer pour survivre aux
+            changements d'écran (ex. : copier un lien puis fermer la modale
+            d'invitation) et se superposer à n'importe quelle route. Rend
+            `null` tant qu'aucun toast n'est demandé. */}
+        <ToastHost />
+        {/* Host des dialogues du design system. Il s'appuie sur le Modal de
+            React Native, présenté dans sa propre fenêtre native : un seul
+            host suffit pour couvrir tous les écrans, y compris ceux
+            présentés en `modal`. */}
+        <AlertHost />
         {/* App notice (kill-switch) — monté en dernier pour couvrir tous
             les écrans du Stack. L'overlay s'auto-cache si pas d'avis (null
             return), aucun coût en steady-state. */}
@@ -2628,10 +2911,23 @@ function AppInner() {
 // STYLES
 // ============================================
 
-const styles = StyleSheet.create({
+// ════════════════════════════════════════════════════════════════════════════
+// Ce `StyleSheet.create` était au niveau MODULE et lisait `theme.colors.X`.
+// Or `theme.colors` est une copie de la palette résolue à l'import du module
+// theme.ts : les valeurs étaient donc GELÉES au démarrage. Changer
+// d'apparence dans les Réglages laissait la racine de l'app — dont l'overlay
+// de confidentialité qui recouvre tout l'écran en arrière-plan — peinte dans
+// l'ancien thème jusqu'au prochain démarrage à froid.
+//
+// C'est maintenant une FABRIQUE consommée via `useThemedStyles(makeStyles)`
+// dans `AppInner`. `useThemedStyles` mémoïse sur la référence de la palette,
+// donc le coût en régime permanent est nul : un seul `StyleSheet.create`
+// par changement de thème.
+// ════════════════════════════════════════════════════════════════════════════
+const makeStyles = (colors: ColorPalette) => ({
   container: {
     flex: 1,
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
   },
   // Fond uni sans animation, affiché UNIQUEMENT pendant la micro-phase
   // `isLockEnabledFast` (avant que la décision lock/unlock soit connue).
@@ -2639,27 +2935,29 @@ const styles = StyleSheet.create({
   // imperceptible lorsqu'il est remplacé par le LockScreen ou le SplashScreen.
   initialCover: {
     flex: 1,
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
   },
   // Overlay plein écran affiché quand l'app est 'inactive' ou 'background'.
   // Empêche la fuite d'informations sensibles dans :
   //   - l'App Switcher iOS (snapshot pris à 'inactive')
   //   - le Recents Android (snapshot pris au moment du pause)
   //   - les previews de FaceID / contrôle center
-  // Note : pour une protection complète contre les screenshots utilisateur,
-  // ajouter aussi `expo-screen-capture` → preventScreenCaptureAsync().
+  // Complément — et non substitut — de la protection anti-capture armée au
+  // boot par `screenCaptureGuard` : sur iOS, aucune API ne bloque un
+  // screenshot, cet overlay reste donc la seule barrière pour les états
+  // 'inactive'/'background'.
   privacyOverlay: {
-    position: 'absolute',
+    position: 'absolute' as const,
     top: 0, left: 0, right: 0, bottom: 0,
-    backgroundColor: theme.colors.background,
+    backgroundColor: colors.background,
     zIndex: 9999,
     elevation: 9999,
   },
   errorContainer: {
     flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: theme.colors.background,
+    justifyContent: 'center' as const,
+    alignItems: 'center' as const,
+    backgroundColor: colors.background,
     padding: 20,
   },
   errorEmoji: {
@@ -2668,7 +2966,7 @@ const styles = StyleSheet.create({
   },
   errorText: {
     fontSize: 16,
-    color: theme.colors.text,
-    textAlign: 'center',
+    color: colors.text,
+    textAlign: 'center' as const,
   },
 });

@@ -17,6 +17,74 @@
 
 import { sha256 } from '@noble/hashes/sha256';
 
+// ════════════════════════════════════════════════════════════════════════════
+// SHA-256 NATIF (react-native-quick-crypto) — accélération de la boucle PoW
+// ════════════════════════════════════════════════════════════════════════════
+// PROBLÈME : les ~260k itérations SHA-256 de la recherche de nonce tournaient
+// en JS pur (@noble/hashes) sur Hermes (pas de JIT) : 1.5s théorique, 3-30s
+// réel sous contention CPU. C'était LA cause du blocage « Préparation de la
+// connexion sécurisée » au cold start.
+//
+// SOLUTION : react-native-quick-crypto expose createHash('sha256') en C++
+// pur via JSI/Nitro — appel SYNCHRONE sans traversée de pont, buffers
+// partagés par référence. La boucle passe à quelques centaines de ms.
+//
+// SÉCURITÉ :
+//   • Même algorithme, même difficulté, même format — le gateway ne voit
+//     aucune différence. Aucun paramètre de sécurité n'est modifié.
+//   • SELF-TEST à la première résolution : on vérifie le module natif
+//     contre un vecteur de test FIPS 180-2 (sha256("abc")), y compris sur
+//     un subarray décalé (les vues sont le hot path de la boucle). S'il
+//     échoue, absent (ex: bundle JS poussé avant rebuild natif) ou throw,
+//     on retombe sur @noble/hashes — jamais de PoW invalide soumis.
+//   • require() lazy et try/catch : zéro impact si le module n'est pas
+//     linké (l'app reste 100% fonctionnelle, juste plus lente).
+// ════════════════════════════════════════════════════════════════════════════
+
+type Sha256Fn = (data: Uint8Array) => Uint8Array;
+
+let _nativeSha256: Sha256Fn | null | undefined; // undefined = pas encore résolu
+
+function resolveSha256(): Sha256Fn {
+  if (_nativeSha256 !== undefined) return _nativeSha256 ?? sha256;
+  try {
+    const qc = require('react-native-quick-crypto');
+    const createHash = qc?.createHash ?? qc?.default?.createHash;
+    if (typeof createHash !== 'function') {
+      _nativeSha256 = null;
+      return sha256;
+    }
+    const nativeHash: Sha256Fn = (data: Uint8Array) => {
+      const d = createHash('sha256').update(data).digest();
+      // digest() renvoie un Buffer (sous-classe de Uint8Array) — normaliser
+      return d instanceof Uint8Array ? d : new Uint8Array(d);
+    };
+    // Self-test : sha256("abc") = vecteur FIPS 180-2, passé en subarray
+    // décalé pour valider le respect de byteOffset/byteLength des vues.
+    const probe = new Uint8Array([0x00, 0x61, 0x62, 0x63, 0x00]);
+    const digest = nativeHash(probe.subarray(1, 4));
+    const expected = sha256(probe.subarray(1, 4));
+    let ok = digest.length === expected.length;
+    if (ok) {
+      for (let i = 0; i < expected.length; i++) {
+        if (digest[i] !== expected[i]) { ok = false; break; }
+      }
+    }
+    if (!ok) {
+      __DEV__ && console.warn('[PoW] Native SHA-256 self-test FAILED — falling back to @noble/hashes');
+      _nativeSha256 = null;
+      return sha256;
+    }
+    __DEV__ && console.log('[PoW] ⚡ Native SHA-256 active (react-native-quick-crypto)');
+    _nativeSha256 = nativeHash;
+    return nativeHash;
+  } catch {
+    __DEV__ && console.log('[PoW] Native SHA-256 unavailable — using @noble/hashes (pure JS)');
+    _nativeSha256 = null;
+    return sha256;
+  }
+}
+
 // ============================================
 // CONSTANTS
 // ============================================
@@ -145,6 +213,11 @@ export async function computeProofOfWork(
   const startedAt = Date.now();
   let lastProgressLog = startedAt;
 
+  // Résolution du hasher UNE fois avant la boucle (natif si sain, sinon
+  // @noble). Avec le natif, un batch de 10k passe de ~220ms à ~10-30ms —
+  // les yields restent en place pour le fallback JS et coûtent peu.
+  const hashFn = resolveSha256();
+
   while (true) {
     const batchEnd = nonce + BATCH_SIZE;
     while (nonce < batchEnd) {
@@ -167,7 +240,7 @@ export async function computeProofOfWork(
       }
 
       // Hash the exact slice — subarray creates a view, not a copy
-      const hash = sha256(buffer.subarray(0, prefixLen + digitCount));
+      const hash = hashFn(buffer.subarray(0, prefixLen + digitCount));
 
       // Inline difficulty check (avoid function call overhead)
       let valid = true;

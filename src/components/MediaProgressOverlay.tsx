@@ -16,7 +16,7 @@
 import React, { useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, Animated, Easing, Platform } from 'react-native';
 import { useTranslation } from 'react-i18next';
-import { useThemedStyles, type ColorPalette } from './ui';
+import { useThemedStyles, useThemeColors, type ColorPalette } from './ui';
 
 // ============================================
 // THÈME — Aligné avec ConversationScreen Colors
@@ -62,11 +62,18 @@ function makeProgressColors(c: ColorPalette) {
   };
 }
 
-// Boot-time palette for any callers that still need a static reference.
-// Imported lazily through `_theme` so we don't add a dependency arrow
-// from this file to ThemeContext at module load.
-import { theme as _theme } from './ui/theme';
-const ProgressColors = makeProgressColors(_theme.colors as ColorPalette);
+// Plus de constante `ProgressColors` figée au niveau module : elle était
+// construite à partir de `theme.colors`, c'est-à-dire de la palette capturée
+// à l'import du module theme.ts. Chaque composant appelle désormais
+// `useProgressColors()` et suit donc le thème actif en direct.
+//
+// Le hook est trivial mais mémoïsé : `useThemeColors()` renvoie toujours la
+// MÊME référence d'objet pour un scheme donné, donc `useMemo` ne recalcule
+// qu'au changement de thème.
+function useProgressColors() {
+  const colors = useThemeColors();
+  return React.useMemo(() => makeProgressColors(colors), [colors]);
+}
 
 // ============================================
 // ANNEAU DE PROGRESSION SVG (React Native compatible)
@@ -84,7 +91,12 @@ const ProgressRing: React.FC<{
   strokeWidth: number;
   progress: number;  // 0.0 → 1.0
   color?: string;
-}> = ({ size, strokeWidth, progress, color = ProgressColors.ringFill }) => {
+}> = ({ size, strokeWidth, progress, color }) => {
+  const P = useProgressColors();
+  const ringStyles = useThemedStyles(makeRingStyles);
+  // `color` ne peut plus avoir de valeur par défaut dans la signature : elle
+  // serait évaluée à l'import du module, avant que le thème soit connu.
+  const strokeColor = color ?? P.ringFill;
   const animatedProgress = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(0.6)).current;
   
@@ -154,7 +166,7 @@ const ProgressRing: React.FC<{
           height: size,
           borderRadius: size / 2,
           borderWidth: strokeWidth,
-          borderColor: ProgressColors.ringTrack,
+          borderColor: P.ringTrack,
         },
       ]} />
       
@@ -168,7 +180,7 @@ const ProgressRing: React.FC<{
               height: size,
               borderRadius: size / 2,
               borderWidth: strokeWidth,
-              borderColor: color,
+              borderColor: strokeColor,
               left: -(size / 2),
               transform: [{ rotate: firstHalfRotation }],
             },
@@ -186,7 +198,7 @@ const ProgressRing: React.FC<{
               height: size,
               borderRadius: size / 2,
               borderWidth: strokeWidth,
-              borderColor: color,
+              borderColor: strokeColor,
               transform: [{ rotate: secondHalfRotation }],
             },
           ]} />
@@ -203,7 +215,7 @@ const ProgressRing: React.FC<{
   );
 };
 
-const ringStyles = StyleSheet.create({
+const makeRingStyles = (c: ColorPalette) => StyleSheet.create({
   track: {
     position: 'absolute',
   },
@@ -226,7 +238,7 @@ const ringStyles = StyleSheet.create({
     alignItems: 'center',
   },
   percentText: {
-    color: ProgressColors.percentText,
+    color: makeProgressColors(c).percentText,
     fontWeight: '700',
     fontVariant: ['tabular-nums'],
     letterSpacing: -0.5,
@@ -272,6 +284,8 @@ export const MediaProgressOverlay: React.FC<MediaProgressOverlayProps> = ({
   phaseLabel,
 }) => {
   const { t } = useTranslation();
+  const P = useProgressColors();
+  const styles = useThemedStyles(makeOverlayStyles);
   const fadeAnim = useRef(new Animated.Value(0)).current;
   
   useEffect(() => {
@@ -294,8 +308,8 @@ export const MediaProgressOverlay: React.FC<MediaProgressOverlayProps> = ({
   }, [phase]);
   
   const ringColor = direction === 'receive'
-    ? ProgressColors.ringFillReceive
-    : ProgressColors.ringFill;
+    ? P.ringFillReceive
+    : P.ringFill;
   
   const label = phaseLabel || (() => {
     switch (phase) {
@@ -309,16 +323,16 @@ export const MediaProgressOverlay: React.FC<MediaProgressOverlayProps> = ({
   })();
   
   return (
-    <Animated.View style={[overlayStyles.container, { opacity: fadeAnim }]}>
-      <View style={overlayStyles.backdrop} />
-      <View style={overlayStyles.content}>
+    <Animated.View style={[styles.container, { opacity: fadeAnim }]}>
+      <View style={styles.backdrop} />
+      <View style={styles.content}>
         <ProgressRing
           size={ringSize}
           strokeWidth={3}
           progress={progress}
           color={ringColor}
         />
-        <Text style={overlayStyles.phaseLabel} numberOfLines={1}>
+        <Text style={styles.phaseLabel} numberOfLines={1}>
           {label}
         </Text>
       </View>
@@ -326,7 +340,7 @@ export const MediaProgressOverlay: React.FC<MediaProgressOverlayProps> = ({
   );
 };
 
-const overlayStyles = StyleSheet.create({
+const makeOverlayStyles = (c: ColorPalette) => StyleSheet.create({
   container: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: 'center',
@@ -335,14 +349,14 @@ const overlayStyles = StyleSheet.create({
   },
   backdrop: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: ProgressColors.overlayBg,
+    backgroundColor: makeProgressColors(c).overlayBg,
   },
   content: {
     alignItems: 'center',
     gap: 8,
   },
   phaseLabel: {
-    color: ProgressColors.phaseText,
+    color: makeProgressColors(c).phaseText,
     fontSize: 11,
     fontWeight: '500',
     letterSpacing: 0.3,
@@ -368,6 +382,7 @@ export const FileProgressBar: React.FC<FileProgressBarProps> = ({
   direction = 'send',
   height = 3,
 }) => {
+  const P = useProgressColors();
   const barStyles = useThemedStyles(makeBarStyles);
   const widthAnim = useRef(new Animated.Value(0)).current;
   
@@ -381,8 +396,8 @@ export const FileProgressBar: React.FC<FileProgressBarProps> = ({
   }, [progress]);
   
   const fillColor = direction === 'receive'
-    ? ProgressColors.barFillReceive
-    : ProgressColors.barFill;
+    ? P.barFillReceive
+    : P.barFill;
   
   return (
     <View style={[barStyles.track, { height }]}>
@@ -471,6 +486,7 @@ export const IncomingMediaPlaceholder: React.FC<IncomingMediaPlaceholderProps> =
   width = 200,
   height = 150,
 }) => {
+  const P = useProgressColors();
   const placeholderStyles = useThemedStyles(makePlaceholderStyles);
   const { t } = useTranslation();
   const shimmerAnim = useRef(new Animated.Value(0)).current;
@@ -524,7 +540,7 @@ export const IncomingMediaPlaceholder: React.FC<IncomingMediaPlaceholderProps> =
             size={52}
             strokeWidth={2.5}
             progress={progress}
-            color={ProgressColors.ringFillReceive}
+            color={P.ringFillReceive}
           />
           <Text style={placeholderStyles.chunkText}>
             {receivedChunks}/{totalChunks}

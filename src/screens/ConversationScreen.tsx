@@ -50,6 +50,7 @@ import haptics from '../services/haptics';
 import { ensureCameraPermission, ensureMediaLibraryPermission, ensureSaveToLibraryPermission } from '../services/permissions';
 import { useUnifiedMessages, UnifiedMessage } from '../hooks/useUnifiedMessages';
 import { MessageStatus } from '../services/messageStatus';
+import { errorMessage, localizedError } from '../services/errorMessages';
 import { LocalMessage, getConversationKeys, getMasterKey } from '../services/storage';
 
 // Type alias pour compatibilité avec l'ancien code
@@ -69,6 +70,7 @@ import { CallButton1to1 } from '../components/CallButton1to1';
 import { useCall1to1 } from '../hooks/useCall1to1';
 import { Avatar } from '../components/Avatar';
 import { GroupAvatar } from '../components/GroupAvatar';
+import { GROUPS_ENABLED } from '../config/features';
 import { isCallMessage, getCallPayload, formatCallDuration, getCallStatusText, CallMessagePayload } from '../services/callMessages';
 import { VoiceRecordButton } from '../components/VoiceRecordButton';
 import { useChunkingProgress } from '../hooks/useChunkingProgress';
@@ -1244,7 +1246,13 @@ export function ConversationScreen() {
   // Placé APRÈS la destructuration de useUnifiedMessages : `conversationInfo`
   // doit être défini avant d'être lu ici et dans le tableau de dépendances
   // (sinon TDZ → « Cannot read property 'type' of undefined »).
+  //
+  // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. Aucune conversation de
+  // groupe n'est atteignable depuis la liste, mais on garde la garde explicite :
+  // ouvrir un abonnement d'admin (et pouvoir afficher une modale d'approbation
+  // bloquante) sur une fonctionnalité retirée du produit serait incohérent.
   useEffect(() => {
+    if (!GROUPS_ENABLED) return;
     if (conversationInfo.type !== 'group') return;
     let unsub: (() => void) | undefined;
     let cancelled = false;
@@ -1262,12 +1270,12 @@ export function ConversationScreen() {
           // savoir pourquoi. Refuser explicitement est une réponse ; ignorer
           // n'en est pas une.
           void showAlert({
-            title: t('groups.joinRequestTitle', 'Demande de participation'),
-            message: t('groups.joinRequestBody', { name: req.displayName, defaultValue: `${req.displayName} souhaite rejoindre le groupe.` }),
+            title: t('groups.joinRequestTitle'),
+            message: t('groups.joinRequestBody', { name: req.displayName }),
             dismissible: false,
             buttons: [
-              { text: t('groups.decline', 'Refuser'), style: 'cancel', onPress: () => { apiG.rejectJoinRequest(req).catch(() => {}); } },
-              { text: t('groups.accept', 'Accepter'), onPress: () => { apiG.approveJoinRequest(req).catch(() => {}); } },
+              { text: t('groups.decline'), style: 'cancel', onPress: () => { apiG.rejectJoinRequest(req).catch(() => {}); } },
+              { text: t('groups.accept'), onPress: () => { apiG.approveJoinRequest(req).catch(() => {}); } },
             ],
           });
         });
@@ -2111,7 +2119,7 @@ export function ConversationScreen() {
     try {
       const success = await sendVoiceHook(uri, duration, waveform);
 
-      if (!success) throw new Error(i18n.t('errors.voiceSendFailed'));
+      if (!success) throw localizedError('errors.voiceSendFailed');
 
       // Scroll vers le bas
       setTimeout(() => {
@@ -2119,7 +2127,7 @@ export function ConversationScreen() {
       }, 150);
 
     } catch (error: any) {
-      showAlert({ title: t('common.error'), message: error.message || t('conversation.errSendVoice') });
+      showAlert({ title: t('common.error'), message: errorMessage(error, 'conversation.errSendVoice') });
     } finally {
       setSendingVoice(false);
     }
@@ -3789,7 +3797,13 @@ export function ConversationScreen() {
           title={conversationInfo.name || conversationName}
           onBackPress={() => navigation.goBack()}
           onTitlePress={() => {
-            if (conversationInfo.type === 'group') {
+            // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. La route
+            // `GroupInfo` n'est plus enregistrée : sans cette garde, un appui
+            // sur le titre d'une conversation de groupe (cas résiduel, aucune
+            // n'étant listée) ne ferait strictement rien. On retombe sur
+            // `ContactInfo`, qui gère un identifiant inconnu par son propre
+            // écran d'erreur — un chemin déjà éprouvé plutôt qu'un tap mort.
+            if (GROUPS_ENABLED && conversationInfo.type === 'group') {
               // @ts-ignore — route ajoutée au RootStackParamList
               navigation.navigate('GroupInfo', { groupId: conversationId });
             } else {
@@ -3817,7 +3831,7 @@ export function ConversationScreen() {
           }
           subtitle={
             conversationInfo.type === 'group'
-              ? t('groups.memberCount', { count: conversationInfo.memberCount || 0, defaultValue: `${conversationInfo.memberCount || 0} membres` })
+              ? t('groups.memberCount', { count: conversationInfo.memberCount || 0 })
               : ''
           }
           rightActions={

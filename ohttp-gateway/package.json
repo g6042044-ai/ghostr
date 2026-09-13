@@ -4,10 +4,15 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "keygen": "node -e \"const nacl=require('tweetnacl');const k=nacl.box.keyPair();console.log('GATEWAY_PUBLIC_KEY='+Buffer.from(k.publicKey).toString('base64'));console.log('GATEWAY_SECRET_KEY='+Buffer.from(k.secretKey).toString('base64'));\""
+    "keygen": "node -e \"const nacl=require('tweetnacl');const k=nacl.box.keyPair();console.log('GATEWAY_PUBLIC_KEY='+Buffer.from(k.publicKey).toString('base64'));console.log('GATEWAY_SECRET_KEY='+Buffer.from(k.secretKey).toString('base64'));\"",
+    "android": "expo run:android",
+    "ios": "expo run:ios"
   },
   "dependencies": {
     "jsonwebtoken": "^9.0.3",
-    "tweetnacl": "^1.0.3"
+    "tweetnacl": "^1.0.3",
+    "expo": "~54.0.37",
+    "react": "19.1.0",
+    "react-native": "0.81.5"
   }
 }

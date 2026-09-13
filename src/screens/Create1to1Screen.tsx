@@ -13,7 +13,7 @@
 //     son propre filet de sécurité mais ne fera rien si SS déjà prêt.
 
 import { useEffect, useState } from 'react';
-import { Alert, BackHandler } from 'react-native';
+import { BackHandler } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useTranslation } from 'react-i18next';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -22,7 +22,10 @@ import { sessionService } from '../services/tripleRatchet';
 import { pendingInviteStore } from '../services/pendingInvites';
 import { inviteWatcher } from '../services/inviteWatcher';
 import { waitForSealedSenderReady } from '../services/api1to1';
+import { errorMessage } from '../services/errorMessages';
 import { SplashScreen } from './SplashScreen';
+
+import { showAlert, type AlertButton } from '../components/ui';
 
 type RootStackParamList = {
   ConversationList: undefined;
@@ -75,11 +78,7 @@ export function Create1to1Screen() {
 
     const showErrorAndGoBack = (message: string, retryable: boolean) => {
       if (!mountedRef.current) return;
-      const buttons: Array<{
-        text: string;
-        onPress?: () => void;
-        style?: 'cancel' | 'default' | 'destructive';
-      }> = [];
+      const buttons: AlertButton[] = [];
       if (retryable) {
         buttons.push({
           text: t('common.retry'),
@@ -95,7 +94,10 @@ export function Create1to1Screen() {
           if (mountedRef.current) navigation.goBack();
         },
       });
-      Alert.alert(t('common.error'), message, buttons);
+      // `dismissible: false` : fermer par un tap à côté laisserait
+      // l'utilisateur sur un écran de création en échec, sans invitation ni
+      // chemin de sortie. Il doit choisir « Réessayer » ou « Annuler ».
+      void showAlert({ title: t('common.error'), message, buttons, dismissible: false });
     };
 
     const run = async () => {
@@ -152,7 +154,7 @@ export function Create1to1Screen() {
         console.error('[Create1to1] Error:', e);
         // En cas d'échec dans createInvite, c'est probablement le réseau
         // ou un bug crypto — retry possible mais on ne masque pas l'erreur.
-        showErrorAndGoBack(e?.message || t('create.createError'), true);
+        showErrorAndGoBack(errorMessage(e, 'create.createError'), true);
       }
     };
 

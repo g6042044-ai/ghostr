@@ -61,7 +61,7 @@ export function GroupInfoScreen() {
     if (blockDoneRef.current) return;
     blockDoneRef.current = true;
     await blockFingerprint(target.fingerprint, target.displayName);
-    showToast(t('groups.memberBlocked', { name: target.displayName, defaultValue: `${target.displayName} a été bloqué.` }));
+    showToast(t('groups.memberBlocked', { name: target.displayName }));
     refresh();
   }, [refresh, t]);
 
@@ -89,11 +89,11 @@ export function GroupInfoScreen() {
 
     if (iAmAdmin && m.role !== 'admin') {
       items.push({
-        title: t('groups.makeAdmin', 'Promouvoir administrateur'),
+        title: t('groups.makeAdmin'),
         icon: <Ionicons name="shield-checkmark-outline" size={24} color={colors.primary} />,
         onPress: async () => {
           const r = await apiGroups.promoteMember(groupId, m.fingerprint);
-          if (!r.success) void showAlert({ title: t('common.error', 'Erreur'), message: r.error || '' });
+          if (!r.success) void showAlert({ title: t('common.error'), message: r.error || '' });
           refresh();
         },
       });
@@ -101,20 +101,20 @@ export function GroupInfoScreen() {
 
     if (iAmAdmin) {
       items.push({
-        title: t('groups.removeMember', 'Retirer du groupe'),
+        title: t('groups.removeMember'),
         icon: <Ionicons name="person-remove-outline" size={24} color={colors.danger} />,
         destructive: true,
         onPress: async () => {
           const confirmed = await showConfirm({
-            title: t('groups.removeConfirmTitle', 'Retirer ce membre ?'),
-            message: t('groups.removeConfirmBody', { name: m.displayName, defaultValue: `${m.displayName} sera retiré du groupe.` }),
-            confirmText: t('groups.removeMember', 'Retirer'),
-            cancelText: t('common.cancel', 'Annuler'),
+            title: t('groups.removeConfirmTitle'),
+            message: t('groups.removeConfirmBody', { name: m.displayName }),
+            confirmText: t('groups.removeMember'),
+            cancelText: t('common.cancel'),
             destructive: true,
           });
           if (!confirmed) return;
           const r = await apiGroups.removeMember(groupId, m.fingerprint);
-          if (!r.success) void showAlert({ title: t('common.error', 'Erreur'), message: r.error || '' });
+          if (!r.success) void showAlert({ title: t('common.error'), message: r.error || '' });
           refresh();
         },
       });
@@ -124,15 +124,15 @@ export function GroupInfoScreen() {
     // un participant non-admin doit pouvoir se protéger d'un membre abusif
     // sans dépendre de l'admin (guideline 1.2).
     items.push({
-      title: t('groups.blockAndReport', 'Bloquer et signaler'),
+      title: t('groups.blockAndReport'),
       icon: <Ionicons name="ban-outline" size={24} color={colors.danger} />,
       destructive: true,
       onPress: async () => {
         const confirmed = await showConfirm({
-          title: t('groups.blockAndReport', 'Bloquer et signaler'),
-          message: t('groups.blockConfirmBody', { name: m.displayName, defaultValue: `${m.displayName} ne pourra plus vous contacter. Vous pourrez transmettre le contenu fautif à la modération à l'étape suivante.` }),
-          confirmText: t('common.continue', 'Continuer'),
-          cancelText: t('common.cancel', 'Annuler'),
+          title: t('groups.blockAndReport'),
+          message: t('groups.blockConfirmBody', { name: m.displayName }),
+          confirmText: t('common.continue'),
+          cancelText: t('common.cancel'),
           destructive: true,
         });
         if (!confirmed) return;
@@ -147,10 +147,10 @@ export function GroupInfoScreen() {
 
   const handleLeave = useCallback(async () => {
     const confirmed = await showConfirm({
-      title: t('groups.leaveTitle', 'Quitter le groupe ?'),
-      message: t('groups.leaveBody', 'Vous ne recevrez plus les messages de ce groupe.'),
-      confirmText: t('groups.leave', 'Quitter'),
-      cancelText: t('common.cancel', 'Annuler'),
+      title: t('groups.leaveTitle'),
+      message: t('groups.leaveBody'),
+      confirmText: t('groups.leave'),
+      cancelText: t('common.cancel'),
       destructive: true,
     });
     if (!confirmed) return;
@@ -166,8 +166,8 @@ export function GroupInfoScreen() {
   if (!g) {
     return (
       <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]} edges={['top']}>
-        <Header title={t('groups.info', 'Infos du groupe')} showBackButton onBackPress={() => navigation.goBack()} />
-        <View style={styles.center}><Text style={{ color: colors.textSecondary }}>{t('groups.notFound', 'Groupe introuvable')}</Text></View>
+        <Header title={t('groups.info')} showBackButton onBackPress={() => navigation.goBack()} />
+        <View style={styles.center}><Text style={{ color: colors.textSecondary }}>{t('groups.notFound')}</Text></View>
       </SafeAreaView>
     );
   }
@@ -184,12 +184,12 @@ export function GroupInfoScreen() {
         <Avatar displayName={item.displayName} senderToken={item.fingerprint} avatarUri={item.avatarBase64} size="medium" />
         <View style={styles.memberInfo}>
           <Text style={[styles.memberName, { color: colors.text }]} numberOfLines={1}>
-            {item.displayName}{isMe ? ` (${t('groups.you', 'vous')})` : ''}
+            {item.displayName}{isMe ? ` (${t('groups.you')})` : ''}
           </Text>
         </View>
         {item.role === 'admin' && (
           <View style={[styles.adminBadge, { backgroundColor: colors.primary + '22' }]}>
-            <Text style={[styles.adminBadgeText, { color: colors.primary }]}>{t('groups.admin', 'Admin')}</Text>
+            <Text style={[styles.adminBadgeText, { color: colors.primary }]}>{t('groups.admin')}</Text>
           </View>
         )}
       </TouchableOpacity>
@@ -198,7 +198,7 @@ export function GroupInfoScreen() {
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]} edges={['top']}>
-      <Header title={t('groups.info', 'Infos du groupe')} showBackButton onBackPress={() => navigation.goBack()} />
+      <Header title={t('groups.info')} showBackButton onBackPress={() => navigation.goBack()} />
       <ScrollView>
         {/* En-tête : avatar + nom + description */}
         <View style={styles.profileHeader}>
@@ -206,14 +206,14 @@ export function GroupInfoScreen() {
           <Text style={[styles.groupName, { color: colors.text }]}>{g.name}</Text>
           {!!g.description && <Text style={[styles.groupDesc, { color: colors.textSecondary }]}>{g.description}</Text>}
           <Text style={[styles.memberCount, { color: colors.textSecondary }]}>
-            {t('groups.memberCount', { count: members.length, defaultValue: `${members.length} membres` })}
+            {t('groups.memberCount', { count: members.length })}
           </Text>
         </View>
 
         {/* Mute */}
         <View style={[styles.optionRow, { borderColor: colors.border }]}>
           <Ionicons name="notifications-off-outline" size={22} color={colors.textSecondary} />
-          <Text style={[styles.optionLabel, { color: colors.text }]}>{t('groups.mute', 'Mettre en sourdine')}</Text>
+          <Text style={[styles.optionLabel, { color: colors.text }]}>{t('groups.mute')}</Text>
           <Switch
             value={!!g.muted}
             onValueChange={handleToggleMute}
@@ -229,7 +229,7 @@ export function GroupInfoScreen() {
             onPress={() => navigation.navigate('AddGroupMembers', { groupId })}
           >
             <Ionicons name="person-add-outline" size={22} color={colors.primary} />
-            <Text style={[styles.optionLabel, { color: colors.primary }]}>{t('groups.addMembers', 'Ajouter des membres')}</Text>
+            <Text style={[styles.optionLabel, { color: colors.primary }]}>{t('groups.addMembers')}</Text>
             <Ionicons name="chevron-forward" size={20} color={colors.textSecondary} />
           </TouchableOpacity>
         )}
@@ -244,14 +244,14 @@ export function GroupInfoScreen() {
             onPress={() => navigation.navigate('GroupInviteQR', { groupId })}
           >
             <Ionicons name="qr-code-outline" size={22} color={colors.primary} />
-            <Text style={[styles.optionLabel, { color: colors.primary }]}>{t('groups.inviteByQR', 'Inviter via QR')}</Text>
+            <Text style={[styles.optionLabel, { color: colors.primary }]}>{t('groups.inviteByQR')}</Text>
             <Ionicons name="chevron-forward" size={20} color={colors.textSecondary} />
           </TouchableOpacity>
         )}
 
         {/* Liste des membres */}
         <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>
-          {t('groups.membersSection', 'Membres')}
+          {t('groups.membersSection')}
         </Text>
         <FlatList
           data={members}
@@ -262,13 +262,13 @@ export function GroupInfoScreen() {
         {/* Le hint s'affiche pour tout le monde : le long-press propose
             désormais au minimum « Bloquer et signaler », admin ou non. */}
         <Text style={[styles.longPressHint, { color: colors.textSecondary }]}>
-          {t('groups.longPressHint', 'Appui long sur un membre pour le gérer.')}
+          {t('groups.longPressHint')}
         </Text>
 
         {/* Quitter */}
         <TouchableOpacity style={styles.leaveRow} onPress={handleLeave}>
           <Ionicons name="exit-outline" size={22} color={colors.danger} />
-          <Text style={[styles.leaveText, { color: colors.danger }]}>{t('groups.leave', 'Quitter le groupe')}</Text>
+          <Text style={[styles.leaveText, { color: colors.danger }]}>{t('groups.leave')}</Text>
         </TouchableOpacity>
         <View style={{ height: 32 }} />
       </ScrollView>

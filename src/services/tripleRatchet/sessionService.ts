@@ -1273,6 +1273,19 @@ export class SessionService {
     if (!this.identityKeyPair) return '';
     return bytesToHex(this.identityKeyPair.publicKey.bytes);
   }
+
+  /**
+   * Clé secrète Ed25519 (64o, format tweetnacl) pour SIGNER (ex. messages de
+   * groupe). null tant que l'identité n'est pas chargée.
+   */
+  getMySigningSecretKey(): Uint8Array | null {
+    return this.identityKeyPair ? this.identityKeyPair.privateKey.bytes : null;
+  }
+
+  /** Clé publique Ed25519 (32o) ; hex(.)[:16] === fingerprint. */
+  getMyIdentityPublicKeyBytes(): Uint8Array | null {
+    return this.identityKeyPair ? this.identityKeyPair.publicKey.bytes : null;
+  }
   
   /**
    * Génère un tag aléatoire pour le transport
@@ -1804,6 +1817,353 @@ export class SessionService {
    * En cas d'échec, on throw avec `wasRollback: true` pour que l'UI puisse
    * afficher un message clair et inviter à réessayer.
    */
+
+  // ==========================================
+  // v30.0 — MESH DE GROUPE : sessions à la demande depuis un bundle
+  // ==========================================
+  //
+  // Pour le maillage des groupes : créer une session 1:1 SANS le flux QR/serveur
+  // (pas de tag, pas de fetch). Le bundle est transporté dans le canal de groupe
+  // (welcome / roster_state). Réplique la logique d'acceptInvite (initiateur) et
+  // de finalizeSession (répondeur), mais à partir de données déjà en main.
+
+  /**
+   * Crée une session 1:1 en tant qu'INITIATEUR à partir d'un bundle PQXDH
+   * sérialisé (clés publiques du pair) et de son profil. Renvoie la session +
+   * le PQXDHInitialMessage SÉRIALISÉ à joindre au premier message de groupe
+   * (pour que le pair crée sa moitié de session à la réception).
+   *
+   * Réutilisé par apiGroups pour le lazy-mesh. Consomme une OTPK du pair (ou
+   * dégradation gracieuse si absente). Vérifie KT (non bloquant sauf MITM).
+   */
+  async createMeshInitiatorSession(
+    serializedBundle: string,
+    theirProfile: UserProfile
+  ): Promise<{ sessionId: string; initialMessageSerialized: string } | null> {
+    if (!this.identityKeyPair) { await this.initialize(); }
+    if (!this.identityKeyPair) throw new Error('Identity not initialized');
+
+    // Désérialiser + valider le bundle.
+    let bundle;
+    try {
+      bundle = deserializePQPreKeyBundle(JSON.parse(serializedBundle));
+    } catch (e) {
+      __DEV__ && console.warn('[SessionService] mesh: bad bundle:', e);
+      return null;
+    }
+    const validation = validatePQPreKeyBundle(bundle);
+    if (!validation.valid) {
+      __DEV__ && console.warn('[SessionService] mesh: invalid bundle:', validation.error);
+      return null;
+    }
+
+    // Anti self-session.
+    const myKeyB64 = serializePublicKey(this.identityKeyPair.publicKey);
+    if (myKeyB64 === serializePublicKey(bundle.identityKey)) {
+      __DEV__ && console.warn('[SessionService] mesh: self-session ignored');
+      return null;
+    }
+
+    // Si une session existe déjà avec ce pair, ne pas en recréer.
+    const existingId = this.generateSessionId(bundle.identityKey);
+    if (this.sessions.has(existingId)) {
+      return { sessionId: existingId, initialMessageSerialized: '' };
+    }
+
+    // KT (protection MITM) — non bloquant sauf invalid_proof.
+    const theirKeyB64 = serializePublicKey(bundle.identityKey);
+    let ktStatus: StoredSession['ktStatus'] = 'error';
+    try {
+      const ktResult = await verifyKeyInTransparencyLog(theirKeyB64);
+      if (ktResult.verified) ktStatus = 'verified';
+      else if (!ktResult.inLog) ktStatus = 'not_in_log';
+      else if (!ktResult.proofValid) {
+        __DEV__ && console.warn('[SessionService] mesh: KT invalid_proof — blocking');
+        return null; // MITM probable
+      }
+    } catch { ktStatus = 'error'; }
+
+    // PQXDH initiateur (consomme une OTPK si présente).
+    const pqxdhResult = await pqxdhInitiator(this.identityKeyPair, bundle);
+    const ratchetState = await initializeTripleRatchetInitiator(
+      pqxdhResult.sharedSecret,
+      bundle.signedPreKey.publicKey,
+      pqxdhResult.ephemeralKeyPair,
+      pqxdhResult.sharedSecret.bytes,
+      this.config
+    );
+    const sessionId = this.generateSessionId(bundle.identityKey);
+
+    const pqxdhMessage: PQXDHInitialMessage = {
+      identityKey: this.identityKeyPair.publicKey,
+      ephemeralKey: pqxdhResult.ephemeralPublicKey,
+      usedSignedPreKeyId: bundle.signedPreKey.id,
+      usedOneTimePreKeyId: pqxdhResult.usedOneTimePreKeyId,
+      usedPQPreKeyId: bundle.pqPreKey.id,
+      kemCiphertext: pqxdhResult.kemCiphertext,
+      ciphertext: new Uint8Array(0),
+    };
+
+    const session: StoredSession = {
+      version: 2,
+      id: sessionId,
+      myIdentityKeyFingerprint: this.getMyShortFingerprint(),
+      theirIdentityKey: serializePublicKey(bundle.identityKey),
+      theirIdentityKeyFingerprint: bytesToHex(bundle.identityKey.bytes).substring(0, 16),
+      theirProfile,
+      tripleRatchetState: serializeTripleRatchetState(ratchetState),
+      createdAt: Date.now(),
+      lastActivityAt: Date.now(),
+      isInitiator: true,
+      messagesSent: 0,
+      messagesReceived: 0,
+      tag: '', // mesh : pas de tag d'invitation
+      isPostQuantum: true,
+      ktStatus,
+    };
+    await this.saveSession(session);
+    this.ratchetStates.set(sessionId, ratchetState);
+    await this.verifyContactKey(sessionId, session.theirIdentityKey, theirProfile.displayName || 'Unknown');
+
+    return {
+      sessionId,
+      initialMessageSerialized: serializePQXDHMessage(pqxdhMessage),
+    };
+  }
+
+  /**
+   * Crée une session 1:1 en tant que RÉPONDEUR à partir d'un PQXDHInitialMessage
+   * sérialisé (reçu en accompagnement d'un premier message de groupe). Réplique
+   * finalizeSession sans le wrapping InviteResponse. Renvoie le sessionId créé,
+   * ou un sessionId existant si la session est déjà là (idempotent).
+   */
+  async createMeshResponderSession(
+    initialMessageSerialized: string,
+    theirProfile: UserProfile
+  ): Promise<string | null> {
+    if (!this.identityKeyPair) { await this.initialize(); }
+    if (!this.identityKeyPair) throw new Error('Identity not initialized');
+
+    let pqxdhMessage: PQXDHInitialMessage;
+    try {
+      pqxdhMessage = deserializePQXDHMessage(initialMessageSerialized);
+    } catch (e) {
+      __DEV__ && console.warn('[SessionService] mesh responder: bad initial message:', e);
+      return null;
+    }
+
+    // Anti self.
+    const myKeyB64 = serializePublicKey(this.identityKeyPair.publicKey);
+    if (myKeyB64 === serializePublicKey(pqxdhMessage.identityKey)) return null;
+
+    // Session déjà existante ? (idempotent)
+    const sessionId = this.generateSessionId(pqxdhMessage.identityKey);
+    if (this.sessions.has(sessionId)) return sessionId;
+
+    // KT.
+    const theirKeyB64 = serializePublicKey(pqxdhMessage.identityKey);
+    let ktStatus: StoredSession['ktStatus'] = 'error';
+    try {
+      const ktResult = await verifyKeyInTransparencyLog(theirKeyB64);
+      if (ktResult.verified) ktStatus = 'verified';
+      else if (!ktResult.inLog) ktStatus = 'not_in_log';
+      else if (!ktResult.proofValid) return null;
+    } catch { ktStatus = 'error'; }
+
+    // Retrouver MES prekeys référencées par le message initial.
+    const signedPreKey = this.findSignedPreKeyById(pqxdhMessage.usedSignedPreKeyId);
+    const pqSignedKey = this.findPQSignedKeyById(pqxdhMessage.usedPQPreKeyId);
+    if (!signedPreKey || !pqSignedKey) {
+      __DEV__ && console.warn('[SessionService] mesh responder: prekeys not found (expired?)');
+      return null;
+    }
+    const usedOtpk = pqxdhMessage.usedOneTimePreKeyId !== undefined
+      ? this.oneTimePreKeys.get(pqxdhMessage.usedOneTimePreKeyId)
+      : null;
+
+    // PQXDH répondeur (signature réelle : objets, pas callbacks).
+    let sharedSecret;
+    try {
+      sharedSecret = await pqxdhResponder(
+        this.identityKeyPair,
+        signedPreKey,
+        pqSignedKey,
+        usedOtpk ?? null,
+        pqxdhMessage
+      );
+    } catch (e) {
+      __DEV__ && console.warn('[SessionService] mesh responder: pqxdhResponder failed:', e);
+      return null;
+    }
+
+    // Consommer l'OTPK utilisée.
+    if (pqxdhMessage.usedOneTimePreKeyId !== undefined) {
+      this.oneTimePreKeys.delete(pqxdhMessage.usedOneTimePreKeyId);
+      this.reservedOtpkIds.delete(pqxdhMessage.usedOneTimePreKeyId);
+      await this.saveOneTimePreKeys();
+    }
+
+    const ratchetState = await initializeTripleRatchetResponder(
+      sharedSecret,
+      signedPreKey.keyPair,
+      pqxdhMessage.ephemeralKey,
+      sharedSecret.bytes,
+      this.config
+    );
+
+    const session: StoredSession = {
+      version: 2,
+      id: sessionId,
+      myIdentityKeyFingerprint: this.getMyShortFingerprint(),
+      theirIdentityKey: serializePublicKey(pqxdhMessage.identityKey),
+      theirIdentityKeyFingerprint: bytesToHex(pqxdhMessage.identityKey.bytes).substring(0, 16),
+      theirProfile,
+      tripleRatchetState: serializeTripleRatchetState(ratchetState),
+      createdAt: Date.now(),
+      lastActivityAt: Date.now(),
+      isInitiator: false,
+      messagesSent: 0,
+      messagesReceived: 0,
+      tag: '',
+      isPostQuantum: true,
+      ktStatus,
+    };
+    await this.saveSession(session);
+    this.ratchetStates.set(sessionId, ratchetState);
+    await this.verifyContactKey(sessionId, session.theirIdentityKey, theirProfile.displayName || 'Unknown');
+
+    return sessionId;
+  }
+
+  /**
+   * Génère MON bundle PQXDH sérialisé, à transporter dans le canal de groupe
+   * (welcome / roster_state) pour que les autres membres puissent créer une
+   * session vers moi (mesh à la demande). Réserve une OTPK si disponible
+   * (dégradation gracieuse sinon). Ne consomme PAS de tag (hors flux QR).
+   */
+  async generateMyBundleForGroup(): Promise<string | null> {
+    if (!this.identityKeyPair) { await this.initialize(); }
+    if (!this.identityKeyPair || !this.signedPreKey || !this.pqSignedKey) return null;
+
+    // Tenter de réserver une OTPK dédiée (comme createInvite).
+    let dedicatedOtpk: OneTimePreKey | undefined;
+    for (const [id, otpk] of this.oneTimePreKeys) {
+      if (!this.reservedOtpkIds.has(id)) {
+        dedicatedOtpk = otpk;
+        this.reservedOtpkIds.add(id);
+        break;
+      }
+    }
+    if (!dedicatedOtpk) {
+      __DEV__ && console.warn('[SessionService] group bundle: no OTPK available (reduced FS)');
+    }
+
+    const bundle = createPQPreKeyBundle(
+      this.identityKeyPair,
+      this.signedPreKey,
+      this.pqSignedKey,
+      dedicatedOtpk
+    );
+    return JSON.stringify(serializePQPreKeyBundle(bundle));
+  }
+
+  // ==========================================
+  // PUBLICATION DU BUNDLE ADMIN POUR INVITATION DE GROUPE
+  // ==========================================
+  //
+  // Reproduit exactement le mécanisme du 1:1 (`createInvite`) : le bundle
+  // PQXDH est téléversé sur le serveur sous un tag aléatoire, et seul ce tag
+  // — 32 caractères hexadécimaux — voyage dans le QR code. Cela fait passer
+  // l'invitation de groupe d'environ 2 170 octets (QR version 40, à la limite
+  // du lisible) à environ 200 octets (QR version 6, scannable instantanément).
+  //
+  // ⚠️ CONTRAINTE DE RÉTENTION — À CONNAÎTRE AVANT D'UTILISER CE CHEMIN
+  // Le serveur purge les messages au bout de 48 h (`cleanup_old_data`), alors
+  // que les tickets de groupe valent 7 jours par défaut. Un QR reposant sur un
+  // tag cesse donc de fonctionner après 48 h, même si le ticket est encore
+  // valide. C'est aussi vrai du flux 1:1 aujourd'hui : `acceptInvite` vérifie
+  // une péremption de 30 jours côté client (`INVITE_MAX_AGE_MS`) qui ne peut
+  // jamais être atteinte, puisque la ligne a disparu du serveur bien avant.
+  //
+  // Conséquence pour l'appelant : republier à chaque affichage de l'écran
+  // d'invitation (ce que fait `GroupInviteQRScreen`), et conserver un chemin
+  // durable — le lien partageable embarque le bundle en clair, sans dépendance
+  // au serveur ni limite de taille.
+
+  /**
+   * Téléverse le bundle PQXDH de l'admin et renvoie le tag permettant de le
+   * récupérer. Le payload serveur est strictement identique à celui d'une
+   * invitation 1:1 (`type: 'ghostr_invite_pq'`, version 2), afin de réutiliser
+   * `fetchInviteFromServer` sans ajouter la moindre surface côté serveur.
+   *
+   * @throws si le sealed sender ne peut pas être initialisé, ou si le
+   *         téléversement échoue. L'appelant doit prévoir un repli.
+   */
+  async publishGroupAdminBundle(): Promise<{ tag: string; bundleJson: string }> {
+    const bundleJson = await this.generateMyBundleForGroup();
+    if (!bundleJson) {
+      throw new Error('Bundle admin indisponible (identité non initialisée)');
+    }
+
+    const tag = this.generateTag();
+
+    const inviteData: InviteData = {
+      version: 2,
+      type: 'ghostr_invite_pq',
+      bundle: bundleJson,
+      profile: this.myProfile,
+      createdAt: Date.now(),
+      tag,
+    };
+
+    const serverPayload = {
+      type: 'ghostr_invite_pq',
+      version: 2,
+      data: encodeBase64(new TextEncoder().encode(JSON.stringify(inviteData))),
+      timestamp: Date.now(),
+    };
+
+    // Le gateway n'accepte que des enveloppes sealed sender : sans bootstrap,
+    // il tenterait nacl.box.open() sur du JSON brut et rejetterait la requête.
+    if (!isSealedSenderReady()) {
+      const { waitForSealedSenderReady } = await import('../api1to1');
+      const ready = await waitForSealedSenderReady({ timeoutMs: 60_000 });
+      if (!ready || !isSealedSenderReady()) {
+        throw new Error('Sealed sender indisponible — publication du bundle impossible');
+      }
+    }
+
+    const envelope = createSealedSenderEnvelope(tag, JSON.stringify(serverPayload));
+    const { error } = await secureRpc('send_sealed_message', {
+      p_tag: envelope.tag,
+      p_sealed_content: envelope.sealedContent,
+      p_version: envelope.version,
+    });
+
+    if (error) {
+      throw new Error('Publication du bundle admin échouée : ' + (error.message || error.code));
+    }
+
+    __DEV__ && console.log('[SessionService] 📤 Bundle admin de groupe publié, tag:', tag.slice(0, 12) + '…');
+    return { tag, bundleJson };
+  }
+
+  /**
+   * Récupère un bundle PQXDH publié, à partir de son tag.
+   * Enveloppe publique de `fetchInviteFromServer` : lecture seule, le tag
+   * n'est pas consommé, donc plusieurs personnes peuvent rejoindre avec le
+   * même QR.
+   *
+   * @returns le bundle sérialisé, prêt pour `createMeshInitiatorSession`.
+   */
+  async fetchGroupAdminBundle(tag: string): Promise<string> {
+    const inviteData = await this.fetchInviteFromServer(tag);
+    if (!inviteData || !inviteData.bundle) {
+      throw new Error('Bundle introuvable pour ce tag');
+    }
+    return inviteData.bundle;
+  }
+
   async acceptInviteAndRespond(inviteString: string): Promise<AcceptInviteResult> {
     // 1. Accepter l'invitation (crée la session localement, consomme l'OTPK)
     const result = await this.acceptInvite(inviteString);

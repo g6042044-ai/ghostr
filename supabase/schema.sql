@@ -10,7 +10,8 @@
 --   • 1 table monitoring: blob_cleanup_log
 --   • 4 RPCs publiques: send_sealed_message, get_messages_by_tags,
 --                        send_call_signal, get_call_signals_by_tags
---   • 2 RPCs internes: check_rate_limit, cleanup_old_data
+--   • 3 RPCs internes: check_rate_limit, cleanup_old_data,
+--                        is_handshake_payload
 --   • 1 RPC maintenance: cleanup_expired_blobs
 --   • 2 buckets storage: ghostr-blobs (v26.0 médias E2E), whisper-media (legacy)
 --   • Cron jobs: cleanup messages/signaux (15min), cleanup blobs (6h)
@@ -20,7 +21,8 @@
 --   2. RPC-only: aucun accès direct aux tables (RLS deny-all)
 --   3. Rate limiting sur écriture ET lecture (par tag individuel)
 --   4. Payload opaque: tag + sealed_payload, rien d'autre
---   5. TTL automatique: messages 48h, signaux 24h, blobs 48h
+--   5. TTL automatique: trafic 48h, handshake 30j (invitations + accepts),
+--      signaux 24h, blobs 48h
 --   6. statement_timeout sur toutes les fonctions (défense DoS)
 --   7. Validation stricte de toutes les entrées
 --   8. Sealed sender: aucun identifiant expéditeur (pas de device_id)
@@ -49,10 +51,12 @@ DROP FUNCTION IF EXISTS public.get_app_notice() CASCADE;
 
 -- Fonctions internes
 DROP FUNCTION IF EXISTS public.check_rate_limit(TEXT, TEXT, INTEGER) CASCADE;
-DROP FUNCTION IF EXISTS public.cleanup_old_data(INTEGER, INTEGER) CASCADE;
+DROP FUNCTION IF EXISTS public.cleanup_old_data(INTEGER, INTEGER, INTEGER) CASCADE;
+DROP FUNCTION IF EXISTS public.is_handshake_payload(TEXT) CASCADE;
 DROP FUNCTION IF EXISTS public.cleanup_expired_blobs() CASCADE;
 
 -- Anciennes signatures (compat drop)
+DROP FUNCTION IF EXISTS public.cleanup_old_data(INTEGER, INTEGER) CASCADE;
 DROP FUNCTION IF EXISTS public.send_message(TEXT, TEXT, TEXT) CASCADE;
 DROP FUNCTION IF EXISTS public.send_call_signal(TEXT, TEXT, TEXT) CASCADE;
 
@@ -214,6 +218,68 @@ COMMENT ON TABLE public.app_notice IS
 COMMENT ON COLUMN public.app_notice.signed_payload IS
     'Format: base64(canonical_json).base64(ed25519_sig). Clé pub côté client.';
 
+-- ── Signalements (Guideline App Store 1.2) ──
+--
+-- Le serveur ne peut PAS lire les messages (E2EE, sealed sender). Un
+-- signalement est un acte VOLONTAIRE du destinataire : le contenu arrive ici
+-- uniquement parce que le signaleur a choisi de le transmettre, via le tunnel
+-- OHTTP (pas d'IP). Modération manuelle sous 24h (engagement guideline 1.2) :
+--   SELECT * FROM reports WHERE handled = false ORDER BY created_at;
+--   UPDATE reports SET handled = true, handled_at = now() WHERE id = '<uuid>';
+CREATE TABLE public.reports (
+    id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    category      TEXT        NOT NULL,
+    content       TEXT        NOT NULL,
+    context       TEXT        NOT NULL DEFAULT 'message',
+    reporter_tag  TEXT,
+    handled       BOOLEAN     NOT NULL DEFAULT false,
+    handled_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Aligné avec ReportCategory / ReportContext (src/services/reportService.ts)
+    CONSTRAINT reports_category_valid CHECK (
+        category IN ('spam', 'harassment', 'illegal', 'other')
+    ),
+    CONSTRAINT reports_context_valid CHECK (
+        context IN ('message', 'contact')
+    ),
+    CONSTRAINT reports_content_size CHECK (
+        length(content) BETWEEN 1 AND 4000
+    ),
+    CONSTRAINT reports_reporter_tag_size CHECK (
+        reporter_tag IS NULL OR length(reporter_tag) <= 64
+    )
+);
+
+COMMENT ON TABLE public.reports IS
+    'Signalements volontaires (guideline 1.2). Contenu transmis par le signaleur, jamais lu par le serveur. Modération manuelle sous 24h.';
+COMMENT ON COLUMN public.reports.reporter_tag IS
+    'Tag aléatoire local du signaleur — sert uniquement au rate-limit, aucun lien avec son identité.';
+
+
+-- ── Exemption du TTL (invitation de démo App Review) ──
+--
+-- Le bundle d'invitation PQXDH vit dans `messages` (le QR ne contient que le
+-- tag, cf. sessionService.fetchInviteFromServer) : une invitation meurt donc
+-- avec la purge 48h. C'est la cause du rejet Apple 2.1(a) du 4 juin 2026.
+-- Plutôt que d'allonger le TTL GLOBAL à chaque soumission (ce qui allongerait
+-- aussi la rétention des messages non délivrés, contrairement à ce qui est
+-- déclaré à Apple), on exempte le seul tag de l'invitation de démo.
+-- Table vide par défaut → comportement strictement identique à 48h partout.
+CREATE TABLE public.invite_ttl_exempt (
+    tag        TEXT        PRIMARY KEY,
+    note       TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Même contrainte que public.messages.tag
+    CONSTRAINT invite_ttl_exempt_tag_length CHECK (length(tag) BETWEEN 8 AND 128)
+);
+
+COMMENT ON TABLE public.invite_ttl_exempt IS
+    'Tags exemptés de la purge TTL de messages (invitation de démo App Review). À vider après approbation.';
+COMMENT ON COLUMN public.invite_ttl_exempt.note IS
+    'Pourquoi ce tag est exempté (ex. « demo App Review 1.0.1 ») — pour pouvoir nettoyer plus tard.';
+
 
 -- ============================================================================
 -- 3. INDEX
@@ -230,6 +296,9 @@ CREATE INDEX idx_call_signals_tag_created
 
 CREATE INDEX idx_rate_limits_window
     ON public.rate_limits (window_start);
+
+CREATE INDEX idx_reports_unhandled
+    ON public.reports (created_at) WHERE handled = false;
 
 
 -- ============================================================================
@@ -465,23 +534,75 @@ $$;
 -- ============================================================================
 
 -- ── Cleanup messages/signaux/rate_limits (cron toutes les 15min) ──
+-- ── Prédicat « ceci est un handshake » ──
+-- Le gateway dé-scelle l'enveloppe sealed sender avant de transmettre à
+-- Supabase (ohttp-gateway/server.js:1435 → `p_sealed_content:
+-- inner.innerPayload`), donc `sealed_payload` est du JSON dont le champ
+-- `type` est lisible ici. Le CONTENU reste chiffré E2EE — seul le type
+-- d'enveloppe est visible, et il l'était déjà.
+--
+-- LIKE et non `::jsonb->>'type'` DÉLIBÉRÉMENT : une seule ligne au JSON
+-- malformé ferait échouer le cast, donc la purge entière, donc la table
+-- grossirait sans limite — en silence. Un LIKE ne peut pas échouer.
+-- Pas de faux positif : les champs `data` et `_p` n'utilisent que l'alphabet
+-- base64 (sealedSender.ts:728), sans guillemet ni deux-points.
+CREATE OR REPLACE FUNCTION public.is_handshake_payload(p_payload TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+AS $$
+    SELECT p_payload LIKE '%"type":"ghostr_invite_pq"%'
+        OR p_payload LIKE '%"type":"ghostr_accept_pq"%';
+$$;
+
+COMMENT ON FUNCTION public.is_handshake_payload(TEXT) IS
+    'Vrai si le payload est un bundle d''invitation ou un accusé d''acceptation (TTL long). Le contenu reste chiffré E2EE — seul le type d''enveloppe est lu.';
+
+
+-- ── Cleanup messages/signaux/rate_limits — DEUX TTL ──
+-- Le bundle d'invitation vit dans `messages` (le QR ne contient que le tag),
+-- donc la durée de vie réelle d'une invitation EST ce TTL. Le client annonce
+-- 30 jours (pendingInvites.DEFAULT_EXPIRY_MS) : on aligne le serveur sur les
+-- handshakes seuls, sans allonger la rétention du trafic — il n'y a aucune
+-- suppression après lecture, et les decoys écrivent ~17 KB toutes les ~90s
+-- par client actif.
+-- Les accepts suivent les invitations : sinon quelqu'un scanne une invitation
+-- de 20 jours, envoie son accept, et si l'émetteur n'ouvre pas l'app sous 48h
+-- l'accept est purgé — connexion perdue, OTPK consommée.
 CREATE OR REPLACE FUNCTION public.cleanup_old_data(
-    p_messages_days INTEGER DEFAULT 2,
-    p_signals_days  INTEGER DEFAULT 1
+    p_messages_days  INTEGER DEFAULT 2,
+    p_signals_days   INTEGER DEFAULT 1,
+    p_handshake_days INTEGER DEFAULT 30
 ) RETURNS JSON
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
 SET statement_timeout = '30s'
 AS $$
 DECLARE
-    deleted_messages INTEGER;
-    deleted_signals  INTEGER;
-    deleted_rates    INTEGER;
+    deleted_messages   INTEGER;
+    deleted_handshakes INTEGER;
+    deleted_signals    INTEGER;
+    deleted_rates      INTEGER;
 BEGIN
-    -- Messages > 48h
+    -- Handshake > 30j (hors tags exemptés). Volume négligeable : une
+    -- invitation + un accept par connexion.
     WITH d AS (
-        DELETE FROM public.messages
-        WHERE created_at < now() - (p_messages_days || ' days')::INTERVAL
+        DELETE FROM public.messages m
+        WHERE m.created_at < now() - (p_handshake_days || ' days')::INTERVAL
+          AND public.is_handshake_payload(m.sealed_payload)
+          AND NOT EXISTS (
+              SELECT 1 FROM public.invite_ttl_exempt e WHERE e.tag = m.tag
+          )
+        RETURNING 1
+    ) SELECT count(*) INTO deleted_handshakes FROM d;
+
+    -- Trafic de conversation (messages réels ET decoys) > 48h
+    WITH d AS (
+        DELETE FROM public.messages m
+        WHERE m.created_at < now() - (p_messages_days || ' days')::INTERVAL
+          AND NOT public.is_handshake_payload(m.sealed_payload)
+          AND NOT EXISTS (
+              SELECT 1 FROM public.invite_ttl_exempt e WHERE e.tag = m.tag
+          )
         RETURNING 1
     ) SELECT count(*) INTO deleted_messages FROM d;
 
@@ -501,6 +622,7 @@ BEGIN
 
     RETURN json_build_object(
         'deleted_messages',    deleted_messages,
+        'deleted_handshakes',  deleted_handshakes,
         'deleted_signals',     deleted_signals,
         'deleted_rate_limits', deleted_rates,
         'executed_at',         now()
@@ -508,8 +630,8 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER)
-    IS 'TTL cleanup: 48h messages, 24h signaux, 5min rate limits. Cron: */15 * * * *';
+COMMENT ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER)
+    IS 'TTL cleanup: 48h trafic, 30j handshake (hors invite_ttl_exempt), 24h signaux, 5min rate limits. Cron: */15 * * * *';
 
 
 -- ── Cleanup blobs expirés (cron toutes les 6h) ──
@@ -585,6 +707,50 @@ COMMENT ON FUNCTION public.get_app_notice() IS
     'Retourne le payload Ed25519-signé de l''avis courant (ou NULL). Vérif client.';
 
 
+-- ── submit_report ──
+-- Guideline 1.2 : dépôt d'un signalement volontaire par le destinataire.
+-- Le rate-limit s'appuie sur un tag aléatoire local du signaleur (aucun lien
+-- avec son identité crypto) — 5 signalements/min max.
+CREATE OR REPLACE FUNCTION public.submit_report(
+    p_category     TEXT,
+    p_content      TEXT,
+    p_context      TEXT DEFAULT 'message',
+    p_reporter_tag TEXT DEFAULT NULL
+) RETURNS TABLE(id UUID)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+SET statement_timeout = '5s'
+AS $$
+BEGIN
+    -- Validation
+    IF p_category IS NULL OR p_category NOT IN ('spam', 'harassment', 'illegal', 'other') THEN
+        RAISE EXCEPTION 'Invalid category';
+    END IF;
+    IF p_context IS NULL OR p_context NOT IN ('message', 'contact') THEN
+        RAISE EXCEPTION 'Invalid context';
+    END IF;
+    IF p_content IS NULL OR length(p_content) < 1 OR length(p_content) > 4000 THEN
+        RAISE EXCEPTION 'Invalid content';
+    END IF;
+
+    -- Rate limit: 5 signalements/min par reporter_tag (anti-spam de reports)
+    IF p_reporter_tag IS NOT NULL AND length(p_reporter_tag) BETWEEN 8 AND 64 THEN
+        IF NOT check_rate_limit(p_reporter_tag, 'report', 5) THEN
+            RAISE EXCEPTION 'Rate limit exceeded';
+        END IF;
+    END IF;
+
+    RETURN QUERY
+    INSERT INTO public.reports (category, content, context, reporter_tag)
+    VALUES (p_category, p_content, p_context, left(p_reporter_tag, 64))
+    RETURNING reports.id;
+END;
+$$;
+
+COMMENT ON FUNCTION public.submit_report(TEXT, TEXT, TEXT, TEXT)
+    IS 'Guideline 1.2 : dépôt d''un signalement volontaire par le destinataire. Rate-limité par reporter_tag.';
+
+
 -- ============================================================================
 -- 8. STORAGE — BUCKETS
 -- ============================================================================
@@ -648,6 +814,8 @@ ALTER TABLE public.call_signals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.rate_limits  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.blob_cleanup_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.app_notice   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reports      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.invite_ttl_exempt ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY messages_deny_direct
     ON public.messages
@@ -675,6 +843,19 @@ CREATE POLICY app_notice_deny_direct
     TO anon, authenticated
     USING (false) WITH CHECK (false);
 
+-- reports: aucun accès direct, écriture uniquement via submit_report,
+-- lecture uniquement par le modérateur (service_role / dashboard).
+CREATE POLICY reports_deny_direct
+    ON public.reports
+    TO anon, authenticated
+    USING (false) WITH CHECK (false);
+
+-- invite_ttl_exempt: aucun accès client, gestion manuelle via le dashboard.
+CREATE POLICY invite_ttl_exempt_deny_direct
+    ON public.invite_ttl_exempt
+    TO anon, authenticated
+    USING (false) WITH CHECK (false);
+
 
 -- ============================================================================
 -- 11. PERMISSIONS — LEAST PRIVILEGE
@@ -688,12 +869,16 @@ REVOKE ALL ON public.call_signals      FROM anon, authenticated;
 REVOKE ALL ON public.rate_limits       FROM anon, authenticated;
 REVOKE ALL ON public.blob_cleanup_log  FROM anon, authenticated;
 REVOKE ALL ON public.app_notice        FROM anon, authenticated;
+REVOKE ALL ON public.reports           FROM anon, authenticated;
+REVOKE ALL ON public.invite_ttl_exempt FROM anon, authenticated;
 
 GRANT ALL ON public.messages          TO service_role;
 GRANT ALL ON public.call_signals      TO service_role;
 GRANT ALL ON public.rate_limits       TO service_role;
 GRANT ALL ON public.blob_cleanup_log  TO service_role;
 GRANT ALL ON public.app_notice        TO service_role;
+GRANT ALL ON public.reports           TO service_role;
+GRANT ALL ON public.invite_ttl_exempt TO service_role;
 
 -- Séquence
 GRANT USAGE, SELECT ON SEQUENCE public.blob_cleanup_log_id_seq TO service_role;
@@ -704,15 +889,23 @@ GRANT EXECUTE ON FUNCTION public.get_messages_by_tags(TEXT[], TIMESTAMPTZ, INTEG
 GRANT EXECUTE ON FUNCTION public.send_call_signal(TEXT, TEXT)                           TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_call_signals_by_tags(TEXT[], TIMESTAMPTZ, INTEGER) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_app_notice()                                       TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.submit_report(TEXT, TEXT, TEXT, TEXT)                  TO anon, authenticated;
 
 -- RPCs internes: service_role uniquement
 -- check_rate_limit est appelé depuis les SECURITY DEFINER RPCs (qui tournent
 -- en tant que postgres owner) donc n'a pas besoin d'être accessible par anon.
 REVOKE EXECUTE ON FUNCTION public.check_rate_limit(TEXT, TEXT, INTEGER) FROM anon, authenticated;
-REVOKE EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER)   FROM anon, authenticated;
+-- PUBLIC d'abord : CREATE FUNCTION accorde EXECUTE à PUBLIC par défaut, et un
+-- REVOKE ciblé sur anon/authenticated ne le retire pas. Sans ça, un porteur de
+-- la clé anon pourrait appeler cleanup_old_data(0, 0, 0) → purge totale.
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER) FROM anon, authenticated;
+REVOKE EXECUTE ON FUNCTION public.is_handshake_payload(TEXT)                  FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.is_handshake_payload(TEXT)                  FROM anon, authenticated;
 REVOKE EXECUTE ON FUNCTION public.cleanup_expired_blobs()              FROM anon, authenticated;
 GRANT  EXECUTE ON FUNCTION public.check_rate_limit(TEXT, TEXT, INTEGER) TO service_role;
-GRANT  EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER)   TO service_role;
+GRANT  EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER) TO service_role;
+GRANT  EXECUTE ON FUNCTION public.is_handshake_payload(TEXT)                  TO service_role;
 GRANT  EXECUTE ON FUNCTION public.cleanup_expired_blobs()              TO service_role;
 
 -- Verrouiller les DEFAULT PRIVILEGES Supabase

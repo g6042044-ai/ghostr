@@ -137,67 +137,18 @@ export function appearanceBootPromise(): Promise<AppearancePreference> {
 // ════════════════════════════════════════════════════════════════════════════
 // RESTART HELPERS
 // ════════════════════════════════════════════════════════════════════════════
+// REDÉMARRAGE DU BUNDLE — SUPPRIMÉ
+// ════════════════════════════════════════════════════════════════════════════
+// `canRestartApp()` et `restartApp()` (basés sur `expo-updates.reloadAsync`)
+// vivaient ici pour que ThemeScreen puisse relancer le bundle JS après un
+// changement d'apparence.
 //
-// Why these live here and not in a generic service: theme switching is
-// currently the only consumer of an explicit "reload the JS bundle"
-// operation. If you later add other consumers (locale changes, etc.) it
-// might be worth promoting these to e.g. `services/restart.ts`.
+// Ce détour n'a plus d'objet : la palette est intégralement réactive
+// (`theme.colors` supprimé, toutes les feuilles de styles converties en
+// fabriques consommées par `useThemedStyles`). Un changement de thème est
+// appliqué instantanément sur tous les écrans, donc plus aucun appelant.
 //
-// `expo-updates` is the standard way to programmatically restart a React
-// Native bundle in Expo apps. It's lazy-loaded here because:
-//  1. Not all apps install it, and we want this module to import cleanly
-//     in dev/test environments where the native module is missing.
-//  2. The native module isn't loaded until first call — saves a few ms at
-//     boot.
-//
-// If `expo-updates` is not installed/available, `canRestartApp()` returns
-// `false` and the UI falls back to showing the "restart manually" banner.
-
-let _restartChecked = false;
-let _restartFn: (() => Promise<void>) | null = null;
-
-function ensureRestartModule(): void {
-  if (_restartChecked) return;
-  _restartChecked = true;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const Updates = require('expo-updates');
-    // The module exposes `reloadAsync` as the standard restart API.
-    if (Updates && typeof Updates.reloadAsync === 'function') {
-      _restartFn = () => Updates.reloadAsync();
-    }
-  } catch {
-    // Module not installed or native side missing. _restartFn stays null.
-  }
-}
-
-/**
- * True if the app can programmatically restart its JS bundle.
- * False if `expo-updates` isn't installed or the native module isn't
- * linked (e.g., in some dev configurations).
- *
- * UI callers should use this to decide whether to offer an auto-restart
- * flow vs. fall back to the "please restart manually" banner.
- */
-export function canRestartApp(): boolean {
-  ensureRestartModule();
-  return _restartFn !== null;
-}
-
-/**
- * Restart the JS bundle. Resolves only if the restart fails — on success
- * the JS context tears down before this promise can resolve.
- *
- * Callers should `await` this and handle errors by falling back to the
- * banner. Don't render UI between calling this and the bundle reloading;
- * the user briefly sees the native splash.
- */
-export async function restartApp(): Promise<void> {
-  ensureRestartModule();
-  if (!_restartFn) {
-    throw new Error(
-      'expo-updates is not available. Install it with `npx expo install expo-updates` to enable auto-restart.',
-    );
-  }
-  await _restartFn();
-}
+// Redémarrer le bundle sur une messagerie chiffrée n'était de toute façon pas
+// anodin : cela détruit l'état en mémoire, coupe les abonnements au relais et
+// impose de ressaisir le mot de passe si le verrouillage est actif — un prix
+// disproportionné pour passer du sombre au clair.

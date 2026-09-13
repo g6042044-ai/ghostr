@@ -10,8 +10,10 @@
 //   - `useAppearancePreference()`→ écran Settings → ThemeScreen pour lire le
 //                                  choix utilisateur courant et le modifier
 //
-// Pour les ~30 fichiers qui consomment encore `theme.colors.X` au top-level
-// d'un `StyleSheet.create`, voir THEME_MIGRATION.md.
+// Il n'existe PLUS de consommateur legacy : `theme.colors` a été supprimé du
+// module theme.ts, donc `useTheme()` / `useThemedStyles()` sont les seules
+// portes d'entrée vers les couleurs. Tout changement d'apparence est
+// instantané sur l'ensemble de l'application.
 //
 // ════════════════════════════════════════════════════════════════════════════
 // COMPORTEMENT
@@ -24,20 +26,11 @@
 //        - 'system' → `Appearance.getColorScheme()` (ou 'dark' fallback)
 //        - 'light'  → 'light'
 //        - 'dark'   → 'dark'
-//   3. On verrouille `_lockBootScheme()` pour empêcher toute mutation
-//      ultérieure de `theme.colors` côté legacy (cohérence garantie entre
-//      styles frozen et styles live).
-//
+
 // Au changement de préf :
 //   - `setAppearance(pref)` met à jour l'état React → re-render de tout
 //     consommateur `useTheme()`.
 //   - Persiste via `storeAppearance(pref)`.
-//   - Si le nouveau `effectiveScheme` DIFFÈRE du `bootScheme` initialement
-//     appliqué à `theme.colors`, on expose `requiresReload = true` pour que
-//     l'UI puisse afficher un message « relancez l'app pour appliquer
-//     partout ». Les composants qui consomment `useTheme()` voient le bon
-//     thème immédiatement ; ceux qui consomment encore le legacy export ne
-//     bougeront qu'au prochain cold start.
 //
 // Au changement de préférence système (Appearance.addChangeListener) :
 //   - Si la préf user est `'system'`, on met à jour `effectiveScheme`
@@ -57,7 +50,6 @@ import { Appearance, StyleSheet } from 'react-native';
 import {
   getColorsForScheme,
   getBootScheme,
-  _lockBootScheme,
   type ColorPalette,
   type ColorScheme,
 } from './theme';
@@ -83,22 +75,12 @@ export interface ThemeContextValue {
   preference: AppearancePreference;
   /** Met à jour la préférence + persiste. */
   setAppearance: (pref: AppearancePreference) => Promise<void>;
-  /**
-   * Vrai si `scheme` diffère du scheme qui a été appliqué au boot. Quand
-   * c'est le cas, les styles legacy (au top-level d'un StyleSheet.create)
-   * sont encore figés sur l'ancien thème — un reload du JS bundle est
-   * nécessaire pour qu'ils s'alignent. Les ThemeScreen / SettingsScreen
-   * utilisent ce flag pour afficher un message d'attente.
-   */
-  requiresReload: boolean;
-  /**
-   * The scheme captured at module load — the palette that legacy
-   * module-level `StyleSheet.create({ color: theme.colors.X })` calls
-   * actually used. Exposed so the UI can decide, BEFORE applying a
-   * choice, whether that choice would require a restart.
-   */
-  getBootScheme: () => ColorScheme;
 }
+// `requiresReload` et `getBootScheme` ont été RETIRÉS du contexte. Ils
+// servaient à prévenir l'utilisateur qu'une partie de l'app resterait figée
+// sur l'ancienne palette jusqu'au prochain démarrage. Plus aucun style n'est
+// figé, donc le drapeau serait toujours faux et le flux de redémarrage qu'il
+// pilotait a été supprimé de ThemeScreen.
 
 // ────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -143,15 +125,6 @@ export function ThemeProvider({ children, initialPreference }: ThemeProviderProp
   });
 
   const [scheme, setScheme] = useState<ColorScheme>(() => resolveScheme(preference));
-
-  // First mount: notify the theme module that the UI has started rendering.
-  // Currently a no-op (kept for API stability) — see the docstring of
-  // `_lockBootScheme` in theme.ts for the historical context.
-  const lockedRef = useRef(false);
-  if (!lockedRef.current) {
-    _lockBootScheme();
-    lockedRef.current = true;
-  }
 
   // Tracks whether `setAppearance` has been called on this mount. Used by
   // the async re-check below to avoid overriding a freshly user-set value
@@ -211,8 +184,6 @@ export function ThemeProvider({ children, initialPreference }: ThemeProviderProp
 
   const colors = useMemo(() => getColorsForScheme(scheme), [scheme]);
 
-  const requiresReload = useMemo(() => scheme !== getBootScheme(), [scheme]);
-
   const value = useMemo<ThemeContextValue>(
     () => ({
       colors,
@@ -220,10 +191,8 @@ export function ThemeProvider({ children, initialPreference }: ThemeProviderProp
       isDark: scheme === 'dark',
       preference,
       setAppearance,
-      requiresReload,
-      getBootScheme,
     }),
-    [colors, scheme, preference, setAppearance, requiresReload],
+    [colors, scheme, preference, setAppearance],
   );
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
@@ -257,8 +226,6 @@ export function useTheme(): ThemeContextValue {
     isDark: bootScheme === 'dark',
     preference: 'system',
     setAppearance: async () => {},
-    requiresReload: false,
-    getBootScheme,
   };
 }
 

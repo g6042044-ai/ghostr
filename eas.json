@@ -22,7 +22,9 @@
         "EXPO_PUBLIC_GATEWAY_URL": "https://ghostr-gateway-831985391959.europe-north1.run.app",
         "EXPO_PUBLIC_ENTRY_RELAY_URL": "https://whisper-entry-relay.ghostcrypt.workers.dev",
         "EXPO_PUBLIC_GATEWAY_PINNING_ENFORCED": "true",
-        "EXPO_PUBLIC_PUSH_PROXY_PUBLIC_KEY": "isGSymp45aITxRCN0btPTRTfLH1yiJHGpqVu/UPec0I="
+        "EXPO_PUBLIC_PUSH_PROXY_PUBLIC_KEY": "isGSymp45aITxRCN0btPTRTfLH1yiJHGpqVu/UPec0I=",
+        "EXPO_PUBLIC_BUILD_PROFILE": "development",
+        "EXPO_PUBLIC_ALLOW_SCREEN_CAPTURE": "1"
       }
     },
     "preview": {
@@ -41,7 +43,9 @@
         "EXPO_PUBLIC_GATEWAY_URL": "https://ghostr-gateway-831985391959.europe-north1.run.app",
         "EXPO_PUBLIC_ENTRY_RELAY_URL": "https://whisper-entry-relay.ghostcrypt.workers.dev",
         "EXPO_PUBLIC_GATEWAY_PINNING_ENFORCED": "true",
-        "EXPO_PUBLIC_PUSH_PROXY_PUBLIC_KEY": "isGSymp45aITxRCN0btPTRTfLH1yiJHGpqVu/UPec0I="
+        "EXPO_PUBLIC_PUSH_PROXY_PUBLIC_KEY": "isGSymp45aITxRCN0btPTRTfLH1yiJHGpqVu/UPec0I=",
+        "EXPO_PUBLIC_BUILD_PROFILE": "preview",
+        "EXPO_PUBLIC_ALLOW_SCREEN_CAPTURE": "1"
       }
     },
     "preview-simulator": {
@@ -66,7 +70,8 @@
         "EXPO_PUBLIC_GATEWAY_URL": "https://ghostr-gateway-831985391959.europe-north1.run.app",
         "EXPO_PUBLIC_ENTRY_RELAY_URL": "https://whisper-entry-relay.ghostcrypt.workers.dev",
         "EXPO_PUBLIC_GATEWAY_PINNING_ENFORCED": "true",
-        "EXPO_PUBLIC_PUSH_PROXY_PUBLIC_KEY": "isGSymp45aITxRCN0btPTRTfLH1yiJHGpqVu/UPec0I="
+        "EXPO_PUBLIC_PUSH_PROXY_PUBLIC_KEY": "isGSymp45aITxRCN0btPTRTfLH1yiJHGpqVu/UPec0I=",
+        "EXPO_PUBLIC_BUILD_PROFILE": "production"
       }
     }
   },

@@ -3,7 +3,7 @@
 // v5.0 - Design compact et moderne pour le profil
 
 import { useState, useEffect } from 'react';
-import { View, Text, ScrollView, TouchableOpacity, Image, Platform, Switch } from 'react-native';
+import { View, Text, ScrollView, TouchableOpacity, Image, Platform, Switch, Modal } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
@@ -16,6 +16,7 @@ import { Avatar } from '../components/Avatar';
 import { Ionicons } from '@expo/vector-icons';
 import { isPushEnabled, setPushEnabled } from '../services/pushNotificationService';
 import { SplashScreen } from './SplashScreen';
+import { TermsScreen } from './TermsScreen';
 import { getLanguageInfo } from '../i18n';
 // PERF — Lecture du profil depuis la RAM de sessionService au lieu d'AsyncStorage.
 // La donnée est garantie chargée car App.tsx await sessionService.initialize()
@@ -52,6 +53,7 @@ export function SettingsScreen({ onSecurityChange, onRequestRestore }: Props) {
   
   const [lockEnabled, setLockEnabled] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [showTerms, setShowTerms] = useState(false);
   const [showRestoreConfirm, setShowRestoreConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [relayEnabled, setRelayEnabled] = useState(false);
@@ -267,8 +269,8 @@ export function SettingsScreen({ onSecurityChange, onRequestRestore }: Props) {
             <Switch
               value={pushNotifEnabled}
               onValueChange={handleTogglePush}
-              trackColor={{ false: '#333', true: colors.primary + '60' }}
-              thumbColor={pushNotifEnabled ? colors.primary : '#888'}
+              trackColor={{ false: colors.surfaceElevated, true: colors.primary + '60' }}
+              thumbColor={pushNotifEnabled ? colors.primary : colors.textMuted}
             />
           </View>
         </View>
@@ -471,8 +473,22 @@ export function SettingsScreen({ onSecurityChange, onRequestRestore }: Props) {
           <Text style={styles.aboutCopyright}>
             Triple Ratchet · X25519 · ML-KEM-768
           </Text>
+          {/* Guideline 1.2 : CGU consultables à tout moment */}
+          <TouchableOpacity
+            style={styles.termsLink}
+            onPress={() => setShowTerms(true)}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.termsLinkText}>{t('settings.termsOfUse')}</Text>
+            <Ionicons name="chevron-forward" size={14} color={colors.textMuted} />
+          </TouchableOpacity>
         </View>
       </ScrollView>
+
+      {/* CGU en lecture seule */}
+      <Modal visible={showTerms} animationType="slide" onRequestClose={() => setShowTerms(false)}>
+        <TermsScreen readOnly onClose={() => setShowTerms(false)} />
+      </Modal>
 
       {/* Modal de confirmation effacement */}
       <AlertModal
@@ -854,7 +870,20 @@ const makeStyles = (colors: ColorPalette) => ({
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     letterSpacing: 0.3,
   },
-  
+  termsLink: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    marginTop: 12,
+    paddingVertical: 8,
+  },
+  termsLinkText: {
+    fontSize: 13,
+    color: colors.textSecondary,
+    fontWeight: '500',
+  },
+
 }) as const;
 
 export default SettingsScreen;

@@ -1,0 +1,8 @@
+{
+  "android": {
+    "package": "com.lordbrutus.ghostrohttpgateway"
+  },
+  "ios": {
+    "bundleIdentifier": "com.lordbrutus.ghostrohttpgateway"
+  }
+}

@@ -20,6 +20,8 @@
 //   En les gardant dans le fragment, le tag d'invitation ne quitte
 //   jamais le device de l'utilisateur côté HTTP.
 
+import { decodeGroupInvite } from './groupInviteCodec';
+
 const INVITE_DOMAIN = 'theghostr.com';
 const INVITE_PATH = '/i';
 const INVITE_SCHEME = 'ghostr';
@@ -141,4 +143,29 @@ export function isInviteUrl(input: string | null | undefined): boolean {
     lower.startsWith(`http://${INVITE_DOMAIN}${INVITE_PATH}`) ||
     lower.startsWith(`${INVITE_SCHEME}://invite`)
   );
+}
+
+/**
+ * v30.0 — Détecte si une chaîne d'invitation (déjà extraite par
+ * parseInviteString) correspond à une invitation de GROUPE.
+ *
+ * Les invitations de groupe sont un JSON base64 `{v:3, k:'group', g, ti, ts, ab, n}`.
+ * Les invitations 1:1 sont un JSON base64 `{v:2, t, n}` (pas de `k:'group'`).
+ *
+ * Retourne le groupId + le nom si c'est une invitation de groupe, sinon null.
+ * PURE et sans effet de bord (sûre depuis un scanner).
+ */
+export function parseGroupInvite(inviteString: string | null | undefined): { groupId: string; name: string } | null {
+  if (!inviteString) return null;
+
+  // Délègue au codec partagé : il reconnaît le format binaire compact v4 ET
+  // l'ancien format JSON v3, et ne lève jamais (il renvoie null sur toute
+  // entrée qui n'est pas une invitation de groupe — invitation 1:1, QR
+  // étranger, texte quelconque).
+  //
+  // IMPORTANT — cette fonction doit rester PURE et sans effet de bord : elle
+  // est appelée depuis le scanner QR, sur des données non fiables.
+  const decoded = decodeGroupInvite(inviteString);
+  if (!decoded) return null;
+  return { groupId: decoded.groupId, name: decoded.name };
 }

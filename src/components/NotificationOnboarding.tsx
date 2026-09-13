@@ -242,7 +242,7 @@ export const NotificationOnboarding: React.FC<Props> = ({ onComplete }) => {
               >
                 <Ionicons name="notifications" size={20} color={colors.textOnPrimary} />
                 <Text style={styles.primaryBtnText}>
-                  {loading ? t('common.loading') : t('notificationOnboarding.enableNotifications')}
+                  {loading ? t('common.loading') : t('notificationOnboarding.continue')}
                 </Text>
               </TouchableOpacity>
 

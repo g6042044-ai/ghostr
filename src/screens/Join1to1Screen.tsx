@@ -7,7 +7,7 @@
 // - Removed inline success UI (was inconsistent with ConnectionSuccessScreen)
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { View, Text, StyleSheet, TextInput, TouchableOpacity, ActivityIndicator, Platform, ScrollView, KeyboardAvoidingView, BackHandler, Alert } from 'react-native';
+import { View, Text, StyleSheet, TextInput, TouchableOpacity, ActivityIndicator, Platform, ScrollView, KeyboardAvoidingView, BackHandler, AppState } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
@@ -15,13 +15,16 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RouteProp } from '@react-navigation/native';
 import { CameraView, useCameraPermissions, BarcodeScanningResult } from 'expo-camera';
 import { Ionicons } from '@expo/vector-icons';
+import * as Clipboard from 'expo-clipboard';
 
 import { sessionService } from '../services/tripleRatchet';
-import { Header, Button, useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
+import { Header, Button, useTheme, useThemedStyles, type ColorPalette, showAlert, showConfirm } from '../components/ui';
+import { isBlockedFingerprint, unblockFingerprint } from '../services/blockService';
 import { SplashScreen } from './SplashScreen';
 import { suppressLock, releaseLock } from '../services/lockGuard';
 import { openAppSettings } from '../services/permissions';
-import { parseInviteString } from '../services/inviteUrl';
+import { parseInviteString, parseGroupInvite } from '../services/inviteUrl';
+import { GROUPS_ENABLED } from '../config/features';
 import { waitForSealedSenderReady } from '../services/api1to1';
 
 type RootStackParamList = {
@@ -29,6 +32,7 @@ type RootStackParamList = {
   Conversation: { conversationId: string; conversationName: string };
   ConnectionSuccess: { sessionId: string; contactName: string; inviteLabel: string; inviteTag?: string };
   Join1to1: { pendingInviteString?: string } | undefined;
+  JoinGroup: { inviteString: string };
 };
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Join1to1'>;
@@ -48,13 +52,32 @@ export function Join1to1Screen() {
   const { colors } = useTheme();
   const styles = useThemedStyles(makeStyles);
   const { t } = useTranslation();
-  const [permission, requestPermission] = useCameraPermissions();
-  
+  const [permission, requestPermission, getPermission] = useCameraPermissions();
+
+  // Nombre de dialogs système réellement tentés sur cet écran.
+  // C'est ce compteur — et non le `canAskAgain` renvoyé par le get initial —
+  // qui autorise l'écran à basculer sur "Ouvrir les paramètres". Sur Android,
+  // `canAskAgain` vaut false à tort dans plusieurs situations courantes
+  // (cache expo restauré par Auto Backup après réinstallation, permission
+  // réglée sur "Toujours demander", dialog simplement annulé avec le bouton
+  // retour) : s'y fier avant d'avoir essayé envoyait l'utilisateur dans les
+  // Réglages système sans lui avoir jamais montré le moindre dialog.
+  // Cf. le bloc "canAskAgain non fiable" dans services/permissions.ts, qui
+  // applique la même règle aux autres permissions.
+  const [permissionAttempts, setPermissionAttempts] = useState(0);
+
   const [step, setStep] = useState<Step>('choose');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState('');
   
+  // Torche du scanner. Rejoindre une conversation se fait très souvent en
+  // scannant l'écran de quelqu'un d'autre dans un contexte peu éclairé
+  // (bar, rue le soir, salle de réunion). Sans torche, l'autofocus rame et
+  // le QR n'est jamais détecté — l'utilisateur conclut que le scan est
+  // cassé alors qu'il manque juste de lumière.
+  const [torchOn, setTorchOn] = useState(false);
+
   // Manual input
   const [codeInput, setCodeInput] = useState('');
   
@@ -92,6 +115,33 @@ export function Join1to1Screen() {
   }, []);
 
   // ═══════════════════════════════════════════════════════════════════
+  // RETOUR DES RÉGLAGES SYSTÈME : relire l'état de la permission caméra
+  // ═══════════════════════════════════════════════════════════════════
+  // useCameraPermissions ne relit l'autorisation qu'au mount. Si l'utilisateur
+  // part dans les Réglages, active la caméra et revient, l'écran resterait
+  // figé sur le message de refus jusqu'à un remount complet — il conclurait
+  // que l'app est cassée alors qu'il vient justement de faire ce qu'on lui
+  // demandait. On relit donc l'état à chaque retour au premier plan, tant
+  // qu'on est sur l'étape scan et que la permission n'est pas accordée.
+  useEffect(() => {
+    if (step !== 'scan' || permission?.granted) return;
+
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState !== 'active') return;
+      getPermission()
+        .then((result) => {
+          // Permission accordée depuis les Réglages : on repart d'un état
+          // neuf, sinon le bouton "Ouvrir les paramètres" resterait affiché
+          // si l'utilisateur la retirait ensuite.
+          if (result.granted && mountedRef.current) setPermissionAttempts(0);
+        })
+        .catch(() => {});
+    });
+
+    return () => subscription.remove();
+  }, [step, permission?.granted, getPermission]);
+
+  // ═══════════════════════════════════════════════════════════════════
   // DEEP LINK : traitement automatique d'un inviteString reçu en param
   // ═══════════════════════════════════════════════════════════════════
   // Quand l'app est ouverte via Universal Link / App Link / scheme natif,
@@ -103,6 +153,29 @@ export function Join1to1Screen() {
     if (!pending) return;
     if (deepLinkProcessedRef.current === pending) return; // déjà traité
     deepLinkProcessedRef.current = pending;
+
+    // Une invitation de GROUPE emprunte le MÊME lien `/i#…` qu'une invitation
+    // 1:1 (cf. inviteUrl.buildInviteUrl) : ce chemin doit donc faire le même
+    // tri que le scanner et la saisie manuelle. Sans lui, un lien de groupe
+    // partait dans processInvite, qui attend le bootstrap SealedSender
+    // (jusqu'à 60 s) avant d'échouer sur un payload qui n'est pas une
+    // invitation 1:1.
+    //
+    // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. On refuse via
+    // showAlert et non setError : le useEffect de reset d'étape, déclaré
+    // juste après celui-ci, exécute `setError(null)` au même mount et
+    // effacerait la bannière avant qu'elle ne soit lue.
+    const pendingGroupInvite = parseGroupInvite(pending);
+    if (pendingGroupInvite) {
+      if (!GROUPS_ENABLED) {
+        console.log('[Join1to1] Deep-link group invite ignored — groups disabled');
+        void showAlert({ title: t('join.title'), message: t('errors.qrCodeError') });
+        return;
+      }
+      navigation.replace('JoinGroup', { inviteString: pending });
+      return;
+    }
+
     // processInvite est défini ci-dessous ; on l'appelle dans un microtask
     // pour s'assurer que les autres useEffect du mount ont eu lieu.
     Promise.resolve().then(() => processInvite(pending));
@@ -137,6 +210,41 @@ export function Join1to1Screen() {
   
   const safeSetStatus = (msg: string) => {
     if (mountedRef.current) setStatusMessage(msg);
+  };
+
+  /**
+   * Garde anti-reconnexion d'un contact bloqué (guideline 1.2).
+   *
+   * L'empreinte d'identité n'est connue qu'APRÈS le handshake — on vérifie
+   * donc une fois la session créée. Si le contact est bloqué :
+   *   - déblocage explicite → la connexion continue normalement ;
+   *   - refus → la session fraîchement créée est supprimée, retour au choix.
+   *
+   * @returns true si la connexion peut continuer.
+   */
+  const ensureNotBlocked = async (session: {
+    id: string;
+    theirIdentityKeyFingerprint?: string;
+    theirProfile?: { displayName?: string };
+  }): Promise<boolean> => {
+    const fp = session?.theirIdentityKeyFingerprint;
+    if (!(await isBlockedFingerprint(fp))) return true;
+
+    const name = session?.theirProfile?.displayName || t('common.contact');
+    const unblock = await showConfirm({
+      title: t('join.blockedContactTitle'),
+      message: t('join.blockedContactMessage', { name }),
+      confirmText: t('join.unblockAndAccept'),
+      cancelText: t('common.cancel'),
+      destructive: true,
+    });
+    if (unblock && fp) {
+      await unblockFingerprint(fp);
+      return true;
+    }
+    try { await sessionService.deleteSession(session.id); } catch {}
+    if (mountedRef.current) setStep('choose');
+    return false;
   };
   
   const processInvite = async (inviteString: string) => {
@@ -190,7 +298,11 @@ export function Join1to1Screen() {
       safeSetStatus(t('join.establishingSecure'));
       const result = await sessionService.acceptInviteAndRespond(inviteString);
       if (!mountedRef.current || signal.aborted) return;
-      
+
+      // Guideline 1.2 : refuser la reconnexion d'un contact bloqué
+      if (!(await ensureNotBlocked(result.session))) return;
+      if (!mountedRef.current || signal.aborted) return;
+
       // Envoyer notre push token au nouveau pair via E2E (best-effort)
       try {
         const { sendPushTokenToPeer } = require('../services/api1to1');
@@ -221,11 +333,10 @@ export function Join1to1Screen() {
       // The check happens before any OTPK is consumed, so this is a
       // pure no-op on the cryptographic side.
       if (e.isSelfInvite) {
-        Alert.alert(
-          t('join.selfInviteTitle'),
-          t('join.selfInviteMessage'),
-          [{ text: t('common.ok'), style: 'default' }],
-        );
+        showAlert({
+          title: t('join.selfInviteTitle'),
+          message: t('join.selfInviteMessage'),
+        });
         setStep('choose');
         return;
       }
@@ -308,7 +419,11 @@ export function Join1to1Screen() {
       
       const result = await sessionService.acceptInviteAndReplace(inviteString, existingSessionId);
       if (!mountedRef.current || signal.aborted) return;
-      
+
+      // Guideline 1.2 : refuser la reconnexion d'un contact bloqué
+      if (!(await ensureNotBlocked(result.session))) return;
+      if (!mountedRef.current || signal.aborted) return;
+
       const contactName = result.session.theirProfile.displayName || t('common.contact');
       
       if (mountedRef.current) {
@@ -371,13 +486,72 @@ export function Join1to1Screen() {
     console.log('[Join1to1] QR scanned, parsed length:', parsed.length);
     
     scannedRef.current = true;
+
+    // v30.0 — Si c'est une invitation de GROUPE, rediriger vers l'écran dédié.
+    //
+    // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. L'écran `JoinGroup`
+    // n'est plus enregistré dans le Stack : rediriger dessus ne ferait rien du
+    // tout (react-navigation ignore une route inconnue) et le scanner
+    // resterait figé, `scannedRef` déjà armé — l'utilisateur croirait à un
+    // plantage. On refuse donc explicitement, avec le message d'erreur générique
+    // de code illisible, et on RÉARME le scanner pour qu'un autre QR (1:1)
+    // puisse être scanné dans la foulée.
+    //
+    // Ne PAS laisser filer vers `processInvite` : il attendrait le bootstrap
+    // SealedSender (jusqu'à 60 s) avant d'échouer sur un blob qui n'est pas
+    // une invitation 1:1.
+    const groupInvite = parseGroupInvite(parsed);
+    if (groupInvite) {
+      if (!GROUPS_ENABLED) {
+        console.log('[Join1to1] Group invite ignored — groups disabled');
+        // Dialogue, PAS `setError` : la vue caméra ne rend aucune bannière
+        // d'erreur (le bandeau n'existe que sur les étapes « choose » et
+        // « manual »), et basculer sur « choose » pour la montrer ne
+        // marcherait pas non plus — le useEffect de reset d'étape fait
+        // justement `setError(null)`. `showAlert` s'affiche par-dessus la
+        // caméra, quel que soit l'état de l'écran.
+        showAlert({ title: t('join.scanTitle'), message: t('errors.qrCodeError') });
+        // Réarmer : sans ça le scanner reste sourd à tout QR suivant, y
+        // compris une invitation 1:1 parfaitement valide.
+        scannedRef.current = false;
+        return;
+      }
+      console.log('[Join1to1] Group invite detected → JoinGroup');
+      navigation.replace('JoinGroup', { inviteString: parsed });
+      return;
+    }
+
     await processInvite(parsed);
-  }, []);
+  }, [navigation, t]);
+
+  // ==========================================
+  // PASTE FROM CLIPBOARD
+  // ==========================================
+
+  const handlePaste = useCallback(async () => {
+    try {
+      const clip = (await Clipboard.getStringAsync())?.trim();
+      if (!clip) {
+        // Presse-papiers vide : on le DIT au lieu de ne rien faire. Un
+        // bouton qui ne réagit pas est lu comme un bug.
+        setError(t('join.clipboardEmpty'));
+        return;
+      }
+      setCodeInput(clip);
+      // On efface l'erreur précédente : le contenu du champ a changé, le
+      // message d'erreur qui l'accompagnait ne le décrit plus.
+      setError(null);
+    } catch {
+      // `getStringAsync` peut échouer si l'OS refuse l'accès au
+      // presse-papiers (Android 13+ avec certaines politiques d'entreprise).
+      setError(t('join.clipboardError'));
+    }
+  }, [t]);
 
   // ==========================================
   // MANUAL SUBMIT
   // ==========================================
-  
+
   const handleManualSubmit = async () => {
     // Accepte une URL collée (https://ghostr.app/i#…) ou un code brut.
     const parsed = parseInviteString(codeInput);
@@ -393,7 +567,27 @@ export function Join1to1Screen() {
     }
     
     console.log('[Join1to1] Manual input, parsed length:', parsed.length);
-    
+
+    // Si c'est une invitation de GROUPE collée (lien/texte), rediriger vers
+    // l'écran dédié — symétrique du scanner. Indispensable car les invitations
+    // de groupe post-quantiques se partagent par lien (trop volumineuses pour
+    // un QR).
+    //
+    // [GROUPES DÉSACTIVÉS] — cf. src/config/features.ts. Même refus explicite
+    // que côté scanner : le champ de saisie reste sur place et affiche
+    // l'erreur, au lieu d'une navigation qui n'aboutit nulle part.
+    const groupInvite = parseGroupInvite(parsed);
+    if (groupInvite) {
+      if (!GROUPS_ENABLED) {
+        console.log('[Join1to1] Manual group invite ignored — groups disabled');
+        setError(t('errors.qrCodeError'));
+        return;
+      }
+      console.log('[Join1to1] Manual group invite detected → JoinGroup');
+      navigation.replace('JoinGroup', { inviteString: parsed });
+      return;
+    }
+
     await processInvite(parsed);
   };
 
@@ -476,12 +670,28 @@ export function Join1to1Screen() {
     }
 
     if (!permission.granted) {
-      // PERM FIX : différencier "jamais demandé / refusé une fois" (canAskAgain=true)
-      // de "refusé définitivement" (canAskAgain=false). Dans le 2e cas, le
-      // dialog OS ne se rouvrira pas → on doit pointer l'utilisateur vers
-      // les Paramètres système plutôt que de continuer à insister sur un
-      // bouton "Autoriser" qui ne fera rien.
-      const isBlocked = !permission.canAskAgain;
+      // PERM FIX : différencier "jamais demandé / refusé une fois" (le dialog
+      // OS peut encore s'ouvrir) de "refusé définitivement" (il ne s'ouvrira
+      // plus → seuls les Paramètres système débloquent la situation).
+      //
+      // On ne conclut au refus définitif qu'APRÈS avoir réellement tenté le
+      // dialog : `canAskAgain` seul est un faux négatif fréquent sur Android
+      // (cf. commentaire sur permissionPrompted plus haut). Tant qu'aucune
+      // tentative n'a eu lieu, on propose le bouton qui déclenche le dialog —
+      // s'il s'avère que l'OS refuse de l'afficher, le tap suivant basculera
+      // sur "Ouvrir les paramètres".
+      // Combien de tentatives avant d'accepter le verdict "bloqué" ?
+      //   - iOS : 1. Le refus y est définitif dès le premier "Ne pas autoriser"
+      //     et `canAskAgain` est alors fiable — insister n'afficherait rien.
+      //   - Android : 2. Un dialog annulé (bouton retour, tap à côté) ne laisse
+      //     AUCUNE trace côté OS mais fait quand même passer `canAskAgain` à
+      //     false. Avec une seule tentative, une annulation involontaire
+      //     condamnerait l'utilisateur aux Réglages système alors qu'un
+      //     nouveau dialog s'afficherait parfaitement. Deux tentatives lèvent
+      //     l'ambiguïté : après un vrai premier refus, l'OS repasse
+      //     `canAskAgain` à true et ce bloc n'est de toute façon pas atteint.
+      const attemptsBeforeSettings = Platform.OS === 'android' ? 2 : 1;
+      const isBlocked = permissionAttempts >= attemptsBeforeSettings && !permission.canAskAgain;
 
       return (
         <View style={[styles.container, { paddingBottom: insets.bottom }]}>
@@ -512,7 +722,7 @@ export function Join1to1Screen() {
                 // Refus simple ou première demande : re-prompt l'OS.
                 // suppressLock pendant le dialog (cf. commentaire ci-dessous).
                 <Button
-                  title={t('join.authorize')}
+                  title={t('join.continue')}
                   onPress={async () => {
                     // CRITIQUE : suppressLock() pendant le dialog système de
                     // permission caméra. Sur Android, ce dialog fait passer
@@ -523,7 +733,17 @@ export function Join1to1Screen() {
                     // 'active' post-permission sur ROMs lentes.
                     suppressLock();
                     try {
-                      await requestPermission();
+                      const result = await requestPermission();
+                      // Tentative comptabilisée : une fois le quota atteint et
+                      // l'OS confirmant qu'il ne redemandera plus, le prochain
+                      // rendu proposera les Réglages système.
+                      if (!result.granted && mountedRef.current) {
+                        setPermissionAttempts((n) => n + 1);
+                      }
+                    } catch {
+                      // Échec du module natif : on laisse l'écran en l'état
+                      // plutôt que de basculer à tort sur "Ouvrir les
+                      // paramètres" — l'utilisateur peut retaper le bouton.
                     } finally {
                       setTimeout(() => releaseLock(), 1500);
                     }
@@ -544,16 +764,34 @@ export function Join1to1Screen() {
         <CameraView
           style={styles.camera}
           facing="back"
+          enableTorch={torchOn}
           barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
           onBarcodeScanned={handleQRScanned}
         >
           <View style={[styles.scannerOverlay, { paddingTop: insets.top }]}>
             <View style={styles.scannerHeader}>
-              <TouchableOpacity style={styles.scannerBackButton} onPress={() => setStep('choose')}>
-                <Text style={styles.scannerBackIcon}>‹</Text>
+              <TouchableOpacity
+                style={styles.scannerBackButton}
+                onPress={() => setStep('choose')}
+                accessibilityRole="button"
+                accessibilityLabel={t('common.back')}
+              >
+                <Ionicons name="chevron-back" size={26} color="#FFFFFF" />
               </TouchableOpacity>
               <Text style={styles.scannerTitle}>{t('join.scanQRTitle')}</Text>
-              <View style={styles.scannerPlaceholder} />
+              <TouchableOpacity
+                style={styles.scannerBackButton}
+                onPress={() => setTorchOn((v) => !v)}
+                accessibilityRole="button"
+                accessibilityState={{ selected: torchOn }}
+                accessibilityLabel={torchOn ? t('join.torchOff') : t('join.torchOn')}
+              >
+                <Ionicons
+                  name={torchOn ? 'flashlight' : 'flashlight-outline'}
+                  size={24}
+                  color={torchOn ? '#FFD54F' : '#FFFFFF'}
+                />
+              </TouchableOpacity>
             </View>
             
             <View style={styles.scanFrameContainer}>
@@ -608,7 +846,29 @@ export function Join1to1Screen() {
               multiline
               autoCapitalize="none"
               autoCorrect={false}
+              accessibilityLabel={t('join.codeLabel')}
             />
+            {/*
+              Bouton Coller explicite. Un code d'invitation fait plusieurs
+              centaines de caractères : personne ne le tape. Le chemin par
+              défaut (appui long → attendre le menu système → « Coller »)
+              est fiable sur iOS mais capricieux sur Android dans un
+              TextInput multiline, et invisible pour beaucoup
+              d'utilisateurs. Un bouton dédié rend l'action évidente et
+              atteignable en un tap.
+            */}
+            <View style={styles.pasteRow}>
+              <TouchableOpacity
+                style={styles.pasteButton}
+                onPress={handlePaste}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityLabel={t('join.pasteFromClipboard')}
+              >
+                <Ionicons name="clipboard-outline" size={18} color={colors.primary} />
+                <Text style={styles.pasteButtonText}>{t('join.pasteFromClipboard')}</Text>
+              </TouchableOpacity>
+            </View>
             <Text style={styles.hint}>
               {t('join.codeHint')}
             </Text>
@@ -708,14 +968,15 @@ const makeStyles = (colors: ColorPalette) => ({
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     paddingHorizontal: 16, paddingVertical: 12, backgroundColor: 'rgba(0,0,0,0.5)',
   },
+  // 44×44 = cible tactile minimale recommandée par iOS et Android. Les
+  // boutons du scanner faisaient 40×40 et se manipulent à une main, souvent
+  // en tendant le bras vers l'écran d'en face.
   scannerBackButton: {
-    width: 40, height: 40, borderRadius: 20,
+    width: 44, height: 44, borderRadius: 22,
     backgroundColor: 'rgba(255,255,255,0.2)',
     alignItems: 'center', justifyContent: 'center',
   },
-  scannerBackIcon: { fontSize: 28, color: '#FFF', marginTop: -2 },
   scannerTitle: { fontSize: 17, fontWeight: '600', color: '#FFF' },
-  scannerPlaceholder: { width: 40 },
   scanFrameContainer: { alignItems: 'center', justifyContent: 'center' },
   scanFrame: { width: 250, height: 250 },
   corner: { position: 'absolute', width: 40, height: 40, borderColor: colors.primary },
@@ -739,8 +1000,29 @@ const makeStyles = (colors: ColorPalette) => ({
     minHeight: 140, textAlignVertical: 'top',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
+  // Bouton Coller — aligné à droite sous le champ, en retrait visuel pour
+  // ne pas concurrencer le CTA « Se connecter ». 44 px de haut (12 + 20 + 12).
+  pasteRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: 8,
+  },
+  pasteButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    backgroundColor: colors.primary + '15',
+  },
+  pasteButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.primary,
+  },
   hint: { fontSize: 12, color: colors.textMuted, marginTop: 8, marginLeft: 4 },
-  
+
   // Error
   errorBanner: {
     backgroundColor: colors.danger + '15',

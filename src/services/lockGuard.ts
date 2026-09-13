@@ -39,7 +39,10 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { Platform } from 'react-native';
-import * as ScreenCapture from 'expo-screen-capture';
+import {
+  disarmScreenCaptureProtection,
+  rearmScreenCaptureProtection,
+} from './screenCaptureGuard';
 
 let suppressCount = 0;
 let safetyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -55,16 +58,18 @@ const SAFETY_TIMEOUT_MS = 30_000;
 // (app externe déjà ouverte, utilisateur pas encore de retour dans Ghostr).
 const DEFAULT_GRACE_MS = 5_000;
 
-const SCREEN_CAPTURE_TAG = 'ghostr-global';
-
 function enableScreenCaptureForPicker(): void {
   // Retire FLAG_SECURE pendant l'ouverture du picker. Sans ça, certains
   // téléphones Android affichent une preview caméra noire.
-  ScreenCapture.allowScreenCaptureAsync(SCREEN_CAPTURE_TAG).catch(() => {});
+  //
+  // Android uniquement, et sans effet dans un build autorisé à la capture :
+  // toute la décision vit dans screenCaptureGuard, ce module ne fait que la
+  // déclencher au bon moment.
+  disarmScreenCaptureProtection();
 }
 
 function restoreScreenCaptureProtection(): void {
-  ScreenCapture.preventScreenCaptureAsync(SCREEN_CAPTURE_TAG).catch(() => {});
+  rearmScreenCaptureProtection();
 }
 
 function resetSafetyTimer(): void {

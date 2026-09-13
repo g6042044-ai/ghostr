@@ -76,6 +76,9 @@ interface SealedSenderInner {
 
 let _currentCertificate: SenderCertificate | null = null;
 let _serverSealedSenderPubKey: Uint8Array | null = null;
+// Copie base64 de la clé serveur — conservée pour pouvoir persister le
+// couple (certificat, clé) via les cache hooks sans ré-encoder les bytes.
+let _serverSealedSenderPubKeyB64: string | null = null;
 
 // ════════════════════════════════════════════════════════════════════════════
 // OBSERVABLE STATE — pour que les composants React puissent réagir
@@ -191,6 +194,9 @@ export function getSenderCertificate(): SenderCertificate | null {
  */
 export function invalidateSenderCertificate(): void {
   _currentCertificate = null;
+  // Un certificat rejeté par le gateway (quota/expiry) ne doit pas être
+  // restauré au prochain cold start — purge du cache persisté.
+  void _cacheHooks?.clear();
   if (_ssState === 'ready') setSealedSenderObservableState('idle');
 }
 
@@ -219,6 +225,9 @@ export function invalidateSenderCertificate(): void {
  * "obsolète" sera ignoré au moment de l'application (voir _runBootstrapAttempt).
  */
 export function clearSealedSenderState(): void {
+  // 0. Purger le cache persisté (mode PIN : le certificat est éphémère par
+  //    design R-13 ; couvre aussi la transition no-PIN → PIN).
+  void _cacheHooks?.clear();
   // 1. Invalider la génération pour que tout bootstrap en flight termine en no-op
   _bootstrapGeneration++;
   // 2. Abort le controller (réveille les awaits dans le fetcher + retry loop)
@@ -242,6 +251,7 @@ export function clearSealedSenderState(): void {
     }
     _serverSealedSenderPubKey = null;
   }
+  _serverSealedSenderPubKeyB64 = null;
   // 6. Le certificat ne contient pas de Uint8Array — null suffit
   _currentCertificate = null;
   // 7. Repasser à 'idle' pour que les écrans réinitialisent leur UI au prochain unlock.
@@ -254,6 +264,7 @@ export function clearSealedSenderState(): void {
  */
 export function setSealedSenderServerKey(pubKeyB64: string): void {
   _serverSealedSenderPubKey = decodeBase64(pubKeyB64);
+  _serverSealedSenderPubKeyB64 = pubKeyB64;
 }
 
 /**
@@ -332,6 +343,28 @@ export function setSealedSenderCertificateFetcher(fn: FetchCertificateFn): void 
 }
 
 /**
+ * Hooks de persistance du couple (certificat, clé SS) — injectés depuis
+ * api1to1.ts (implémentation : sealedSenderCache.ts). Même pattern
+ * d'injection que le fetcher : sealedSender.ts reste sans dépendance
+ * stockage. Tous les hooks sont fire-and-forget et ne throw jamais.
+ *
+ * Sécurité : la POLITIQUE (chiffrement hardware, refus en mode PIN,
+ * validation de forme, marge d'expiration) vit dans sealedSenderCache.ts —
+ * ici on ne fait qu'appeler save/load/clear aux transitions d'état.
+ */
+export interface SealedSenderCacheHooks {
+  load: () => Promise<{ cert: SenderCertificate; ssKeyB64: string } | null>;
+  save: (cert: SenderCertificate, ssKeyB64: string) => Promise<void>;
+  clear: () => Promise<void>;
+}
+
+let _cacheHooks: SealedSenderCacheHooks | null = null;
+
+export function setSealedSenderCacheHooks(hooks: SealedSenderCacheHooks): void {
+  _cacheHooks = hooks;
+}
+
+/**
  * Délai await-able qui se réveille à l'abort.
  * Ne throw jamais — retourne simplement plus tôt si signal aborted.
  */
@@ -404,6 +437,9 @@ async function _runBootstrapAttempt(
   // 4. Programme le renouvellement
   scheduleCertificateRefresh(cert.expiry);
 
+  // 5. Persistance (fire-and-forget, no-op en mode PIN — cf. sealedSenderCache.ts)
+  void _cacheHooks?.save(cert, ssKeyB64);
+
   __DEV__ && console.log(
     '[SealedSender] ✅ Bootstrap complete — sealed sender ACTIVE, cert expires:',
     new Date(cert.expiry).toISOString()
@@ -450,6 +486,30 @@ export function ensureSealedSenderBootstrap(): Promise<boolean> {
   setSealedSenderObservableState('bootstrapping');
 
   const promise = (async (): Promise<boolean> => {
+    // ── Étape 0 : RESTAURATION DEPUIS LE CACHE PERSISTÉ (no-PIN) ──
+    // Si un certificat chiffré valide (≥ 10 min restantes) existe sur
+    // disque, on l'applique directement : zéro PoW, zéro réseau. La
+    // validation (mode PIN, déchiffrement authentifié, forme, expiry)
+    // est entièrement dans sealedSenderCache.ts. En cas d'échec ou de
+    // cache absent, on retombe sur le bootstrap réseau normal.
+    if (_cacheHooks) {
+      try {
+        const cached = await _cacheHooks.load();
+        if (signal.aborted || generation !== _bootstrapGeneration) return false;
+        if (cached) {
+          // Application atomique (aucun await entre les deux) — même
+          // invariant que _runBootstrapAttempt.
+          setSealedSenderServerKey(cached.ssKeyB64);
+          setSenderCertificate(cached.cert); // → 'ready' via l'observable
+          scheduleCertificateRefresh(cached.cert.expiry);
+          __DEV__ && console.log('[SealedSender] ✅ Bootstrap via persisted cache — PoW + RPC skipped');
+          return true;
+        }
+      } catch (e) {
+        __DEV__ && console.warn('[SealedSender] Cache restore failed, falling back to network bootstrap:', e);
+      }
+    }
+
     for (let attempt = 0; attempt < BOOTSTRAP_RETRY_DELAYS_MS.length; attempt++) {
       // Abort/clear pendant le précédent attempt → sortir immédiatement
       if (signal.aborted || generation !== _bootstrapGeneration) {
@@ -576,6 +636,10 @@ function scheduleCertificateRefresh(expiry: number): void {
       if (cert && _serverSealedSenderPubKey) {
         setSenderCertificate(cert);
         scheduleCertificateRefresh(cert.expiry);
+        // Rafraîchir aussi la copie persistée (no-op en mode PIN)
+        if (_serverSealedSenderPubKeyB64) {
+          void _cacheHooks?.save(cert, _serverSealedSenderPubKeyB64);
+        }
         __DEV__ && console.log('[SealedSender] ✅ Certificate refreshed');
       } else {
         // Refresh failed → invalider. Le prochain envoi déclenchera un bootstrap.

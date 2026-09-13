@@ -8,9 +8,10 @@
 // - Glisser haut → verrouille (mains libres)
 
 import React, { useRef, useCallback, useEffect } from 'react';
-import { View, StyleSheet, Animated, PanResponder, PanResponderGestureState, Vibration, ActivityIndicator } from 'react-native';
+import { View, StyleSheet, Animated, PanResponder, PanResponderGestureState, ActivityIndicator } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme, useThemedStyles, type ColorPalette } from './ui';
+import haptics from '../services/haptics';
 
 // ============================================
 // CONFIGURATION
@@ -140,9 +141,12 @@ export const VoiceRecordButton: React.FC<VoiceRecordButtonProps> = ({
     return () => lockProgress.removeListener(listenerId);
   }, []);
   
-  // Haptic feedback
+  // Haptic feedback — délègue au moteur natif (Taptic Engine sur iOS,
+  // HapticFeedbackConstants sur Android) au lieu du moteur de vibration
+  // brut. `Vibration.vibrate(10)` ignorait la durée sur iOS et produisait
+  // une secousse de ~400 ms là où on voulait un tick.
   const haptic = useCallback((type: 'light' | 'medium' | 'heavy') => {
-    Vibration.vibrate(type === 'heavy' ? 50 : type === 'medium' ? 30 : 10);
+    haptics.impact(type);
   }, []);
   
   // Reset animations

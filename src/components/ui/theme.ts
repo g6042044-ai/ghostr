@@ -1,31 +1,34 @@
 // src/components/ui/theme.ts
-// v3.0 — Light + Dark palettes with boot-time scheme detection.
+// v4.0 — Palettes claire et sombre + tokens non chromatiques.
 //
 // ════════════════════════════════════════════════════════════════════════════
 // ARCHITECTURE
 // ════════════════════════════════════════════════════════════════════════════
-// The original `theme` export was a single dark palette. Many files across the
-// codebase do `import { theme }` and consume `theme.colors.X` inside
-// module-level `StyleSheet.create({ … })`. Those style sheets are FROZEN at
-// module load time — they capture whatever value `theme.colors.X` had at the
-// moment `StyleSheet.create` ran. Mutating `theme.colors` after that point
-// does NOT update those styles.
+// Ce module expose DEUX choses, de natures très différentes :
 //
-// To make the app respect the OS theme without refactoring every screen, we
-// resolve the initial palette SYNCHRONOUSLY at module load using
-// `Appearance.getColorScheme()`. By the time any consumer's
-// `StyleSheet.create` runs, `theme.colors` already points at the right
-// palette — light or dark — for the user's device.
+//   1. LES PALETTES (`darkColors`, `lightColors`, `getColorsForScheme`).
+//      Ce sont des données pures. Personne ne les lit directement pour
+//      styler : on passe par `useTheme()` / `useThemedStyles()`
+//      (./ThemeContext.tsx), qui renvoient la palette ACTIVE et re-rendent
+//      les consommateurs quand elle change.
 //
-// For genuine live switching of a manual override (Settings → Appearance →
-// Light / Dark) we expose:
-//   - `darkColors` and `lightColors` palettes (same shape, both frozen)
-//   - `getColorsForScheme(scheme)` → returns the right palette
-//   - The new `ThemeContext` (./ThemeContext.tsx) that components can opt into
-//     via `useTheme()` for live-reactive colors.
+//   2. LES TOKENS NON CHROMATIQUES (`theme`) : espacements, rayons, tailles
+//      de police, ombres, durées d'animation. Indépendants du thème, donc
+//      figés sans risque.
 //
-// Files that have NOT migrated to `useTheme()` will still render in the
-// boot-time scheme until the JS bundle is reloaded — see THEME_MIGRATION.md.
+// ⚠️ `theme.colors` N'EXISTE PLUS.
+//
+// Les versions précédentes l'exposaient : une COPIE de la palette résolue au
+// chargement du module. Tout `StyleSheet.create({ color: theme.colors.X })`
+// écrit au niveau module capturait ces valeurs une fois pour toutes et ne
+// pouvait plus jamais changer — d'où la modale « redémarrez l'application »
+// qui accompagnait chaque changement d'apparence, et un mode clair de fait
+// inatteignable.
+//
+// Toutes ces feuilles de styles ont été converties en FABRIQUES
+// `makeStyles(colors)` consommées par `useThemedStyles`. La clé `colors` a
+// ensuite été retirée pour que le compilateur interdise toute rechute :
+// réintroduire `theme.colors.X` ne compile pas.
 //
 // ════════════════════════════════════════════════════════════════════════════
 // PRIVACY
@@ -123,8 +126,12 @@ const darkColors = {
   dangerLight: '#FF8A8A',
 
   // Message status
-  statusSent: 'rgba(255,255,255,0.5)',
-  statusDelivered: 'rgba(255,255,255,0.75)',
+  // `statusSent` était à 0.5 d'alpha : sur la bulle `messageMine` (#005C4B)
+  // cela donnait un contraste ≈ 2,6:1, sous le seuil WCAG de 3:1 exigé pour
+  // un élément graphique porteur de sens. À 0.72 on est à ≈ 4,4:1 et la
+  // hiérarchie envoyé < distribué reste lisible.
+  statusSent: 'rgba(255,255,255,0.72)',
+  statusDelivered: 'rgba(255,255,255,0.92)',
   statusRead: '#00D9A6',
 
   // Reactions
@@ -213,8 +220,9 @@ const lightColors: typeof darkColors = {
 
   // Message status — for light theme, status icons sit on the teal "mine"
   // bubble, so we mirror the dark palette's alphas-over-white-on-coloured.
-  statusSent: 'rgba(255,255,255,0.6)',
-  statusDelivered: 'rgba(255,255,255,0.85)',
+  // Mêmes seuils de contraste que la palette sombre (cf. commentaire là-bas).
+  statusSent: 'rgba(255,255,255,0.78)',
+  statusDelivered: 'rgba(255,255,255,0.94)',
   statusRead: '#FFFFFF',
 
   // Reactions — light card with teal-tinted selected state
@@ -241,77 +249,61 @@ export function getColorsForScheme(scheme: ColorScheme): ColorPalette {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// BOOT-TIME SCHEME RESOLUTION
+// SCHEME DE DÉMARRAGE
 // ════════════════════════════════════════════════════════════════════════════
-// This runs ONCE, synchronously, the first time any module imports `theme`.
-// At this point AsyncStorage has not been read yet (it's async), so we can
-// only honour the OS preference here — not the user's stored override.
+// Résolu UNE fois, de façon synchrone, au premier import du module.
 //
-// The stored override is applied later by the `ThemeContext` provider,
-// which exposes the chosen scheme to opt-in components via `useTheme()`.
-// Files that consume `useTheme()` switch live; files that still read
-// `theme.colors.X` at module-level `StyleSheet.create` time are locked
-// to whatever this initial palette is. See THEME_MIGRATION.md.
+// À cet instant AsyncStorage n'a pas encore été lu (c'est asynchrone), donc
+// on ne peut honorer que la préférence de l'OS. La préférence stockée par
+// l'utilisateur est appliquée juste après par le `ThemeContext`.
 //
-// NOTE: an earlier draft of this module exposed `_applyBootScheme()` for
-// the bootstrap layer to call as soon as the stored override was known.
-// That was unsafe: the AsyncStorage read resolves AFTER every consumer's
-// `StyleSheet.create` has already captured the boot-time palette. The
-// mutation would have been functionally a no-op (legacy stylesheets are
-// already frozen), but it would have also updated `_bootScheme` itself —
-// causing `requiresReload` (computed as `currentScheme !== getBootScheme()`)
-// to falsely report `false`. The user would see no "restart to apply"
-// banner while half their screens silently rendered in the wrong palette.
-// Better to keep `_bootScheme` honestly equal to what's actually painted
-// by the legacy code path, and let `requiresReload` be accurate.
-
+// Ce scheme ne sert plus qu'à DEUX choses, toutes deux transitoires :
+//   1. la valeur de repli de `resolveScheme()` quand `Appearance` ne renvoie
+//      rien d'exploitable ;
+//   2. la palette du `useTheme()` hors provider en production (garde-fou
+//      anti-crash).
+//
+// Il ne détermine plus l'apparence d'aucun style : `theme.colors` a été
+// supprimé, donc plus rien n'est peint à partir d'une palette figée.
 const _bootScheme: ColorScheme = ((): ColorScheme => {
   try {
-    // `getColorScheme()` may return null on devices that don't expose a
-    // preference; default to dark to preserve the original visual identity.
+    // `getColorScheme()` peut renvoyer null sur les appareils qui n'exposent
+    // pas de préférence ; on retombe sur le sombre, identité visuelle
+    // historique de l'app.
     return Appearance.getColorScheme() === 'light' ? 'light' : 'dark';
   } catch {
     return 'dark';
   }
 })();
 
-/**
- * Returns the scheme that was active when the FIRST module-level
- * `StyleSheet.create` referencing `theme.colors` was evaluated. The
- * `ThemeContext` provider uses this to compute `requiresReload`: when the
- * user's chosen scheme differs from this value, legacy stylesheets are
- * out of sync and need a JS bundle reload to catch up.
- */
+/** Scheme résolu au démarrage (préférence OS). Cf. le bloc ci-dessus. */
 export function getBootScheme(): ColorScheme {
   return _bootScheme;
 }
 
-/**
- * Called by `ThemeContext`'s provider on its first render. Currently a
- * no-op kept for API stability and future-proofing — earlier drafts
- * needed it to lock down a runtime mutation path. The current design
- * never mutates `theme.colors` after module load, so there's nothing
- * to lock.
- */
-export function _lockBootScheme(): void {
-  /* no-op — see docstring */
-}
-
 // ════════════════════════════════════════════════════════════════════════════
-// LEGACY EXPORT — preserved for the ~30 files that do `import { theme }`
-// and reference `theme.colors.X` directly at module level.
+// TOKENS NON CHROMATIQUES
 // ════════════════════════════════════════════════════════════════════════════
 //
-// `theme.colors` is a COPY of the boot palette, frozen at module load. It
-// reflects the OS scheme detected synchronously above — and never changes
-// thereafter. Every `StyleSheet.create({ color: theme.colors.X })` at the
-// top level of a module captures these values exactly once.
+// ⚠️ `theme` NE CONTIENT PLUS DE COULEURS. La clé `colors` a été supprimée.
 //
-// Code paths that want LIVE updates on manual theme changes must migrate to
-// `useTheme()` — see THEME_MIGRATION.md.
+// Elle exposait une COPIE de la palette figée au chargement du module. Tout
+// `StyleSheet.create({ backgroundColor: theme.colors.background })` écrit au
+// niveau module capturait cette valeur une fois pour toutes : changer
+// d'apparence dans les Réglages ne pouvait pas les mettre à jour, d'où la
+// modale « redémarrez l'application » qui existait jusqu'ici.
+//
+// Les couleurs passent DÉSORMAIS EXCLUSIVEMENT par le contexte :
+//   const { colors } = useTheme();                    // lecture inline
+//   const styles = useThemedStyles(makeStyles);       // feuille de styles
+//
+// Ce qui reste ici est indépendant du thème (espacements, rayons, tailles de
+// police, ombres, durées) et peut donc rester figé sans risque.
+//
+// La suppression est VOLONTAIREMENT non rétrocompatible : si du code
+// réintroduit `theme.colors.X`, TypeScript échoue au lieu de laisser
+// réapparaître silencieusement un écran figé sur l'ancienne palette.
 export const theme = {
-  colors: { ...getColorsForScheme(_bootScheme) },
-
   spacing: {
     xxs: 2,
     xs: 4,
@@ -476,10 +468,11 @@ export type Theme = typeof theme;
 export type ThemeColors = ColorPalette;
 
 // ════════════════════════════════════════════════════════════════════════════
-// MESSAGE COLOURS — now a function so callers can pick from a specific
-// palette. The default `messageColors` export keeps backward compatibility by
-// resolving from the (mutable) `theme.colors`.
+// COULEURS DES BULLES — fonction pure de la palette passée en argument.
 // ════════════════════════════════════════════════════════════════════════════
+// L'export `messageColors` qui l'accompagnait a été supprimé : c'étaient des
+// getters résolus contre `theme.colors`, donc contre la palette de démarrage.
+// Les appelants passent maintenant la palette de `useTheme()`.
 export function getMessageColors(colors: ColorPalette) {
   return {
     sent: {
@@ -497,20 +490,33 @@ export function getMessageColors(colors: ColorPalette) {
   };
 }
 
-// Legacy export — resolves against the live `theme.colors` reference.
-// Reads at access time via getters so it follows boot-time mutations.
-export const messageColors = {
-  get sent() {
-    return getMessageColors(theme.colors as ColorPalette).sent;
-  },
-  get received() {
-    return getMessageColors(theme.colors as ColorPalette).received;
-  },
-};
 
 // ════════════════════════════════════════════════════════════════════════════
-// AVATAR PALETTE — same vivid set on both themes (recognisable across modes).
+// PALETTE D'AVATARS — SOURCE UNIQUE
 // ════════════════════════════════════════════════════════════════════════════
+// Le projet hébergeait TROIS palettes d'avatars divergentes :
+//   - celle-ci (`avatarColors`, utilisée par GroupAvatar et la liste) ;
+//   - `WHATSAPP_AVATAR_COLORS` dans Avatar.tsx ;
+//   - `AVATAR_COLORS` dans services/crypto.ts (profil et écran de contact).
+//
+// Les trois dérivaient la couleur du même hash, mais indexaient des tableaux
+// différents : un même contact changeait donc de couleur entre la liste de
+// conversations, l'en-tête du fil et sa fiche. Sur une app sans photo de
+// profil imposée, la couleur d'avatar EST l'identifiant visuel du contact —
+// la voir changer d'un écran à l'autre casse la reconnaissance.
+//
+// Les deux autres tableaux ont été supprimés ; celui-ci est désormais la
+// seule définition. Il vit dans le design system parce que c'est de la
+// couleur : `services/crypto.ts` n'a plus à connaître la charte graphique.
+//
+// Volontairement identique en clair et en sombre : ces teintes sont
+// saturées et lisibles sur les deux fonds, et un contact doit rester
+// reconnaissable quand l'utilisateur change de thème.
+//
+// ⚠️ L'ORDRE ET LA LONGUEUR de ce tableau déterminent la couleur de chaque
+// contact (`hash % length`). Y insérer ou en retirer une entrée recolore
+// tout le carnet d'adresses. Ajouter uniquement à la FIN, et seulement si
+// c'est assumé.
 export const avatarColors = [
   '#00D9A6',
   '#FF6B6B',
@@ -539,6 +545,20 @@ export const createResponsiveStyle = <T extends Record<string, any>>(
   return base;
 };
 
+/**
+ * Couleur d'avatar déterministe pour un identifiant stable (senderToken,
+ * groupId, nom d'affichage à défaut).
+ *
+ * SEULE fonction de l'app qui attribue une couleur d'avatar. Les variantes
+ * locales qui existaient dans Avatar.tsx, ContactInfoScreen, EditProfile,
+ * SetupProfile et services/crypto.ts ont toutes été supprimées au profit
+ * de celle-ci — elles réimplémentaient ce même hash sur des palettes
+ * différentes, d'où des couleurs incohérentes d'un écran à l'autre.
+ *
+ * Hash djb2-like sur 32 bits signés. Aucune propriété cryptographique
+ * attendue : il ne sert qu'à répartir les contacts sur la palette de façon
+ * stable dans le temps et entre les écrans.
+ */
 export const getAvatarColor = (token: string): string => {
   if (!token) return avatarColors[0];
   let hash = 0;

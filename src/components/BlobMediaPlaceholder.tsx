@@ -226,21 +226,21 @@ const ImagePlaceholder: React.FC<BlobMediaPlaceholderProps> = ({
             <View style={styles.errorBadge}>
               <Ionicons name="refresh" size={18} color="#fff" />
               <Text style={styles.errorBadgeText} numberOfLines={1}>
-                {t('conversation.tapToRetry', { defaultValue: 'Réessayer' })}
+                {t('conversation.tapToRetry', {})}
               </Text>
             </View>
           ) : downloading ? (
             <View style={styles.progressBadge}>
               <ActivityIndicator size="small" color="#fff" />
               <Text style={styles.progressBadgeText}>
-                {t('conversation.decrypting', { defaultValue: 'Déchiffrement…' })}
+                {t('conversation.decrypting', {})}
               </Text>
             </View>
           ) : (
             <View style={styles.progressBadge}>
               <Ionicons name="lock-closed" size={16} color="#fff" />
               <Text style={styles.progressBadgeText}>
-                {t('conversation.encrypted', { defaultValue: 'Chiffré' })}
+                {t('conversation.encrypted', {})}
               </Text>
             </View>
           )}
@@ -368,10 +368,10 @@ const VoicePlaceholder: React.FC<BlobMediaPlaceholderProps> = ({
             <View style={styles.voiceDot} />
             <Text style={[styles.voiceHint, isMine && styles.voiceTextMine]}>
               {error
-                ? t('conversation.tapToRetry', { defaultValue: 'Réessayer' })
+                ? t('conversation.tapToRetry', {})
                 : downloading
-                  ? t('conversation.decrypting', { defaultValue: 'Déchiffrement…' })
-                  : t('conversation.tapToDownload', { defaultValue: 'Appuyer pour télécharger' })}
+                  ? t('conversation.decrypting', {})
+                  : t('conversation.tapToDownload', {})}
             </Text>
             <View style={{ flex: 1 }} />
             <Text style={[styles.voiceTime, isMine && styles.voiceTimeMine]}>
@@ -413,7 +413,7 @@ const FilePlaceholder: React.FC<BlobMediaPlaceholderProps> = ({
   const styles = useThemedStyles(makeStyles);
   const radius = getBorderRadius(isMine, isFirstOfGroup, isLastOfGroup);
 
-  const fileName = message.fileName || t('conversation.file', { defaultValue: 'Fichier' });
+  const fileName = message.fileName || t('conversation.file', {});
   const fileSize = message.fileSize ? formatFileSize(message.fileSize) : '';
   const extension = (fileName.split('.').pop() || '').toLowerCase();
   const iconEmoji = getFileIcon(extension);
@@ -447,10 +447,10 @@ const FilePlaceholder: React.FC<BlobMediaPlaceholderProps> = ({
           <View style={styles.fileSubRow}>
             <Text style={[styles.fileSub, isMine && styles.fileSubMine]} numberOfLines={1}>
               {error
-                ? t('conversation.tapToRetry', { defaultValue: 'Réessayer' })
+                ? t('conversation.tapToRetry', {})
                 : downloading
-                  ? t('conversation.decrypting', { defaultValue: 'Déchiffrement…' })
-                  : (fileSize ? `${fileSize} · ${t('conversation.tap', { defaultValue: 'Appuyer' })}` : t('conversation.tapToDownload', { defaultValue: 'Appuyer pour télécharger' }))}
+                  ? t('conversation.decrypting', {})
+                  : (fileSize ? `${fileSize} · ${t('conversation.tap')}` : t('conversation.tapToDownload'))}
             </Text>
             <View style={{ flex: 1 }} />
             <Text style={[styles.fileTime, isMine && styles.fileTimeMine]}>

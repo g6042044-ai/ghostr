@@ -546,12 +546,12 @@ async function setupCallNotificationCategory(): Promise<void> {
   await Notifications.setNotificationCategoryAsync('incoming_call', [
     {
       identifier: 'answer_call',
-      buttonTitle: i18n.t('pushNotifications.answerAction', { defaultValue: 'Answer' }),
+      buttonTitle: i18n.t('pushNotifications.answerAction', {}),
       options: { opensAppToForeground: true },
     },
     {
       identifier: 'decline_call',
-      buttonTitle: i18n.t('pushNotifications.declineAction', { defaultValue: 'Decline' }),
+      buttonTitle: i18n.t('pushNotifications.declineAction', {}),
       options: { opensAppToForeground: false, isDestructive: true },
     },
   ], { customDismissAction: true });

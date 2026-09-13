@@ -6,7 +6,7 @@ import { useState, useRef, useEffect } from 'react';
 import { View, Text, Dimensions, TouchableOpacity, Image, Animated, FlatList, Platform, StatusBar } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
-import { useThemedStyles, type ColorPalette } from '../components/ui';
+import { useTheme, useThemedStyles, type ColorPalette } from '../components/ui';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -16,6 +16,23 @@ const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 interface WelcomeScreenProps {
   onComplete: () => void;
+  /**
+   * Ouvre le parcours « Restaurer une sauvegarde » (MigrationImportScreen).
+   *
+   * POURQUOI CE LIEN EXISTE : l'identité Ghostr est purement locale. Un
+   * utilisateur qui change de téléphone n'a AUCUN moyen de retrouver ses
+   * conversations sans importer sa sauvegarde. Sans ce lien, le seul
+   * chemin possible était : créer une identité jetable → terminer
+   * l'onboarding → fouiller les Réglages → importer → repartir de zéro.
+   * C'est le parcours le plus critique de l'app et c'était le plus caché.
+   *
+   * Toutes les applications à identité locale (Signal, portefeuilles
+   * crypto, gestionnaires de mots de passe) exposent la restauration dès
+   * l'écran d'accueil, à côté du CTA principal mais visuellement en
+   * retrait : le nouvel utilisateur ne doit pas hésiter, celui qui migre
+   * doit trouver immédiatement.
+   */
+  onRestore?: () => void;
 }
 
 // Le contenu textuel des slides est chargé via i18n au render. On garde
@@ -245,9 +262,10 @@ const Pagination = ({ currentIndex, total }: { currentIndex: number; total: numb
 // MAIN COMPONENT
 // ============================================
 
-export function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
+export function WelcomeScreen({ onComplete, onRestore }: WelcomeScreenProps) {
   const insets = useSafeAreaInsets();
   const styles = useThemedStyles(makeStyles);
+  const { isDark } = useTheme();
   const { t } = useTranslation();
   const flatListRef = useRef<FlatList>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -279,7 +297,13 @@ export function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
   
   return (
     <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
+      {/* barStyle dérivé du thème : l'écran peint `colors.background`, donc
+          en mode clair un texte de barre d'état blanc serait invisible. */}
+      <StatusBar
+        barStyle={isDark ? 'light-content' : 'dark-content'}
+        backgroundColor="transparent"
+        translucent
+      />
       
       {/* Skip */}
       {!isLastSlide && (
@@ -330,6 +354,27 @@ export function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
             {isLastSlide ? t('welcome.start') : t('welcome.next')}
           </Text>
         </TouchableOpacity>
+
+        {/*
+          Lien de restauration — volontairement en retrait (texte seul,
+          couleur secondaire) pour ne pas concurrencer le CTA principal,
+          mais présent dès le premier écran. Cible tactile de 44 px de haut
+          via le paddingVertical, conformément aux règles d'accessibilité.
+        */}
+        {onRestore && (
+          <TouchableOpacity
+            onPress={onRestore}
+            style={styles.restoreButton}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel={t('welcome.restoreBackup')}
+            accessibilityHint={t('welcome.restoreBackupHint')}
+          >
+            <Text style={styles.restoreText} numberOfLines={2}>
+              {t('welcome.restoreBackup')}
+            </Text>
+          </TouchableOpacity>
+        )}
 
         <Text style={styles.techNote}>{t('welcome.techNote')}</Text>
       </Animated.View>
@@ -515,6 +560,20 @@ const makeStyles = (colors: ColorPalette) => ({
     fontSize: 16,
     fontWeight: '600',
     color: '#FFFFFF',
+  },
+  restoreButton: {
+    marginTop: 8,
+    // 12 px de padding vertical + ~20 px de hauteur de texte = 44 px de
+    // cible tactile, le minimum recommandé par les deux plateformes.
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+  },
+  restoreText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: colors.textSecondary,
+    textAlign: 'center',
   },
   techNote: {
     marginTop: 16,
