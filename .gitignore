@@ -105,3 +105,8 @@ Thumbs.db
 *.tmp
 tmp/
 temp/
+
+# Artefacts de travail a la racine.
+# Ancres sur "/" pour ne PAS exclure patches/*.patch, requis par patch-package.
+/ghostr.zip
+/ghostr-corrections.patch
