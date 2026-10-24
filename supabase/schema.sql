@@ -51,6 +51,7 @@ DROP FUNCTION IF EXISTS public.get_app_notice() CASCADE;
 
 -- Fonctions internes
 DROP FUNCTION IF EXISTS public.check_rate_limit(TEXT, TEXT, INTEGER) CASCADE;
+DROP FUNCTION IF EXISTS public.cleanup_old_data(INTEGER, INTEGER, INTEGER, INTEGER) CASCADE;
 DROP FUNCTION IF EXISTS public.cleanup_old_data(INTEGER, INTEGER, INTEGER) CASCADE;
 DROP FUNCTION IF EXISTS public.is_handshake_payload(TEXT) CASCADE;
 DROP FUNCTION IF EXISTS public.cleanup_expired_blobs() CASCADE;
@@ -571,67 +572,93 @@ COMMENT ON FUNCTION public.is_handshake_payload(TEXT) IS
 CREATE OR REPLACE FUNCTION public.cleanup_old_data(
     p_messages_days  INTEGER DEFAULT 2,
     p_signals_days   INTEGER DEFAULT 1,
-    p_handshake_days INTEGER DEFAULT 30
+    p_handshake_days INTEGER DEFAULT 30,
+    p_lot            INTEGER DEFAULT 5000
 ) RETURNS JSON
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
 SET statement_timeout = '30s'
 AS $$
 DECLARE
-    deleted_messages   INTEGER;
-    deleted_handshakes INTEGER;
+    v_debut            TIMESTAMPTZ := clock_timestamp();
+    deleted_anciens    INTEGER;
+    deleted_trafic     INTEGER;
     deleted_signals    INTEGER;
     deleted_rates      INTEGER;
 BEGIN
-    -- Handshake > 30j (hors tags exemptés). Volume négligeable : une
-    -- invitation + un accept par connexion.
-    WITH d AS (
-        DELETE FROM public.messages m
-        WHERE m.created_at < now() - (p_handshake_days || ' days')::INTERVAL
-          AND public.is_handshake_payload(m.sealed_payload)
-          AND NOT EXISTS (
-              SELECT 1 FROM public.invite_ttl_exempt e WHERE e.tag = m.tag
-          )
-        RETURNING 1
-    ) SELECT count(*) INTO deleted_handshakes FROM d;
+    -- Travail BORNÉ par appel : au plus p_lot messages, p_lot signaux et
+    -- 10 × p_lot compteurs. Un retard (première purge, panne du cron) se
+    -- résorbe en plusieurs passages au lieu de faire échouer chacun d'eux.
+    IF p_lot IS NULL OR p_lot < 1 OR p_handshake_days < p_messages_days THEN
+        RAISE EXCEPTION 'cleanup_old_data : paramètres invalides (p_lot >= 1, p_handshake_days >= p_messages_days).';
+    END IF;
 
-    -- Trafic de conversation (messages réels ET decoys) > 48h
-    WITH d AS (
-        DELETE FROM public.messages m
-        WHERE m.created_at < now() - (p_messages_days || ' days')::INTERVAL
-          AND NOT public.is_handshake_payload(m.sealed_payload)
-          AND NOT EXISTS (
-              SELECT 1 FROM public.invite_ttl_exempt e WHERE e.tag = m.tag
-          )
-        RETURNING 1
-    ) SELECT count(*) INTO deleted_messages FROM d;
+    -- 1. Plus vieux que la durée longue (30 j) : TOUT part, invitation ou non.
+    --    Aucun tri nécessaire, donc aucune lecture du contenu : rapide même sur
+    --    un gros arriéré. Sélection par l'index sur created_at, plus anciens d'abord.
+    WITH cible AS (
+        SELECT m.id
+        FROM   public.messages m
+        WHERE  m.created_at < now() - (p_handshake_days || ' days')::INTERVAL
+          AND  NOT EXISTS (SELECT 1 FROM public.invite_ttl_exempt e WHERE e.tag = m.tag)
+        ORDER  BY m.created_at
+        LIMIT  p_lot
+    ), d AS (
+        DELETE FROM public.messages m USING cible WHERE m.id = cible.id RETURNING 1
+    ) SELECT count(*) INTO deleted_anciens FROM d;
 
-    -- Signaux > 24h
-    WITH d AS (
-        DELETE FROM public.call_signals
-        WHERE created_at < now() - (p_signals_days || ' days')::INTERVAL
-        RETURNING 1
+    -- 2. Entre 48 h et 30 j : seul le trafic de conversation (messages réels
+    --    et leurres) part ; invitations et acceptations restent. Il faut lire
+    --    le type, d'où le budget restant seulement.
+    WITH cible AS (
+        SELECT m.id
+        FROM   public.messages m
+        WHERE  m.created_at <  now() - (p_messages_days  || ' days')::INTERVAL
+          AND  m.created_at >= now() - (p_handshake_days || ' days')::INTERVAL
+          AND  NOT public.is_handshake_payload(m.sealed_payload)
+          AND  NOT EXISTS (SELECT 1 FROM public.invite_ttl_exempt e WHERE e.tag = m.tag)
+        ORDER  BY m.created_at
+        LIMIT  greatest(p_lot - deleted_anciens, 0)
+    ), d AS (
+        DELETE FROM public.messages m USING cible WHERE m.id = cible.id RETURNING 1
+    ) SELECT count(*) INTO deleted_trafic FROM d;
+
+    -- 3. Signaux d'appel > 24 h
+    WITH cible AS (
+        SELECT s.id FROM public.call_signals s
+        WHERE  s.created_at < now() - (p_signals_days || ' days')::INTERVAL
+        LIMIT  p_lot
+    ), d AS (
+        DELETE FROM public.call_signals s USING cible WHERE s.id = cible.id RETURNING 1
     ) SELECT count(*) INTO deleted_signals FROM d;
 
-    -- Rate limits > 5min (fenêtres expirées)
-    WITH d AS (
-        DELETE FROM public.rate_limits
-        WHERE window_start < now() - INTERVAL '2 minutes'  -- R-09: sliding window 60s + marge 60s
+    -- 4. Compteurs anti-abus : fenêtre de 60 s + 60 s de marge
+    WITH cible AS (
+        SELECT r.identifier, r.limit_type FROM public.rate_limits r
+        WHERE  r.window_start < now() - INTERVAL '2 minutes'
+        LIMIT  p_lot * 10
+    ), d AS (
+        DELETE FROM public.rate_limits r USING cible
+        WHERE  r.identifier = cible.identifier AND r.limit_type = cible.limit_type
         RETURNING 1
     ) SELECT count(*) INTO deleted_rates FROM d;
 
     RETURN json_build_object(
-        'deleted_messages',    deleted_messages,
-        'deleted_handshakes',  deleted_handshakes,
-        'deleted_signals',     deleted_signals,
-        'deleted_rate_limits', deleted_rates,
-        'executed_at',         now()
+        'deleted_messages_plus_de_30j', deleted_anciens,
+        'deleted_trafic_48h_30j',       deleted_trafic,
+        'deleted_signals',              deleted_signals,
+        'deleted_rate_limits',          deleted_rates,
+        'reste_a_purger',               deleted_anciens + deleted_trafic >= p_lot
+                                        OR deleted_signals >= p_lot
+                                        OR deleted_rates >= p_lot * 10,
+        'duree_ms',                     round(extract(epoch FROM clock_timestamp() - v_debut) * 1000),
+        'executed_at',                  now()
     );
 END;
 $$;
 
-COMMENT ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER)
-    IS 'TTL cleanup: 48h trafic, 30j handshake (hors invite_ttl_exempt), 24h signaux, 5min rate limits. Cron: */15 * * * *';
+COMMENT ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER, INTEGER)
+    IS 'TTL cleanup par lots: 48h trafic, 30j handshake (hors invite_ttl_exempt), 24h signaux, 2min rate limits; au plus p_lot messages par appel. Cron: */15 * * * *';
 
 
 -- ── Cleanup blobs expirés (cron toutes les 6h) ──
@@ -892,27 +919,68 @@ GRANT EXECUTE ON FUNCTION public.get_app_notice()                               
 GRANT EXECUTE ON FUNCTION public.submit_report(TEXT, TEXT, TEXT, TEXT)                  TO anon, authenticated;
 
 -- RPCs internes: service_role uniquement
+--
+-- PUBLIC D'ABORD, ET POUR LES QUATRE. `CREATE FUNCTION` accorde EXECUTE à
+-- PUBLIC par défaut, et `anon` est membre de PUBLIC : un REVOKE ciblé sur
+-- anon/authenticated ne retire donc RIEN tant que PUBLIC garde le droit.
+-- Sans ces lignes, un porteur de la clé anon — elle est embarquée dans le
+-- binaire de l'app — appelle cleanup_old_data(0, 0, 0) → purge totale, ou
+-- cleanup_expired_blobs() en boucle → scan + DELETE sur storage.objects avec
+-- 60 s de budget, en tant que supabase_storage_admin.
+-- Contrôle : deux pièges rendent le test à l'œil faux. Un proacl NULL signifie
+-- « droits par défaut », donc PUBLIC A EXECUTE ; et chercher la chaîne « =X/ »
+-- attrape aussi l'entrée d'un rôle nommé (« postgres=X/postgres »). Seul le
+-- grantee 0 désigne PUBLIC. La requête de contrôle juste, par aclexplode(), est
+-- dans supabase/migration_grants_public.sql.
+--
 -- check_rate_limit est appelé depuis les SECURITY DEFINER RPCs (qui tournent
 -- en tant que postgres owner) donc n'a pas besoin d'être accessible par anon.
-REVOKE EXECUTE ON FUNCTION public.check_rate_limit(TEXT, TEXT, INTEGER) FROM anon, authenticated;
--- PUBLIC d'abord : CREATE FUNCTION accorde EXECUTE à PUBLIC par défaut, et un
--- REVOKE ciblé sur anon/authenticated ne le retire pas. Sans ça, un porteur de
--- la clé anon pourrait appeler cleanup_old_data(0, 0, 0) → purge totale.
-REVOKE EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER) FROM anon, authenticated;
+REVOKE EXECUTE ON FUNCTION public.check_rate_limit(TEXT, TEXT, INTEGER)       FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.check_rate_limit(TEXT, TEXT, INTEGER)       FROM anon, authenticated;
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER, INTEGER)FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER, INTEGER)FROM anon, authenticated;
 REVOKE EXECUTE ON FUNCTION public.is_handshake_payload(TEXT)                  FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.is_handshake_payload(TEXT)                  FROM anon, authenticated;
-REVOKE EXECUTE ON FUNCTION public.cleanup_expired_blobs()              FROM anon, authenticated;
-GRANT  EXECUTE ON FUNCTION public.check_rate_limit(TEXT, TEXT, INTEGER) TO service_role;
-GRANT  EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER) TO service_role;
+REVOKE EXECUTE ON FUNCTION public.cleanup_expired_blobs()                     FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.cleanup_expired_blobs()                     FROM anon, authenticated;
+GRANT  EXECUTE ON FUNCTION public.check_rate_limit(TEXT, TEXT, INTEGER)       TO service_role;
+GRANT  EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER, INTEGER)TO service_role;
 GRANT  EXECUTE ON FUNCTION public.is_handshake_payload(TEXT)                  TO service_role;
-GRANT  EXECUTE ON FUNCTION public.cleanup_expired_blobs()              TO service_role;
+GRANT  EXECUTE ON FUNCTION public.cleanup_expired_blobs()                     TO service_role;
 
 -- Verrouiller les DEFAULT PRIVILEGES Supabase
+-- Une fonction créée par postgres dans public reçoit EXECUTE par DEUX voies,
+-- qu'il faut fermer toutes les deux (vérifié sur supabase/postgres:17.6.1.178,
+-- même version que la production) :
+--   1. Supabase pose « IN SCHEMA public GRANT … TO anon, authenticated » sur
+--      les privilèges par défaut de postgres. Les deux premières lignes
+--      ci-dessous l'annulent (un REVOKE par schéma défait un GRANT par schéma).
+--   2. PostgreSQL accorde EXECUTE à PUBLIC (dont anon est membre) au niveau
+--      GLOBAL. Seule la troisième ligne, SANS « IN SCHEMA », le retire : la doc
+--      (ALTER DEFAULT PRIVILEGES, Notes) précise qu'un REVOKE par schéma ne peut
+--      pas retrancher un droit accordé globalement.
+-- Sans l'une ou l'autre, toute nouvelle fonction naît appelable par anon. Les
+-- RPC publiques reçoivent leur GRANT explicite plus haut : elles ne dépendent
+-- pas de ces droits par défaut.
+-- Portée de la ligne globale : toute la base, pour les fonctions créées par
+-- postgres après elle. Les schémas internes de Supabase sont peuplés par
+-- d'autres rôles (supabase_admin, supabase_auth_admin…) : non concernés.
+-- Contrôle : migration_grants_public.sql, sections 3a et 3b.
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
     REVOKE ALL ON TABLES FROM anon, authenticated;
+
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
     REVOKE ALL ON FUNCTIONS FROM anon, authenticated;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres
+    REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
+-- Objets présents en PRODUCTION mais créés hors de ce fichier (inventaire du
+-- 2026-10-23) : table notification_tokens et fonctions register_push_token,
+-- unregister_push_token, lookup_push_token, cleanup_stale_push_tokens
+-- (vestiges push d'avril 2026, appelés par aucune version de l'app), table
+-- demo_invite_backup, bucket public whisper-media. Ce script ne les crée ni ne
+-- les supprime ; migration_grants_public.sql ferme les quatre fonctions.
 
 
 -- ============================================================================
