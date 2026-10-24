@@ -84,7 +84,7 @@ import { SplashScreen } from './src/screens/SplashScreen';
 
 // Services
 import { getOrCreateDeviceState, clearEncryptionKey, hasGlobalDisplayName, initHardwareEncryptionAll, nuclearReset } from './src/services/storage';
-// api.ts ne contient plus que la config réseau (supabase, supabaseStorage, isRelayEnabled, getApiUrl)
+// api.ts ne contient plus que la config réseau (API_URL, isRelayEnabled, getApiUrl)
 import { startGlobalPolling1to1, stopGlobalPolling1to1, pollAllSessions, waitForSealedSender, precomputePoW, recoverOrphanedSendingMessages, flushLastMessagePreviews } from './src/services/api1to1';
 // Chargement des groupes persistés : sur le chemin critique du boot, au même
 // titre que sessionService.initialize(). Une seule lecture AsyncStorage +

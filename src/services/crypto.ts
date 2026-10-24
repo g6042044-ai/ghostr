@@ -696,45 +696,6 @@ export function parseShareLink(url: string): ParsedShareLink | null {
 export { encodeBase64, decodeBase64, encodeUTF8, decodeUTF8 };
 
 // ============================================
-// TAGS ANONYMES (pour anonymat serveur)
-// ============================================
-
-export async function generateConversationTag(masterKey: Uint8Array): Promise<string> {
-  // P2-A5: Salt contextuel
-  const saltInput = new TextEncoder().encode('ghostr-tag-salt-v2');
-  const salt = nobleHmac(nobleSha256, saltInput, masterKey);
-  const tagBytes = await hkdf(masterKey, salt, 'whisper-tag-v2', 16);
-  return bytesToHex(tagBytes);
-}
-
-export function generateFakeTags(count: number): string[] {
-  const fakeTags: string[] = [];
-  for (let i = 0; i < count; i++) {
-    const fakeBytes = getRandomBytes(16);
-    fakeTags.push(bytesToHex(fakeBytes));
-  }
-  return fakeTags;
-}
-
-export function getOptimalFakeTagsCount(realTagsCount: number): number {
-  return Math.max(15, realTagsCount * 3);
-}
-
-export function mixTagsWithDecoys(realTags: string[], fakeCount?: number): string[] {
-  const actualFakeCount = fakeCount ?? getOptimalFakeTagsCount(realTags.length);
-  
-  const fakeTags = generateFakeTags(actualFakeCount);
-  const allTags = [...realTags, ...fakeTags];
-  
-  for (let i = allTags.length - 1; i > 0; i--) {
-    const j = secureRandomInt(i + 1); // ACTION 10: rejection sampling, no modulo bias
-    [allTags[i], allTags[j]] = [allTags[j], allTags[i]];
-  }
-  
-  return allTags;
-}
-
-// ============================================
 // IDENTITY COMMITMENT (v5.2 - Pseudonymes cryptographiques)
 // ============================================
 

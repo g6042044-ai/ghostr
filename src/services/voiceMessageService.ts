@@ -12,7 +12,7 @@ import { Audio, InterruptionModeIOS, InterruptionModeAndroid } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
-import { supabaseStorage } from './api';
+import { getApiUrl } from './api';
 import { getRandomBytes } from './crypto';
 // P0-A2: legacyMediaProxy supprimé — tous les downloads via OHTTP relay
 import { fetchMediaViaRelay } from './encryptedBlobService';
@@ -92,15 +92,6 @@ export interface EncryptedVoiceData {
   encryptedData: Uint8Array;
   nonce: Uint8Array;
   fileKey: Uint8Array;
-}
-
-export interface UploadedVoice {
-  fileId: string;
-  storagePath: string;
-  fileUrl: string;
-  fileKey: Uint8Array;
-  fileNonce: Uint8Array;
-  metadata: VoiceMetadata;
 }
 
 // ============================================
@@ -619,76 +610,6 @@ function generateAnonymousFileId(): string {
 }
 
 /**
- * Upload un vocal chiffré sur Supabase Storage
- * @param storagePath - Le chemin de base (tag anonyme) pour le stockage
- * @param voiceUri - URI locale du fichier audio
- * @param duration - Durée en millisecondes
- * @param waveform - Données de waveform
- */
-export async function uploadEncryptedVoice(
-  storagePath: string,
-  voiceUri: string,
-  duration: number,
-  waveform: number[]
-): Promise<UploadedVoice> {
-  const fileId = generateAnonymousFileId();
-
-  // Obtenir la taille du fichier
-  const fileInfo = await FileSystem.getInfoAsync(voiceUri);
-  const fileSize = fileInfo.exists ? (fileInfo as any).size || 0 : 0;
-
-  // Valider la taille
-  if (fileSize > MAX_VOICE_SIZE_BYTES) {
-    throw new Error(`VOICE_TOO_LARGE:${(fileSize / (1024 * 1024)).toFixed(1)}`);
-  }
-
-  // Chiffrer le vocal
-  const encrypted = await encryptVoice(voiceUri);
-
-  // Path dans le storage (anonymisé avec le tag)
-  const fullPath = `${storagePath}/${fileId}_voice.enc`;
-
-  // Upload du fichier chiffré
-  const { error } = await supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .upload(fullPath, encrypted.encryptedData, {
-      contentType: 'application/octet-stream',
-      cacheControl: '3600',
-      upsert: false,
-    });
-
-  if (error) {
-    throw new Error(i18n.t('errors.voiceUploadFailed', { message: error.message }));
-  }
-
-  // Obtenir l'URL publique
-  const { data: urlData } = supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(fullPath);
-
-  // Supprimer le fichier local temporaire
-  try {
-    await FileSystem.deleteAsync(voiceUri, { idempotent: true });
-  } catch (e) {
-    __DEV__ && console.warn('Erreur suppression fichier vocal temporaire:', e);
-  }
-
-  return {
-    fileId,
-    storagePath,
-    fileUrl: urlData.publicUrl,
-    fileKey: encrypted.fileKey,
-    fileNonce: encrypted.nonce,
-    metadata: {
-      duration,
-      size: fileSize,
-      waveform,
-      mimeType: 'audio/mp4',
-    },
-  };
-}
-
-/**
  * Chiffre la clé du fichier avec la clé E2E de la conversation
  */
 export function encryptVoiceKey(fileKey: Uint8Array, e2eKey: Uint8Array): string {
@@ -722,26 +643,6 @@ export function decryptVoiceKey(encryptedKey: string, e2eKey: Uint8Array): Uint8
   }
 
   return decrypted;
-}
-
-/**
- * Crée le payload pour un message vocal
- */
-export function createVoiceMessagePayload(
-  uploadedVoice: UploadedVoice,
-  e2eKey: Uint8Array
-): VoiceMessagePayload {
-  // Chiffrer la clé du fichier avec la clé E2E
-  const fileKeyEncrypted = encryptVoiceKey(uploadedVoice.fileKey, e2eKey);
-
-  return {
-    type: 'voice',
-    fileId: uploadedVoice.fileId,
-    storagePath: uploadedVoice.storagePath,
-    fileKeyEncrypted,
-    fileNonce: encodeBase64(uploadedVoice.fileNonce),
-    metadata: uploadedVoice.metadata,
-  };
 }
 
 // ============================================
@@ -831,27 +732,6 @@ export async function clearVoiceCache(): Promise<void> {
 }
 
 // ============================================
-// SUPPRESSION
-// ============================================
-
-/**
- * Supprime un vocal du storage
- */
-export async function deleteVoiceFromStorage(
-  storagePath: string,
-  fileId: string
-): Promise<void> {
-  const fullPath = `${storagePath}/${fileId}_voice.enc`;
-
-  await supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .remove([fullPath]);
-
-  // Nettoyer le cache local
-  voiceCache.delete(fileId);
-}
-
-// ============================================
 // URL PUBLIQUE
 // ============================================
 
@@ -859,11 +739,12 @@ export async function deleteVoiceFromStorage(
  * Génère l'URL publique d'un vocal dans le storage
  */
 export function getVoicePublicUrl(storagePath: string, fileId: string): string {
+  // Tâche 0.4 : plus de client Supabase Storage côté app. Cette URL n'est
+  // jamais appelée directement : fetchMediaViaRelay() en extrait le chemin
+  // après « /ghostr-blobs/ » et télécharge via OHTTP (download_blob). Le
+  // format reproduit celui de storage-js getPublicUrl() pour ne rien changer.
   const fullPath = `${storagePath}/${fileId}_voice.enc`;
-  const { data } = supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(fullPath);
-  return data.publicUrl;
+  return encodeURI(`${getApiUrl()}/storage/v1/object/public/${STORAGE_BUCKET}/${fullPath}`);
 }
 
 // ============================================

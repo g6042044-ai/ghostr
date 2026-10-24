@@ -75,7 +75,12 @@ DROP POLICY IF EXISTS "ghostr_blobs_delete"   ON storage.objects;
 DROP POLICY IF EXISTS "blob_anon_upload"       ON storage.objects;
 DROP POLICY IF EXISTS "blob_anon_download"     ON storage.objects;
 
--- Storage policies (whisper-media)
+-- Storage policies (whisper-media). Noms RÉELS de la prod (inventaire du
+-- 2026-10-24) : whisper_media_insert / whisper_media_select, fermées par
+-- migration_close_whisper_media.sql (tâche 0.4). Les trois autres noms sont
+-- ceux d'anciennes versions du dépôt, gardés par prudence.
+DROP POLICY IF EXISTS "whisper_media_insert"   ON storage.objects;
+DROP POLICY IF EXISTS "whisper_media_select"   ON storage.objects;
 DROP POLICY IF EXISTS "whisper_media_upload"   ON storage.objects;
 DROP POLICY IF EXISTS "whisper_media_download" ON storage.objects;
 DROP POLICY IF EXISTS "whisper_media_delete"   ON storage.objects;

@@ -8,7 +8,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
-import { supabaseStorage } from './api';
+import { getApiUrl } from './api';
 import { getRandomBytes } from './crypto';
 // P0-A2: legacyMediaProxy supprimé — tous les downloads via OHTTP relay
 import { fetchMediaViaRelay } from './encryptedBlobService';
@@ -41,11 +41,12 @@ const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
  * @param suffix - Suffixe optionnel ('_thumb' pour miniature)
  */
 export function getMediaPublicUrl(storagePath: string, fileId: string, suffix: string = ''): string {
+  // Tâche 0.4 : plus de client Supabase Storage côté app. Cette URL n'est
+  // jamais appelée directement : fetchMediaViaRelay() en extrait le chemin
+  // après « /ghostr-blobs/ » et télécharge via OHTTP (download_blob). Le
+  // format reproduit celui de storage-js getPublicUrl() pour ne rien changer.
   const fullPath = `${storagePath}/${fileId}${suffix}.enc`;
-  const { data } = supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(fullPath);
-  return data.publicUrl;
+  return encodeURI(`${getApiUrl()}/storage/v1/object/public/${STORAGE_BUCKET}/${fullPath}`);
 }
 
 // ============================================
@@ -85,50 +86,10 @@ export interface EncryptedFileData {
   fileKey: Uint8Array;
 }
 
-export interface ImageMessagePayload {
-  type: 'image';
-  fileId: string;           // ID unique du fichier
-  storagePath: string;      // ✅ AJOUTÉ: Chemin de base dans le storage (tag)
-  fileKeyEncrypted: string; // Clé de fichier chiffrée avec e2eKey
-  fileNonce: string;        // Nonce pour déchiffrer le fichier
-  thumbKeyEncrypted: string;// Clé miniature (même clé, nonce différent)
-  thumbNonce: string;       // Nonce pour déchiffrer la miniature
-  metadata: ImageMetadata;
-}
-
-export interface FileMessagePayload {
-  type: 'file';
-  fileId: string;           // ID unique du fichier
-  storagePath: string;      // ✅ AJOUTÉ: Chemin de base dans le storage (tag)
-  fileKeyEncrypted: string; // Clé de fichier chiffrée avec e2eKey
-  fileNonce: string;        // Nonce pour déchiffrer le fichier
-  metadata: FileMetadata;
-}
-
 export interface ProcessedImage {
   fullUri: string;          // URI locale de l'image traitée
   thumbUri: string;         // URI locale de la miniature
   metadata: ImageMetadata;
-}
-
-export interface UploadedImage {
-  fileId: string;
-  storagePath: string;      // ✅ AJOUTÉ: Chemin de base utilisé pour le stockage
-  fileUrl: string;
-  thumbUrl: string;
-  fileKey: Uint8Array;
-  fileNonce: Uint8Array;
-  thumbNonce: Uint8Array;
-  metadata: ImageMetadata;
-}
-
-export interface UploadedFile {
-  fileId: string;
-  storagePath: string;      // ✅ AJOUTÉ: Chemin de base utilisé pour le stockage
-  fileUrl: string;
-  fileKey: Uint8Array;
-  fileNonce: Uint8Array;
-  metadata: FileMetadata;
 }
 
 // ============================================
@@ -490,94 +451,6 @@ function generateAnonymousFileId(): string {
 }
 
 /**
- * Upload une image chiffrée sur Supabase Storage
- * @param storagePath - Le chemin de base (tag anonyme) pour le stockage
- * @param processedImage - L'image traitée à uploader
- */
-export async function uploadEncryptedImage(
-  storagePath: string,
-  processedImage: ProcessedImage
-): Promise<UploadedImage> {
-  const fileId = generateAnonymousFileId();
-  
-  // Chiffrer l'image principale
-  const fullEncrypted = await encryptImage(processedImage.fullUri);
-  
-  // Chiffrer la miniature (même clé, nonce différent)
-  const thumbBase64 = await FileSystem.readAsStringAsync(processedImage.thumbUri, {
-    encoding: FileSystem.EncodingType.Base64,
-  });
-  const thumbData = decodeBase64(thumbBase64);
-  const thumbNonce = getRandomBytes(nacl.secretbox.nonceLength);
-  const thumbEncrypted = nacl.secretbox(thumbData, thumbNonce, fullEncrypted.fileKey);
-
-  if (!thumbEncrypted) {
-    throw new Error(i18n.t('errors.thumbnailEncryptionFailed'));
-  }
-
-  // Paths dans le storage (anonymisés avec le tag)
-  const fullPath = `${storagePath}/${fileId}.enc`;
-  const thumbPath = `${storagePath}/${fileId}_thumb.enc`;
-
-  // Upload de l'image principale
-  const { error: fullError } = await supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .upload(fullPath, fullEncrypted.encryptedData, {
-      contentType: 'application/octet-stream',
-      cacheControl: '3600',
-      upsert: false,
-    });
-
-  if (fullError) {
-    throw new Error(i18n.t('errors.imageUploadFailed', { message: fullError.message }));
-  }
-
-  // Upload de la miniature
-  const { error: thumbError } = await supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .upload(thumbPath, thumbEncrypted, {
-      contentType: 'application/octet-stream',
-      cacheControl: '3600',
-      upsert: false,
-    });
-
-  if (thumbError) {
-    // Nettoyer l'image principale si la miniature échoue
-    await supabaseStorage.storage.from(STORAGE_BUCKET).remove([fullPath]);
-    throw new Error(i18n.t('errors.thumbnailUploadFailed', { message: thumbError.message }));
-  }
-
-  // Obtenir les URLs publiques (le contenu reste chiffré)
-  const { data: fullUrlData } = supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(fullPath);
-
-  const { data: thumbUrlData } = supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(thumbPath);
-    
-
-  // Nettoyer les fichiers temporaires
-  try {
-    await FileSystem.deleteAsync(processedImage.fullUri, { idempotent: true });
-    await FileSystem.deleteAsync(processedImage.thumbUri, { idempotent: true });
-  } catch (e) {
-    __DEV__ && console.warn('Erreur nettoyage fichiers temporaires:', e);
-  }
-
-  return {
-    fileId,
-    storagePath,  // ✅ Inclure le storagePath pour le payload
-    fileUrl: fullUrlData.publicUrl,
-    thumbUrl: thumbUrlData.publicUrl,
-    fileKey: fullEncrypted.fileKey,
-    fileNonce: fullEncrypted.nonce,
-    thumbNonce,
-    metadata: processedImage.metadata,
-  };
-}
-
-/**
  * Télécharge et déchiffre une image
  */
 export async function downloadAndDecryptImage(
@@ -645,32 +518,6 @@ export function decryptFileKey(encryptedKey: string, e2eKey: Uint8Array): Uint8A
   }
 
   return decrypted;
-}
-
-// ============================================
-// CRÉATION DU PAYLOAD MESSAGE
-// ============================================
-
-/**
- * Crée le payload pour un message image
- */
-export function createImageMessagePayload(
-  uploadedImage: UploadedImage,
-  e2eKey: Uint8Array
-): ImageMessagePayload {
-  // Chiffrer la clé du fichier avec la clé E2E
-  const fileKeyEncrypted = encryptFileKey(uploadedImage.fileKey, e2eKey);
-
-  return {
-    type: 'image',
-    fileId: uploadedImage.fileId,
-    storagePath: uploadedImage.storagePath,  // ✅ AJOUTÉ: Inclure le chemin de stockage
-    fileKeyEncrypted,
-    fileNonce: encodeBase64(uploadedImage.fileNonce),
-    thumbKeyEncrypted: fileKeyEncrypted, // Même clé pour la miniature
-    thumbNonce: encodeBase64(uploadedImage.thumbNonce),
-    metadata: uploadedImage.metadata,
-  };
 }
 
 // ============================================
@@ -762,31 +609,6 @@ export async function clearImageCache(): Promise<void> {
 }
 
 // ============================================
-// SUPPRESSION
-// ============================================
-
-/**
- * Supprime une image du storage
- * @param storagePath - Le chemin de base (tag) utilisé lors de l'upload
- * @param fileId - L'ID du fichier
- */
-export async function deleteImageFromStorage(
-  storagePath: string,
-  fileId: string
-): Promise<void> {
-  const fullPath = `${storagePath}/${fileId}.enc`;
-  const thumbPath = `${storagePath}/${fileId}_thumb.enc`;
-
-  await supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .remove([fullPath, thumbPath]);
-
-  // Nettoyer le cache local
-  imageCache.delete(`${fileId}_full`);
-  imageCache.delete(`${fileId}_thumb`);
-}
-
-// ============================================
 // VALIDATION
 // ============================================
 
@@ -831,101 +653,6 @@ export async function validateFileSize(input: string | number): Promise<{ valid:
 // ============================================
 
 /**
- * Obtient l'extension d'un fichier
- */
-function getFileExtension(fileName: string): string {
-  const parts = fileName.split('.');
-  if (parts.length > 1) {
-    return parts[parts.length - 1].toLowerCase();
-  }
-  return '';
-}
-
-/**
- * Détermine le type MIME à partir de l'extension
- */
-function getMimeType(extension: string): string {
-  const mimeTypes: Record<string, string> = {
-    pdf: 'application/pdf',
-    doc: 'application/msword',
-    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    xls: 'application/vnd.ms-excel',
-    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    ppt: 'application/vnd.ms-powerpoint',
-    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    txt: 'text/plain',
-    csv: 'text/csv',
-    json: 'application/json',
-    xml: 'application/xml',
-    zip: 'application/zip',
-    rar: 'application/x-rar-compressed',
-    '7z': 'application/x-7z-compressed',
-    mp3: 'audio/mpeg',
-    wav: 'audio/wav',
-    mp4: 'video/mp4',
-    avi: 'video/x-msvideo',
-    mov: 'video/quicktime',
-  };
-  return mimeTypes[extension] || 'application/octet-stream';
-}
-
-/**
- * Upload un fichier chiffré sur Supabase Storage
- * @param storagePath - Le chemin de base (tag anonyme) pour le stockage
- */
-export async function uploadEncryptedFile(
-  storagePath: string,
-  fileUri: string,
-  fileName: string,
-  fileMimeType: string
-): Promise<UploadedFile> {
-  const fileId = generateAnonymousFileId();
-  const extension = getFileExtension(fileName);
-
-  // Obtenir la taille du fichier
-  const fileInfo = await FileSystem.getInfoAsync(fileUri);
-  const fileSize = fileInfo.exists ? (fileInfo as any).size || 0 : 0;
-
-  // Chiffrer le fichier
-  const encrypted = await encryptFile(fileUri);
-
-  // Path dans le storage (anonymisé avec le tag)
-  const fullPath = `${storagePath}/${fileId}.enc`;
-
-  // Upload du fichier chiffré
-  const { error } = await supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .upload(fullPath, encrypted.encryptedData, {
-      contentType: 'application/octet-stream',
-      cacheControl: '3600',
-      upsert: false,
-    });
-
-  if (error) {
-    throw new Error(i18n.t('errors.fileUploadFailed', { message: error.message }));
-  }
-
-  // Obtenir l'URL publique
-  const { data: urlData } = supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(fullPath);
-
-  return {
-    fileId,
-    storagePath,  // ✅ Inclure le storagePath pour le payload
-    fileUrl: urlData.publicUrl,
-    fileKey: encrypted.fileKey,
-    fileNonce: encrypted.nonce,
-    metadata: {
-      name: fileName,
-      size: fileSize,
-      mimeType: fileMimeType || getMimeType(extension),
-      extension,
-    },
-  };
-}
-
-/**
  * Télécharge et déchiffre un fichier
  */
 export async function downloadAndDecryptFile(
@@ -961,30 +688,6 @@ export async function downloadAndDecryptFile(
   );
 
   return tempPath;
-}
-
-// ============================================
-// FICHIERS GÉNÉRIQUES - PAYLOAD MESSAGE
-// ============================================
-
-/**
- * Crée le payload pour un message fichier
- */
-export function createFileMessagePayload(
-  uploadedFile: UploadedFile,
-  e2eKey: Uint8Array
-): FileMessagePayload {
-  // Chiffrer la clé du fichier avec la clé E2E
-  const fileKeyEncrypted = encryptFileKey(uploadedFile.fileKey, e2eKey);
-
-  return {
-    type: 'file',
-    fileId: uploadedFile.fileId,
-    storagePath: uploadedFile.storagePath,  // ✅ AJOUTÉ: Inclure le chemin de stockage
-    fileKeyEncrypted,
-    fileNonce: encodeBase64(uploadedFile.fileNonce),
-    metadata: uploadedFile.metadata,
-  };
 }
 
 // ============================================
@@ -1038,34 +741,6 @@ export async function clearFileCache(): Promise<void> {
     fileCache.clear();
   } catch (e) {
     __DEV__ && console.warn('Erreur nettoyage cache fichiers:', e);
-  }
-}
-
-// ============================================
-// FICHIERS GÉNÉRIQUES - SUPPRESSION
-// ============================================
-
-/**
- * Supprime un fichier du storage
- * @param storagePath - Le chemin de base (tag) utilisé lors de l'upload
- * @param fileId - L'ID du fichier
- */
-export async function deleteFileFromStorage(
-  storagePath: string,
-  fileId: string
-): Promise<void> {
-  const filePath = `${storagePath}/${fileId}.enc`;
-
-  await supabaseStorage.storage
-    .from(STORAGE_BUCKET)
-    .remove([filePath]);
-
-  // Nettoyer le cache local
-  if (fileCache.has(fileId)) {
-    try {
-      await FileSystem.deleteAsync(fileCache.get(fileId)!, { idempotent: true });
-    } catch (e) {}
-    fileCache.delete(fileId);
   }
 }
 
