@@ -29,17 +29,36 @@ import { secureRandomInt } from './crypto';
 /** Intervalle entre chaque slot de transmission (ms) — INCHANGÉ */
 const SLOT_INTERVAL_MS = 30_000; // 30 secondes
 
-/** Intervalle entre chaque poll (ms) — agressif pour réception appels */
-const POLL_INTERVAL_MS = 5_000; // 5 secondes
+/**
+ * Intervalle entre chaque poll (ms).
+ *
+ * ACTION 0.2: 5 s → 15 s. Chaque poll porte désormais 50 tags constants au lieu
+ * de 15 jetables, et get_messages_by_tags fait un UPSERT sur rate_limits PAR
+ * TAG : le budget serveur est `tags × polls/min`. Le poll était par ailleurs
+ * émis une fois PAR CONVERSATION à chaque tick, soit 180 × N UPSERT/min ; il
+ * n'y a plus qu'une requête par tick, soit 200 UPSERT/min quel que soit le
+ * nombre de conversations.
+ *
+ * Effet sur la réception : la latence passe de ~5 s à ~15 s au pire, ~7,5 s en
+ * moyenne, et deux fois moins quand une conversation est ouverte (la boucle de
+ * conversation tourne à la même cadence, en quinconce). C'est à comparer aux
+ * 0-60 s (30 s en moyenne) que le slot d'envoi impose déjà à l'expéditeur :
+ * la réception n'est pas le facteur limitant. Les appels entrants passent par
+ * le canal messages, mais ils sont signalés par push (pushNotificationService),
+ * le poll n'étant que le filet de secours.
+ */
+const POLL_INTERVAL_MS = 15_000; // 15 secondes
 
 /** Jitter d'ENVOI: ±30s — protège l'anonymat d'envoi.
  * Audit Fix M-04: ±10s est insuffisant contre un adversaire réseau qui peut corréler
  * les patterns temporels sur ~24h d'observation. */
 const SLOT_JITTER_MS = 30_000; // ±30 secondes
 
-/** Jitter de RÉCEPTION: ±3s — proportionnel au poll réduit.
+/** Jitter de RÉCEPTION: ±3s.
  * N'impacte PAS l'anonymat : le poll est une lecture uniforme, tous les clients
- * pollent au même rythme constant via OHTTP avec 50 tags shufflés (vrais + decoys). */
+ * pollent au même rythme constant via OHTTP avec 50 tags shufflés (vrais + decoys).
+ * ACTION 0.2: les 50 tags annoncés ici sont enfin la réalité du code
+ * (POLLING_TAG_COUNT dans api1to1.ts) — c'étaient 15 jusqu'ici. */
 const POLL_JITTER_MS = 3_000; // ±3 secondes
 
 /** Audit Fix M-04: Probabilité d'un burst de dummy traffic par slot (5%) */

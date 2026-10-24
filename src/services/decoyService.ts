@@ -12,6 +12,7 @@ import { encodeBase64, secureRandomIntRange } from './crypto';
 import { secureRpc } from './relayTransport';
 import { createSealedSenderEnvelope, isSealedSenderReady } from './sealedSender';
 import { generateRandomPushBlob } from './pushNotificationService';
+import { pickWritableDecoyTag } from './decoyTagPool';
 import * as Crypto from 'expo-crypto';
 import { AppState, AppStateStatus } from 'react-native';
 
@@ -114,11 +115,16 @@ function getRandomInt(min: number, max: number): number {
 }
 
 /**
- * Génère un tag réaliste (32 caractères hex)
- * Identique au format utilisé pour les vrais tags de session
+ * Génère un tag réaliste (64 caractères hex)
+ * Identique au format utilisé pour les vrais tags de session :
+ * 32 octets, comme deriveDirectionalTag() dans epochTags.ts. Un tag plus
+ * court séparerait les decoys des vrais messages par un simple length().
+ *
+ * ACTION 0.2bis: n'est plus la destination normale d'un decoy — c'est le REPLI
+ * quand aucun plan de poll n'a encore été publié. Voir chooseDecoyTag().
  */
 function generateRealisticTag(): string {
-  const bytes = getRandomBytes(16);
+  const bytes = getRandomBytes(32);
   return Array.from(bytes)
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
@@ -237,6 +243,36 @@ const state: DecoyState = {
 // ============================================
 
 /**
+ * ACTION 0.2bis: choisit le tag destinataire d'un message leurre.
+ *
+ * PROBLÈME FERMÉ. Jusqu'ici un leurre partait vers un tag aléatoire que
+ * personne ne pollait jamais. Deux conséquences, toutes deux exploitables par
+ * l'opérateur de la base :
+ *   1. Parmi les 50 tags d'un poll, ceux qui portaient des lignes dans
+ *      `messages` étaient exactement les vraies conversations — une jointure
+ *      SQL suffisait à trier.
+ *   2. Symétriquement, un observateur qui journalise les lectures classait
+ *      CHAQUE envoi : tag jamais lu = leurre, tag lu par quelqu'un = vrai
+ *      message. Le trafic à débit constant ne masquait donc rien pour lui.
+ *
+ * Le leurre vise maintenant un tag leurre du jour courant présent dans notre
+ * propre poll. La ligne écrite est relue par nous quelques secondes plus tard,
+ * comme une ligne déposée par un pair sur une vraie conversation.
+ *
+ * REPLI. `pickWritableDecoyTag()` rend `null` tant qu'aucun plan de poll n'a
+ * été construit (fenêtre de quelques secondes au démarrage, avant le premier
+ * tick de poll). On retombe alors sur un tag aléatoire : le repli produit une
+ * ligne orpheline, mais sauter le slot trouerait le débit constant, ce qui est
+ * la fuite la plus grave des deux.
+ */
+function chooseDecoyTag(): string {
+  const pooled = pickWritableDecoyTag();
+  if (pooled) return pooled;
+  __DEV__ && console.log('[Decoy] No poll plan yet — falling back to a random tag');
+  return generateRealisticTag();
+}
+
+/**
  * Envoie un message decoy indistinguable d'un vrai message.
  * @param forceTier - Si fourni, force la taille à matcher un tier spécifique
  */
@@ -249,7 +285,7 @@ async function sendDecoyMessage(forceTier?: 'small' | 'medium'): Promise<boolean
       return false;
     }
     
-    const tag = generateRealisticTag();
+    const tag = chooseDecoyTag();
     const payload = generateSizedPayload(forceTier);
     
     state.lastPayloadSize = payload.length;

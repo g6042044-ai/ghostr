@@ -113,6 +113,8 @@ const ALL_SECURESTORE_KEYS: readonly string[] = [
   'whisper_conversations_key_encrypted',
   'whisper_sender_token',
   'whisper_user_secret',
+  // Graine des tags leurres de polling (decoyTagPool.ts)
+  'ghostr_decoy_seed_v1',
 ];
 
 /**

@@ -4,11 +4,13 @@
 // Audit Fixes:
 //   M-03: Fisher-Yates shuffle utilise CSPRNG (Crypto.getRandomBytes) au lieu de Math.random()
 //   N-01: Tags de 32 bytes (256 bits) au lieu de 16 bytes (128 bits) — collision à ~2^128
-//   L-03: Decoy tags mixtes: 50% HKDF-persistants + 50% aléatoires par requête
+//   0.2:  Decoy tags de polling 100% HKDF-persistants, dérivés du numéro de JOUR.
+//         (L'ancienne stratégie 50/50 HKDF + aléatoire est supprimée : la moitié
+//          aléatoire suffisait à rendre l'intersection de deux polls égale à
+//          l'ensemble exact des vrais tags. Voir decoyTagPool.ts.)
 
 import { sha256 } from '@noble/hashes/sha256';
 import { hkdf } from '@noble/hashes/hkdf';
-import * as Crypto from 'expo-crypto';
 import { secureRandomInt } from './crypto';
 
 // ============================================
@@ -27,8 +29,26 @@ const TAG_DAY_DURATION_MS = 24 * 60 * 60 * 1000;
 /** Préfixe pour la dérivation HKDF des tags */
 const TAG_INFO_PREFIX = 'ghostr-epoch-tag-v2'; // v2: 256-bit tags
 
-/** Préfixe pour la dérivation HKDF des decoy tags */
-const DECOY_INFO_PREFIX = 'ghostr-epoch-decoy-v2';
+/**
+ * Préfixe pour la dérivation HKDF des decoy tags.
+ * v3: le salt porte un numéro de JOUR (24 h) et non plus un numéro d'epoch
+ * (5 min). Aucun enjeu d'interopérabilité : les tags leurres sont purement
+ * locaux, ils ne sont jamais partagés avec un pair.
+ */
+const DECOY_INFO_PREFIX = 'ghostr-epoch-decoy-v3';
+
+/**
+ * Préfixe pour la dérivation HKDF du CALENDRIER d'activité des tags leurres
+ * (ACTION 0.2bis).
+ *
+ * DOIT être distinct de DECOY_INFO_PREFIX. Le tag leurre est envoyé au serveur :
+ * si le poids d'un tag était dérivé du tag lui-même, le serveur pourrait
+ * recalculer ce poids et vérifier qu'il correspond au nombre de lignes
+ * observées — ce qui redonnerait un test d'appartenance à la famille des
+ * leurres. Avec un info distinct, le calendrier reste inaccessible sans la
+ * graine.
+ */
+const DECOY_SCHEDULE_INFO_PREFIX = 'ghostr-decoy-schedule-v1';
 
 /** 
  * ACTION 3: Préfixe pour les tags directionnels.
@@ -241,102 +261,67 @@ export function getCurrentEpochTag(seed: Uint8Array): string {
 }
 
 // ============================================
-// POLLING TAGS
-// ============================================
-
-
-
-// ============================================
-// DECOY TAGS — MIXED (Audit Fix L-03)
+// DECOY TAGS — HKDF-PERSISTANTS PAR JOUR (ACTION 0.2)
 // ============================================
 
 /**
- * Génère des decoy tags HKDF-persistants pour un epoch donné.
- * Ces tags sont les mêmes à chaque requête dans le même epoch.
+ * Dérive UN decoy tag HKDF-persistant, pour un jour et un index donnés.
+ *
+ * ACTION 0.2: le paramètre est un numéro de jour (`getTagDayNumber`), pas un
+ * numéro d'epoch de 5 minutes. C'est critique : les vrais tags directionnels
+ * tournent toutes les 24 h. Des leurres qui tourneraient toutes les 5 minutes
+ * pendant que les vrais restent stables rendraient l'attaque par intersection
+ * immédiatement praticable à nouveau.
+ *
+ * Déterministe : même graine + même jour + même index → même tag. L'index est
+ * adressable, pour que deux lots d'un même cycle de poll puissent tirer des
+ * plages disjointes et ne partagent aucun leurre.
+ * L'appelant est `decoyTagPool.ts`, qui détient la graine.
  */
-export function generateDecoyTagsForEpoch(
+export function deriveDecoyTagForDay(
   decoySeed: Uint8Array,
-  epochNumber: number,
-  count: number = 5
-): string[] {
-  const decoys: string[] = [];
+  dayNumber: number,
+  index: number
+): string {
+  const salt = new Uint8Array(12);
+  const view = new DataView(salt.buffer);
+  view.setUint32(0, Math.floor(dayNumber / 0x100000000), false);
+  view.setUint32(4, dayNumber >>> 0, false);
+  view.setUint32(8, index, false);
   
-  for (let i = 0; i < count; i++) {
-    const salt = new Uint8Array(12);
-    const view = new DataView(salt.buffer);
-    view.setUint32(0, Math.floor(epochNumber / 0x100000000), false);
-    view.setUint32(4, epochNumber >>> 0, false);
-    view.setUint32(8, i, false);
-    
-    // Audit Fix N-01: 32 bytes
-    const tagBytes = hkdf(sha256, decoySeed, salt, DECOY_INFO_PREFIX, 32);
-    
-    decoys.push(
-      Array.from(tagBytes)
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('')
-    );
-  }
+  // Audit Fix N-01: 32 bytes, comme les vrais tags
+  const tagBytes = hkdf(sha256, decoySeed, salt, DECOY_INFO_PREFIX, 32);
   
-  return decoys;
+  return Array.from(tagBytes)
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 /**
- * Génère des decoy tags entièrement aléatoires (changent à chaque requête).
- * 
- * Audit Fix L-03: Ces tags ne peuvent pas être corrélés dans le temps.
- * Le serveur ne peut pas déduire que certains tags sont toujours "vides"
- * sur une longue période → améliore la k-anonymity.
+ * ACTION 0.2bis: dérive des octets pseudo-aléatoires pour le CALENDRIER
+ * d'activité des tags leurres d'une journée.
+ *
+ * Déterministe par (graine, jour) : le calendrier survit au redémarrage de
+ * l'app. C'est indispensable — si les poids étaient retirés à chaque
+ * lancement, les écritures se répartiraient uniformément sur la journée et
+ * les tags leurres reformeraient le peloton serré qu'on cherche justement à
+ * éviter.
+ *
+ * @param decoySeed - Graine de leurres de l'appareil
+ * @param dayNumber - Numéro de jour (getTagDayNumber)
+ * @param length - Nombre d'octets voulus
  */
-function generateRandomDecoyTags(count: number): string[] {
-  const decoys: string[] = [];
-  for (let i = 0; i < count; i++) {
-    // Audit Fix N-01: 32 bytes comme les vrais tags
-    const randomBytes = Crypto.getRandomBytes(32);
-    decoys.push(
-      Array.from(randomBytes)
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('')
-    );
-  }
-  return decoys;
-}
-
-// ============================================
-// COMBINED: POLLING WITH DECOYS
-// ============================================
-
-/**
- * Retourne les tags de polling mélangés avec des decoys.
- * 
- * Audit Fixes:
- *   M-03: Shuffle CSPRNG (pas Math.random())
- *   L-03: Decoys mixtes — 50% HKDF-persistants + 50% aléatoires
- *         Les HKDF-persistants couvrent le cas "tag sans résultats = indistinguable"
- *         Les aléatoires empêchent la corrélation inter-epochs par le serveur
- */
-export function getPollingTagsWithDecoys(
-  realSeed: Uint8Array,
+export function deriveDecoyScheduleBytes(
   decoySeed: Uint8Array,
-  decoyCount: number = 6,
-  timestampMs: number = Date.now()
-): string[] {
-  const epochNumber = getEpochNumber(timestampMs);
-  const currentTag = deriveEpochTag(realSeed, epochNumber);
-  const previousTag = deriveEpochTag(realSeed, epochNumber - 1);
-  const realTags = [...new Set([currentTag, previousTag])];
-  
-  // Audit Fix L-03: 50% HKDF-persistants + 50% aléatoires
-  const hkdfCount = Math.ceil(decoyCount / 2);
-  const randomCount = decoyCount - hkdfCount;
-  
-  const hkdfDecoys = generateDecoyTagsForEpoch(decoySeed, epochNumber, hkdfCount);
-  const randomDecoys = generateRandomDecoyTags(randomCount);
-  
-  const allTags = [...realTags, ...hkdfDecoys, ...randomDecoys];
-  
-  // Audit Fix M-03: Shuffle avec CSPRNG
-  return csprngShuffle(allTags);
+  dayNumber: number,
+  length: number
+): Uint8Array {
+  const salt = new Uint8Array(8);
+  const view = new DataView(salt.buffer);
+  view.setUint32(0, Math.floor(dayNumber / 0x100000000), false);
+  view.setUint32(4, dayNumber >>> 0, false);
+
+  return hkdf(sha256, decoySeed, salt, DECOY_SCHEDULE_INFO_PREFIX, length);
 }
 
 // ============================================

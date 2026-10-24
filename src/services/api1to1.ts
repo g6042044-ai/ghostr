@@ -44,6 +44,7 @@ import { encryptAndUploadBlob, base64ToUint8Array } from './encryptedBlobService
 // PHASE 1: Epoch tags (rotation 5min) — legacy
 // ACTION 3: Tags directionnels asymétriques avec rotation 24h
 import { deriveTagSeed, getDirectionalSendTag, getDirectionalReceiveTags, csprngShuffle as csprngShuffleArray } from './epochTags';
+import { ensureDecoyTagPool, getPollingDecoyTags, publishPolledDecoyRange } from './decoyTagPool';
 // v29.0: Couche de fiabilité de livraison (outbox ACK-driven + retransmission)
 import {
   loadOutbox as reliabilityLoadOutbox,
@@ -69,6 +70,131 @@ const PROCESSED_IDS_PREFIX = 'ghostr_1to1_processed_';
 const STATUS_PREFIX = 'ghostr_1to1_status_';
 const UNREAD_COUNT_PREFIX = 'ghostr_1to1_unread_'; // v6.1: Compteur messages non lus
 const DELETED_IDS_PREFIX = 'ghostr_1to1_deleted_'; // Suppression locale: ids de messages supprimés (tombstones)
+
+// ============================================
+// ACTION 0.2 — TAILLE CONSTANTE DU POLL
+// ============================================
+//
+// Chaque poll envoie TOUJOURS exactement POLLING_TAG_COUNT tags, quel que soit
+// le nombre de conversations : le serveur n'apprend donc rien du tout sur ce
+// nombre, là où le total de 15 précédent retombait à 0 leurre dès
+// 5 conversations et révélait ensuite le compte par tranches via le nombre de
+// lots.
+//
+// 50 est le plafond serveur : get_messages_by_tags lève « Too many tags
+// (max 50) » au-delà (supabase/schema.sql:453).
+//
+// Coût base de données: get_messages_by_tags appelle check_rate_limit une fois
+// PAR TAG, soit un UPSERT sur rate_limits par tag et par poll. Le budget est
+// donc `tags × polls/min`. Avec 50 tags, la cadence de poll est passée de 5 s
+// à 15 s (constantTraffic.POLL_INTERVAL_MS) et celle du poll de conversation
+// ouverte de 3 s à 15 s, ce qui laisse la charge sous son niveau précédent :
+//   avant  — conversation ouverte : 15×20 + 15×12 = 480 UPSERT/min/appareil
+//   après  — conversation ouverte : 50×4  + 50×4  = 400 UPSERT/min/appareil
+//   avant  — au repos             : 15×12 = 180   après : 50×4 = 200
+const POLLING_TAG_COUNT = 50;
+
+// Nombre minimum de leurres garanti dans chaque poll. Plafonne le nombre de
+// vrais tags par requête : au-delà, le poll est découpé en plusieurs lots de
+// POLLING_TAG_COUNT tags. À 2 tags directionnels par conversation, un appareil
+// est couvert par un seul lot jusqu'à 22 conversations.
+const MIN_DECOYS_PER_POLL = 6;
+const MAX_REAL_TAGS_PER_POLL = POLLING_TAG_COUNT - MIN_DECOYS_PER_POLL;
+
+// ============================================
+// ACTION 0.2 — PLAN DE POLL UNIQUE
+// ============================================
+//
+// Toutes les requêtes de poll de l'appareil portent le MÊME ensemble de tags,
+// stable sur la journée. C'est la seule construction qui tient : deux formes de
+// requête différentes contenant toutes les deux les vrais tags s'annulent
+// mutuellement, leur intersection redonne exactement les vrais tags. Le poll de
+// conversation ouverte et le poll global partagent donc ce plan, et ne diffèrent
+// que par leur cadence et par les lignes qu'ils traitent.
+
+interface PollPlan {
+  /** Lots de POLLING_TAG_COUNT tags. Ordre interne non mélangé (voir buildPollBatch). */
+  batches: string[][];
+  /** Tags directionnels de réception, par sessionId. */
+  realTagsBySession: Map<string, string[]>;
+  /** Index du lot qui contient un tag donné. */
+  batchIndexByTag: Map<string, number>;
+}
+
+/**
+ * Construit le plan de poll de l'appareil pour la journée.
+ *
+ * Les vrais tags sont triés pour que le découpage en lots soit déterministe :
+ * sans tri, l'ordre de `getAllSessions()` déciderait de la composition des lots
+ * et une simple réouverture de l'app la ferait changer.
+ *
+ * Chaque lot est complété à EXACTEMENT POLLING_TAG_COUNT tags avec une plage
+ * DISJOINTE du jeu de leurres du jour : deux lots qui partageraient des leurres
+ * se désigneraient au serveur comme émis par le même appareil.
+ *
+ * `ensureDecoyTagPool()` doit avoir été attendu avant l'appel.
+ */
+function buildPollPlan(sessions: StoredSession[]): PollPlan {
+  const realTagsBySession = new Map<string, string[]>();
+  const allRealTags: string[] = [];
+  
+  for (const session of sessions) {
+    const seed = deriveTagSeed(
+      session.myIdentityKeyFingerprint,
+      session.theirIdentityKeyFingerprint
+    );
+    // ACTION 3: tags directionnels, rotation 24 h, overlap J/J-1.
+    // ACTION 0.2: le tag permanent legacy n'est plus pollé — il valait
+    // `sha256(fp1:fp2)[:16]` ou le tag d'invitation, soit 32 caractères hex
+    // quand tous les autres en font 64. Un `length()` sur les tags d'un poll
+    // isolait donc un vrai tag par conversation, sans même recouper deux
+    // requêtes, et ce tag était PERMANENT, ce qui annulait la rotation 24 h.
+    // Aucun chemin d'envoi ne l'utilise : l'envoi passe par
+    // getDirectionalSendTag, et la réponse d'acceptation d'invitation est
+    // pollée par inviteWatcher.
+    const realTags = [...new Set(getDirectionalReceiveTags(
+      seed,
+      session.myIdentityKeyFingerprint,
+      session.theirIdentityKeyFingerprint
+    ))];
+    realTagsBySession.set(session.id, realTags);
+    for (const tag of realTags) {
+      if (!allRealTags.includes(tag)) allRealTags.push(tag);
+    }
+  }
+  
+  allRealTags.sort();
+  
+  const batches: string[][] = [];
+  const batchIndexByTag = new Map<string, number>();
+  let decoyOffset = 0;
+  
+  for (let i = 0; i < allRealTags.length; i += MAX_REAL_TAGS_PER_POLL) {
+    const batchRealTags = allRealTags.slice(i, i + MAX_REAL_TAGS_PER_POLL);
+    const decoysNeeded = POLLING_TAG_COUNT - batchRealTags.length;
+    const batch = [...batchRealTags, ...getPollingDecoyTags(decoysNeeded, decoyOffset)];
+    decoyOffset += decoysNeeded;
+    
+    const batchIndex = batches.length;
+    for (const tag of batchRealTags) batchIndexByTag.set(tag, batchIndex);
+    batches.push(batch);
+  }
+  
+  // Aucune session : un lot de leurres seuls, pour que l'absence de
+  // conversation ne se lise pas comme une absence de requête.
+  if (batches.length === 0) {
+    batches.push(getPollingDecoyTags(POLLING_TAG_COUNT, 0));
+    decoyOffset = POLLING_TAG_COUNT;
+  }
+  
+  // ACTION 0.2bis: publier la plage de leurres réellement pollée, pour que les
+  // messages leurres soient adressés à des tags que cet appareil relit. Sans
+  // ça, l'écriture tomberait sur un tag absent des polls et la fuite
+  // s'inverserait : un tag écrit mais jamais lu est un leurre.
+  publishPolledDecoyRange(decoyOffset);
+  
+  return { batches, realTagsBySession, batchIndexByTag };
+}
 
 // Padding pour messages normaux (texte, réactions, accusés)
 // ACTION 18: PADDED_MESSAGE_SIZE supprimé — remplacé par UNIFORM_PADDING_TIERS (voir addUniformPadding)
@@ -874,32 +1000,18 @@ function generateMessageId(): string {
   return `msg-${Date.now()}-${Array.from(Crypto.getRandomBytes(6)).map(b => b.toString(36)).join('').substring(0, 8)}`;
 }
 
-/**
- * v20.0: Génère un tag de session avec SHA-256 (remplace XOR faible)
- * Le tag est dérivé des deux fingerprints triés, rendant impossible
- * la reconstruction sans connaître les deux fingerprints
- */
-export function generateSessionTag(session: StoredSession): string {
-  const parts = [
-    session.myIdentityKeyFingerprint,
-    session.theirIdentityKeyFingerprint,
-  ].sort();
-  
-  const combined = parts.join(':');
-  const bytes = new TextEncoder().encode(combined);
-  
-  // v20.0: Utiliser SHA-256 au lieu de XOR simple
-  const hash = sha256(bytes);
-  
-  // Prendre les 16 premiers bytes (32 caractères hex)
-  return Array.from(hash.slice(0, 16))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-function getSessionTag(session: StoredSession): string {
-  return session.tag || generateSessionTag(session);
-}
+// ACTION 0.2: `generateSessionTag()` et `getSessionTag()` sont supprimés.
+//
+// Ils fabriquaient le tag PERMANENT de conversation — `sha256(fp1:fp2)[:16]`,
+// soit 32 caractères hex quand tous les autres tags en font 64. Il était pollé
+// à chaque requête à côté des tags directionnels : le serveur disposait donc
+// d'un identifiant permanent par conversation, repérable au simple `length()`,
+// ce qui annulait la rotation de 24 h des tags directionnels.
+//
+// Plus aucun chemin d'envoi ne l'utilisait : l'envoi passe par
+// `getDirectionalSendTag()` (epochTags.ts) et la réponse d'acceptation
+// d'invitation est pollée par `inviteWatcher.ts` sur le tag d'invitation, qui
+// vit dans `pendingInviteStore` et n'a rien à voir avec ce tag-ci.
 
 // ============================================
 // GESTION DES IDs TRAITÉS
@@ -2385,49 +2497,48 @@ async function doFetchMessages1to1(
       return [];
     }
     
-    const realTag = getSessionTag(session);
     const lastPoll = since || (await getLastPollTime(sessionId));
     const processedIds = await getProcessedIds(sessionId);
     const myFingerprint = session.myIdentityKeyFingerprint;
     
-    // ACTION 3: Tags directionnels asymétriques pour le polling
-    const seed = deriveTagSeed(
-      session.myIdentityKeyFingerprint,
-      session.theirIdentityKeyFingerprint
-    );
-    const directionalTags = getDirectionalReceiveTags(seed, session.myIdentityKeyFingerprint, session.theirIdentityKeyFingerprint);
-    const legacyTag = realTag; // Tag permanent legacy (migration pre-ACTION 3)
-    const allRealTags = [...new Set([...directionalTags, legacyTag])];
+    // ACTION 0.2: ce poll envoie le PLAN COMMUN de l'appareil, pas seulement les
+    // tags de cette session.
+    //
+    // Avant: 15 tags dont 2-3 vrais de CETTE session et 12 leurres régénérés à
+    // chaque requête. Le serveur obtenait donc deux choses par simple
+    // intersection de deux polls successifs : quels tags étaient réels, et
+    // quels tags appartenaient à la MÊME conversation, puisqu'une requête ne
+    // portait qu'une conversation.
+    // Après: tous les polls de l'appareil portent le même ensemble constant.
+    await ensureDecoyTagPool();
+    const plan = buildPollPlan(sessionService.getAllSessions());
+    const allRealTags = plan.realTagsBySession.get(sessionId) || [];
     const realTagSet = new Set(allRealTags);
     __DEV__ && console.log(`[api1to1] 🔍 DIAG SESSION POLL directional tags: ${allRealTags.map(t => t.slice(0,16)+'...').join(', ')} | myFP: ${session.myIdentityKeyFingerprint} | theirFP: ${session.theirIdentityKeyFingerprint} | p_since: ${lastPoll?.toISOString() || 'null'}`);
     
-    // ACTION 06 + P1-B2: K-ANONYMITY RENFORCÉE — TOUJOURS 15 tags exactement
-    // Le serveur ne peut plus déduire le nombre de conversations.
-    // Decoys purement aléatoires (les HKDF-persistants sont statistiquement identifiables).
-    //
-    // P1-B2 (50 → 15): chaque poll déclenchait 50 UPSERT sur rate_limits Supabase.
-    // À 1000 users actifs, 600K UPSERT/min saturait la DB. 15 reste largement
-    // suffisant pour la k-anonymity (log2(15) ≈ 3.9 bits d'incertitude vs 5.6 à 50,
-    // négligeable face aux 256 bits d'entropie des tags rotatifs).
-    // Comparable à Signal qui n'a pas de tag rotation/decoys du tout.
-    const FIXED_POLLING_TAG_COUNT = 15;
-    const decoysNeeded = Math.max(0, FIXED_POLLING_TAG_COUNT - allRealTags.length);
-    const randomDecoys: string[] = [];
-    for (let i = 0; i < decoysNeeded; i++) {
-      // Decoy = random hex 64 chars (même format que les vrais tags)
-      const randomBytes = getRandomBytes(32);
-      const hexTag = Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-      randomDecoys.push(hexTag);
+    if (allRealTags.length === 0) {
+      __DEV__ && console.warn('[api1to1] Session has no directional tags:', sessionId.slice(0, 12) + '...');
+      return [];
     }
     
-    // Audit Fix M-03: Mélanger vrais tags + decoys avec CSPRNG shuffle
-    const mixedTags = [...allRealTags, ...randomDecoys];
-    const shuffledTags = csprngShuffleArray(mixedTags);
+    // Le lot qui porte les tags de cette session. Au-delà de
+    // MAX_REAL_TAGS_PER_POLL vrais tags le plan compte plusieurs lots ; on
+    // n'envoie que celui qui nous concerne, les autres sont couverts par le
+    // poll global.
+    const batchIndex = plan.batchIndexByTag.get(allRealTags[0]) ?? 0;
+    
+    // Audit Fix M-03: l'ORDRE reste aléatoire à chaque requête (CSPRNG shuffle),
+    // seul le CONTENU de l'ensemble est stable sur la journée.
+    const shuffledTags = csprngShuffleArray(plan.batches[batchIndex]);
     
     const { data, error } = await secureRpc('get_messages_by_tags', {
       p_tags: shuffledTags,
       p_since: lastPoll?.toISOString() || null,
-      p_limit: 100,
+      // ACTION 0.2: le lot couvre désormais toutes les conversations, pas une
+      // seule. Avec p_limit à 100 et un tri par date croissante, le trafic des
+      // autres conversations pourrait repousser les messages de celle-ci hors
+      // de la fenêtre. 500 est le plafond serveur (schema.sql:456).
+      p_limit: 500,
     });
     
     if (error) {
@@ -2440,10 +2551,22 @@ async function doFetchMessages1to1(
       return [];
     }
     
-    const realMessages = (data as ServerMessage[]).filter(row => realTagSet.has(row.tag));
-    __DEV__ && console.log(`[api1to1] 🔍 DIAG session poll: ${(data as any[]).length} total rows, ${realMessages.length} matched real tags`);
+    const allRows = data as ServerMessage[];
+    const realMessages = allRows.filter(row => realTagSet.has(row.tag));
+    __DEV__ && console.log(`[api1to1] 🔍 DIAG session poll: ${allRows.length} total rows, ${realMessages.length} matched real tags`);
     
+    // ACTION 0.2bis: les lignes tombant sur un tag leurre sont écartées ici,
+    // avant tout déchiffrement et tout compteur. Aucune métrique d'échec ne les
+    // voit. Le curseur, lui, doit quand même avancer sur elles — d'où le retour
+    // anticipé qui passe d'abord par setLastPollTime.
     if (realMessages.length === 0) {
+      const newestMs = allRows.reduce((acc, row) => {
+        const t = new Date(row.created_at).getTime();
+        return !Number.isNaN(t) && t > acc ? t : acc;
+      }, 0);
+      if (newestMs > 0) {
+        await setLastPollTime(sessionId, new Date(newestMs - BATCH_SINCE_LAG_MS));
+      }
       return [];
     }
     
@@ -2770,10 +2893,27 @@ async function doFetchMessages1to1(
       sendDeliveredReceipt1to1(sessionId, deliveredIds).catch(() => {});
     }
     
-    // Mettre à jour le timestamp de polling
-    if (realMessages.length > 0) {
-      const latestTime = new Date(realMessages[realMessages.length - 1].created_at);
-      await setLastPollTime(sessionId, latestTime);
+    // Mettre à jour le timestamp de polling.
+    //
+    // ACTION 0.2bis: le curseur avance sur TOUTES les lignes renvoyées, pas
+    // seulement sur celles de cette session. Il n'avançait auparavant que si
+    // `realMessages.length > 0`, ce qui était sans effet tant que le lot ne
+    // ramenait rien : les 50 tags ne portaient de trafic que sur les vraies
+    // conversations. Maintenant que les tags leurres en portent aussi, un
+    // curseur figé ferait retélécharger tous les leurres accumulés depuis le
+    // dernier vrai message, toutes les 15 s, jusqu'au plafond `p_limit: 500`
+    // — soit ~9,6 Mio par requête.
+    //
+    // Le lot est commun à toutes les conversations, donc avancer sur une ligne
+    // d'une AUTRE session est sans risque ici : ce curseur ne sert qu'à borner
+    // la fenêtre, le tri par tag reste fait par `realTagSet` ci-dessus, et
+    // chaque session a son propre curseur.
+    const newestRowMs = allRows.reduce((acc, row) => {
+      const t = new Date(row.created_at).getTime();
+      return !Number.isNaN(t) && t > acc ? t : acc;
+    }, 0);
+    if (newestRowMs > 0) {
+      await setLastPollTime(sessionId, new Date(newestRowMs - BATCH_SINCE_LAG_MS));
     }
     
     // v20.0: Filtre de sécurité final - ne jamais retourner les messages de protocole
@@ -3354,7 +3494,13 @@ function startPolling(): void {
     }
     
     if (pollState.isRunning) {
-      pollState.intervalId = setTimeout(poll, jitteredInterval(3000));
+      // ACTION 0.2: 3 s → 15 s. Ce poll porte maintenant les 50 tags du plan
+      // commun (et non plus 15 tags dont 2 de cette seule conversation), donc
+      // un UPSERT rate_limits par tag et par requête. À 3 s il coûterait à lui
+      // seul 1000 UPSERT/min. À 15 s, en quinconce avec la boucle globale à la
+      // même cadence, la conversation ouverte est servie toutes les ~7,5 s en
+      // moyenne pour 400 UPSERT/min — sous les 480 d'avant.
+      pollState.intervalId = setTimeout(poll, jitteredInterval(15000));
     }
   };
   
@@ -3378,6 +3524,24 @@ export function stopPolling(): void {
  * Utile pour recevoir les messages quand l'app s'ouvre
  */
 export async function pollAllSessions(): Promise<void> {
+  // ACTION 0.2: ce poll est devenu la boucle récurrente (performGlobalPoll), en
+  // plus de ses déclencheurs existants (montage de l'écran de liste, événements
+  // d'appel). Deux exécutions simultanées se marcheraient sur les pieds au
+  // déchiffrement : on partage l'exécution en cours plutôt que d'en lancer une
+  // seconde.
+  if (_batchPollInFlight) {
+    __DEV__ && console.log('[api1to1] 🔄 Batch poll already in flight, joining it');
+    return _batchPollInFlight;
+  }
+  _batchPollInFlight = doPollAllSessions().finally(() => {
+    _batchPollInFlight = null;
+  });
+  return _batchPollInFlight;
+}
+
+let _batchPollInFlight: Promise<void> | null = null;
+
+async function doPollAllSessions(): Promise<void> {
   __DEV__ && console.log('[api1to1] 🔄 Polling all sessions for pending messages...');
   
   // Capturer la génération au début. Si elle change pendant le poll
@@ -3396,12 +3560,14 @@ export async function pollAllSessions(): Promise<void> {
   __DEV__ && console.log('[api1to1] 🔄 Batch-polling', sessions.length, 'sessions in ONE RPC call');
   
   // BUG FIX: Collecter TOUS les tags de TOUTES les sessions en un seul batch.
-  // Avant ce fix, chaque session faisait un appel RPC séparé avec 50 tags,
-  // ce qui permettait au serveur de compter le nombre de conversations.
+  // Avant ce fix, chaque session faisait un appel RPC séparé, ce qui permettait
+  // au serveur de compter le nombre de conversations.
   //
-  // P1-B2 (50 → 15): voir commentaire dans la fonction de polling foreground.
-  // -70% load Supabase, k-anonymity log2(15)=3.9 bits encore largement suffisante.
-  const FIXED_POLLING_TAG_COUNT = 15;
+  // ACTION 0.2: le plan de poll est commun à toutes les boucles — taille
+  // constante (POLLING_TAG_COUNT) et leurres persistants sur la journée.
+  // Voir buildPollPlan et le bloc CONSTANTES en tête de fichier.
+  await ensureDecoyTagPool();
+  const plan = buildPollPlan(sessions);
   
   // 1. Construire le mapping tag → sessionId pour dispatcher les résultats
   const tagToSessionId = new Map<string, string>();
@@ -3412,70 +3578,51 @@ export async function pollAllSessions(): Promise<void> {
     session: StoredSession;
   }>();
   
-  const allRealTagsGlobal: string[] = [];
-  
   for (const session of sessions) {
-    // Ne pas poller les sessions qui ont un polling actif (conversation ouverte)
-    if (pollState.callbacks.has(session.id)) {
-      continue;
-    }
+    // ACTION 0.2: les tags des sessions en polling foreground restent dans
+    // l'ENSEMBLE POLLÉ (buildPollPlan les inclut), ils sont seulement exclus du
+    // TRAITEMENT.
+    //
+    // Avant, ils étaient retirés de la requête. Ouvrir une conversation faisait
+    // donc disparaître ses tags du poll et apparaître des leurres à la place :
+    // en comparant deux polls successifs, le serveur voyait que les tags
+    // entrants étaient toujours les mêmes (la queue du jeu de leurres) et que
+    // les sortants changeaient — ce qui désignait les sortants comme les vrais
+    // tags de la conversation ouverte.
+    // Les lignes renvoyées pour ces tags sont ignorées au dispatch (aucune
+    // entrée tagToSessionId), exactement comme celles tombant sur un leurre :
+    // c'est le poll de conversation ouverte qui les traite.
+    if (pollState.callbacks.has(session.id)) continue;
     
-    const realTag = getSessionTag(session);
-    const seed = deriveTagSeed(
-      session.myIdentityKeyFingerprint,
-      session.theirIdentityKeyFingerprint
-    );
-    // ACTION 3: Tags directionnels pour le batch polling
-    const directionalTags = getDirectionalReceiveTags(seed, session.myIdentityKeyFingerprint, session.theirIdentityKeyFingerprint);
-    const allRealTags = [...new Set([...directionalTags, realTag])];
-    const realTagSet = new Set(allRealTags);
+    const realTags = plan.realTagsBySession.get(session.id) || [];
+    if (realTags.length === 0) continue;
     
-    // Enregistrer chaque tag → session
-    for (const tag of allRealTags) {
-      if (!tagToSessionId.has(tag)) {
-        tagToSessionId.set(tag, session.id);
-        allRealTagsGlobal.push(tag);
-      }
+    for (const tag of realTags) {
+      if (!tagToSessionId.has(tag)) tagToSessionId.set(tag, session.id);
     }
     
     const processedIds = await getProcessedIds(session.id);
     sessionContexts.set(session.id, {
-      realTagSet,
+      realTagSet: new Set(realTags),
       processedIds,
       myFingerprint: session.myIdentityKeyFingerprint,
       session,
     });
   }
   
-  if (allRealTagsGlobal.length === 0) {
-    __DEV__ && console.log('[api1to1] 🔄 No tags to poll (all sessions have active foreground polling)');
-    return;
-  }
+  // 2. Un appel par lot du plan. Chaque lot porte exactement
+  //    POLLING_TAG_COUNT tags, dont au moins MIN_DECOYS_PER_POLL leurres, quel
+  //    que soit le nombre de conversations.
+  //    Audit Fix M-03: l'ordre change à chaque requête, pas le contenu.
+  const batches = plan.batches.map(batch => csprngShuffleArray(batch));
   
-  // 2. Traiter par lots de FIXED_POLLING_TAG_COUNT pour couvrir tous les vrais tags
-  // Si < 50 vrais tags → 1 seul appel, paddé à 50
-  // Si > 50 vrais tags → plusieurs appels, chacun paddé à exactement 50
-  const batches: string[][] = [];
-  for (let i = 0; i < allRealTagsGlobal.length; i += FIXED_POLLING_TAG_COUNT) {
-    const batchRealTags = allRealTagsGlobal.slice(i, i + FIXED_POLLING_TAG_COUNT);
-    
-    // Padder à exactement FIXED_POLLING_TAG_COUNT avec des decoys aléatoires
-    const decoysNeeded = Math.max(0, FIXED_POLLING_TAG_COUNT - batchRealTags.length);
-    const randomDecoys: string[] = [];
-    for (let j = 0; j < decoysNeeded; j++) {
-      const rb = getRandomBytes(32);
-      randomDecoys.push(Array.from(rb).map(b => b.toString(16).padStart(2, '0')).join(''));
-    }
-    
-    batches.push(csprngShuffleArray([...batchRealTags, ...randomDecoys]));
-  }
-  
-  // 3. Exécuter les appels RPC (1 seul dans le cas courant)
+  // 3. Exécuter les appels RPC (1 seul jusqu'à MAX_REAL_TAGS_PER_POLL vrais tags)
+  const batchSince = await getBatchSince();
   for (const batchTags of batches) {
     try {
       // DIAGNOSTIC: Log les vrais tags pollés (pas les decoys)
-      const realTagsInBatch = batchTags.filter(t => allRealTagsGlobal.includes(t));
-      __DEV__ && console.log(`[api1to1] 🔍 DIAG batch poll: ${realTagsInBatch.length} real tags, ${batchTags.length - realTagsInBatch.length} decoys`);
+      const realTagsInBatch = batchTags.filter(t => tagToSessionId.has(t));
+      __DEV__ && console.log(`[api1to1] 🔍 DIAG batch poll: ${realTagsInBatch.length} dispatchable tags, ${batchTags.length} tags sent (since: ${batchSince || 'null'})`);
       for (const rt of realTagsInBatch) {
         const sid = tagToSessionId.get(rt);
         __DEV__ && console.log(`[api1to1] 🔍   tag: ${rt.slice(0, 16)}... → session: ${sid?.slice(0, 16)}...`);
@@ -3483,8 +3630,10 @@ export async function pollAllSessions(): Promise<void> {
       
       const { data, error } = await secureRpc('get_messages_by_tags', {
         p_tags: batchTags,
-        p_since: null, // Fetch tout, le filtrage par processedIds se fait côté client
-        p_limit: 100,
+        // ACTION 0.2: curseur serveur au lieu de `null`. Le filtrage par
+        // processedIds reste en place comme garde-fou anti-doublon.
+        p_since: batchSince,
+        p_limit: 500,
       });
       
       // DIAGNOSTIC: Log what server returned
@@ -3498,6 +3647,19 @@ export async function pollAllSessions(): Promise<void> {
       if (!data || data.length === 0) {
         __DEV__ && console.log('[api1to1] 🔍 DIAG batch: server returned 0 messages');
         continue;
+      }
+
+      // ACTION 0.2: avancer le curseur sur TOUTES les lignes renvoyées, y compris
+      // celles des sessions en polling foreground : celles-là ont leur propre
+      // curseur par session, qui n'avance que sur réception effective. Rien n'est
+      // donc perdu, et le curseur global ne reste pas bloqué le temps qu'une
+      // conversation est ouverte.
+      let newestCreatedAt: number | null = null;
+      for (const row of (data as ServerMessage[])) {
+        const t = new Date(row.created_at).getTime();
+        if (!Number.isNaN(t) && (newestCreatedAt === null || t > newestCreatedAt)) {
+          newestCreatedAt = t;
+        }
       }
 
       // 4. Dispatcher les résultats par session
@@ -3655,6 +3817,10 @@ export async function pollAllSessions(): Promise<void> {
         } catch (error) {
           __DEV__ && console.error('[api1to1] 🔄 Process error for session:', sessionId.slice(0, 12) + '...', error);
         }
+      }
+      
+      if (newestCreatedAt !== null) {
+        await setBatchSince(new Date(newestCreatedAt - BATCH_SINCE_LAG_MS).toISOString());
       }
     } catch (error) {
       __DEV__ && console.error('[api1to1] 🔄 Batch poll RPC error:', error);
@@ -4828,9 +4994,74 @@ async function getLastPollTime(sessionId: string): Promise<Date | null> {
   }
 }
 
+// ACTION 0.2: curseur de lecture du batch poll.
+//
+// Le batch poll demandait `p_since: null` avec `p_limit: 100` et un tri par date
+// CROISSANTE : dès que plus de 100 messages non expirés vivaient sur les tags
+// pollés, il renvoyait indéfiniment les 100 plus anciens et ne voyait plus jamais
+// les nouveaux. Le curseur porte le `created_at` SERVEUR du dernier message vu,
+// comme les curseurs par session — pas une heure locale, donc aucune dérive
+// d'horloge possible.
+const BATCH_SINCE_KEY = 'ghostr_1to1_batch_since_v1';
+
+// Marge de recul du curseur, appliquée aux DEUX boucles de poll (batch et
+// conversation ouverte).
+//
+// ACTION 0.2bis: ramenée de 120 s à 5 s. La marge couvre une seule chose — une
+// ligne insérée par une transaction ouverte AVANT notre lecture mais validée
+// APRÈS : son `created_at` (`now()`, pris à l'ouverture de la transaction) est
+// plus ancien que le curseur qu'on s'apprête à écrire, et sans marge elle
+// serait sautée définitivement. `send_sealed_message` porte
+// `statement_timeout = '5s'` (`schema.sql:372`), donc aucune insertion ne peut
+// être validée avec un `created_at` de plus de 5 s : la marge est exactement
+// bornée, elle n'a pas à être devinée.
+//
+// Le coût est linéaire et il compte maintenant que les tags leurres portent du
+// trafic : avec un poll toutes les 15 s, chaque ligne est retéléchargée
+// `1 + lag / 15 s` fois. À 120 s c'était 9 fois, soit ~26 Mio/h au lieu de
+// ~2,9. À 5 s c'est 1,33 fois.
+//
+// CE QUI EST DÉPLACÉ: la marge de 120 s re-proposait aussi les lignes dont le
+// TRAITEMENT local avait échoué (déchiffrement impossible). À 5 s une telle
+// ligne n'a plus qu'une tentative supplémentaire. C'est assumé : un échec de
+// déchiffrement vient d'un état de ratchet incompatible, il est permanent, et
+// le re-télécharger indéfiniment ne le répare pas. La reprise des messages
+// réellement perdus est le rôle de reliabilityService, pas du curseur.
+const BATCH_SINCE_LAG_MS = 5_000;
+let _batchSinceCache: string | null | undefined;
+
+async function getBatchSince(): Promise<string | null> {
+  if (_batchSinceCache !== undefined) return _batchSinceCache;
+  try {
+    _batchSinceCache = (await secureGet(BATCH_SINCE_KEY)) || null;
+  } catch {
+    _batchSinceCache = null;
+  }
+  return _batchSinceCache;
+}
+
+async function setBatchSince(createdAt: string): Promise<void> {
+  const current = await getBatchSince();
+  if (current && new Date(createdAt) <= new Date(current)) return;
+  _batchSinceCache = createdAt;
+  try {
+    await secureSet(BATCH_SINCE_KEY, createdAt);
+  } catch (error) {
+    __DEV__ && console.error('[api1to1] Error setting batch since:', error);
+  }
+}
+
 async function setLastPollTime(sessionId: string, time: Date): Promise<void> {
   try {
     const key = LAST_POLL_PREFIX + sessionId;
+    // ACTION 0.2bis: garde de monotonie, comme setBatchSince. Le curseur est
+    // écrit à `plus récente ligne vue - BATCH_SINCE_LAG_MS` : quand une seule
+    // ligne arrive et qu'elle a moins de 5 s de plus que le curseur courant, le
+    // calcul reculerait le curseur et la fenêtre serait relue indéfiniment sans
+    // jamais progresser. Les remises à zéro volontaires du curseur passent par
+    // secureRemove sur la clé, pas par cette fonction.
+    const current = await getLastPollTime(sessionId);
+    if (current && time <= current) return;
     await secureSet(key, time.toISOString());
   } catch (error) {
     __DEV__ && console.error('[api1to1] Error setting poll time:', error);
@@ -6070,34 +6301,27 @@ async function performGlobalPoll(): Promise<void> {
     const openSessions = Array.from(pollState.callbacks.keys());
     __DEV__ && console.log('[api1to1] 🌍 Global poll tick, sessions:', sessions.length, ', open:', openSessions.length);
     
-    for (const session of sessions) {
-      try {
-        // v6.1: Ne pas poller les sessions qui ont un polling actif (conversation ouverte)
-        // Cela évite les conflits entre le polling global et le polling par session
-        if (pollState.callbacks.has(session.id)) {
-          continue;
-        }
-        
-        // Vérifier les nouveaux messages pour cette session
-        const messages = await fetchMessages1to1(session.id);
-        
-        if (messages.length > 0) {
-          __DEV__ && console.log('[api1to1] 🌍 Got', messages.length, 'new messages for session:', session.id.slice(0, 12) + '...');
-        }
-        
-        // Notifier les callbacks pour chaque nouveau message
-        for (const message of messages) {
-          for (const callback of globalPollState.newMessageCallbacks) {
-            try {
-              callback(session.id, message);
-            } catch (e) {
-              __DEV__ && console.error('[api1to1] Global callback error:', e);
-            }
-          }
-        }
-      } catch (e) {
-        __DEV__ && console.error('[api1to1] Global poll error for session:', session.id, e);
-      }
+    // ACTION 0.2: une SEULE requête par tick, via le batch poll.
+    //
+    // Avant, ce tick appelait fetchMessages1to1() session par session : une
+    // requête RPC PAR CONVERSATION, toutes les 5 secondes, chacune ne portant
+    // que les 2 tags d'une seule conversation noyés dans des leurres jetables.
+    // Le serveur en tirait trois choses : quels tags étaient réels (intersection
+    // de deux requêtes), quels tags appartenaient à la même conversation (une
+    // requête = une conversation), et le nombre de conversations (le nombre de
+    // requêtes par tick).
+    // Le batch poll porte le plan commun : un seul ensemble de
+    // POLLING_TAG_COUNT tags, constant sur la journée, pour toutes les
+    // conversations. Il notifie les mêmes callbacks globaux et envoie les mêmes
+    // accusés de livraison.
+    //
+    // Charge serveur : get_messages_by_tags fait un UPSERT sur rate_limits par
+    // tag. Avant, à N conversations : N × 15 tags × 12 polls/min = 180 N
+    // UPSERT/min/appareil. Après : 50 × 4 = 200, indépendamment de N.
+    try {
+      await pollAllSessions();
+    } catch (e) {
+      __DEV__ && console.error('[api1to1] Global poll batch error:', e);
     }
 
     // ─────────────────────────────────────────────────────────────────────
