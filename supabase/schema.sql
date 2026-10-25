@@ -7,14 +7,14 @@
 --
 -- ARCHITECTURE:
 --   • 3 tables publiques: messages, call_signals, rate_limits
---   • 1 table monitoring: blob_cleanup_log
 --   • 4 RPCs publiques: send_sealed_message, get_messages_by_tags,
 --                        send_call_signal, get_call_signals_by_tags
 --   • 3 RPCs internes: check_rate_limit, cleanup_old_data,
 --                        is_handshake_payload
---   • 1 RPC maintenance: cleanup_expired_blobs
 --   • 2 buckets storage: ghostr-blobs (v26.0 médias E2E), whisper-media (legacy)
---   • Cron jobs: cleanup messages/signaux (15min), cleanup blobs (6h)
+--   • Cron job: cleanup messages/signaux (15min)
+--   • Blobs > 48 h : purgés par le gateway OHTTP via l'API Storage
+--     (ohttp-gateway/blobSweep.js, toutes les 6 h), PAS par SQL — voir § 12
 --
 -- PRINCIPES SÉCURITÉ:
 --   1. Zero-knowledge: le serveur ne peut lire aucun contenu
@@ -54,16 +54,19 @@ DROP FUNCTION IF EXISTS public.check_rate_limit(TEXT, TEXT, INTEGER) CASCADE;
 DROP FUNCTION IF EXISTS public.cleanup_old_data(INTEGER, INTEGER, INTEGER, INTEGER) CASCADE;
 DROP FUNCTION IF EXISTS public.cleanup_old_data(INTEGER, INTEGER, INTEGER) CASCADE;
 DROP FUNCTION IF EXISTS public.is_handshake_payload(TEXT) CASCADE;
-DROP FUNCTION IF EXISTS public.cleanup_expired_blobs() CASCADE;
 
 -- Anciennes signatures (compat drop)
 DROP FUNCTION IF EXISTS public.cleanup_old_data(INTEGER, INTEGER) CASCADE;
+-- cleanup_expired_blobs() : retirée le 2026-10-25 (0.3bis). Elle n'a jamais pu
+-- fonctionner (SET ROLE interdit en SECURITY DEFINER) et un DELETE SQL sur
+-- storage.objects laisse le fichier orphelin. Le gateway purge via l'API.
+DROP FUNCTION IF EXISTS public.cleanup_expired_blobs() CASCADE;
 DROP FUNCTION IF EXISTS public.send_message(TEXT, TEXT, TEXT) CASCADE;
 DROP FUNCTION IF EXISTS public.send_call_signal(TEXT, TEXT, TEXT) CASCADE;
 
 -- Tables
 DROP TABLE IF EXISTS public.app_notice CASCADE;
-DROP TABLE IF EXISTS public.blob_cleanup_log CASCADE;
+DROP TABLE IF EXISTS public.blob_cleanup_log CASCADE; -- legacy (0.3bis), n'est plus recréée
 DROP TABLE IF EXISTS public.rate_limits CASCADE;
 DROP TABLE IF EXISTS public.call_signals CASCADE;
 DROP TABLE IF EXISTS public.messages CASCADE;
@@ -109,7 +112,7 @@ END $$;
 
 DO $$
 BEGIN
-  PERFORM cron.unschedule('cleanup-ghostr-blobs');
+  PERFORM cron.unschedule('cleanup-ghostr-blobs'); -- legacy (0.3bis), n'est plus replanifiée
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 
@@ -178,17 +181,6 @@ CREATE TABLE public.rate_limits (
 );
 
 COMMENT ON TABLE public.rate_limits IS 'Compteurs rate limiting — fenêtre glissante vraie (sliding window, R-09)';
-
-
--- ── Monitoring blob cleanup ──
-CREATE TABLE public.blob_cleanup_log (
-    id            BIGSERIAL   PRIMARY KEY,
-    cleaned_at    TIMESTAMPTZ DEFAULT now(),
-    blobs_deleted INTEGER     DEFAULT 0,
-    bytes_freed   BIGINT      DEFAULT 0
-);
-
-COMMENT ON TABLE public.blob_cleanup_log IS 'Log du nettoyage automatique des blobs expirés';
 
 
 -- ── App notice (kill-switch / deprecation banner) ──
@@ -666,59 +658,13 @@ COMMENT ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER, INTEGER)
     IS 'TTL cleanup par lots: 48h trafic, 30j handshake (hors invite_ttl_exempt), 24h signaux, 2min rate limits; au plus p_lot messages par appel. Cron: */15 * * * *';
 
 
--- ── Cleanup blobs expirés (cron toutes les 6h) ──
--- Supabase protège storage.objects via un trigger (protect_delete) appartenant
--- à supabase_storage_admin. On assume ce rôle temporairement pour supprimer.
-CREATE OR REPLACE FUNCTION public.cleanup_expired_blobs()
-RETURNS JSON
-LANGUAGE plpgsql SECURITY DEFINER
-SET search_path = public, storage
-SET statement_timeout = '60s'
-AS $$
-DECLARE
-    v_count INTEGER := 0;
-    v_bytes BIGINT := 0;
-    v_name  TEXT;
-BEGIN
-    -- Compter les blobs expirés
-    SELECT count(*), coalesce(sum((metadata->>'size')::bigint), 0)
-    INTO v_count, v_bytes
-    FROM storage.objects
-    WHERE bucket_id = 'ghostr-blobs'
-      AND created_at < now() - INTERVAL '48 hours';
-
-    IF v_count > 0 THEN
-        -- Supprimer via le rôle storage admin (propriétaire du trigger)
-        SET LOCAL ROLE supabase_storage_admin;
-
-        DELETE FROM storage.objects
-        WHERE bucket_id = 'ghostr-blobs'
-          AND created_at < now() - INTERVAL '48 hours';
-
-        RESET ROLE;
-
-        INSERT INTO public.blob_cleanup_log (blobs_deleted, bytes_freed)
-        VALUES (v_count, v_bytes);
-    END IF;
-
-    RETURN json_build_object(
-        'blobs_deleted', v_count,
-        'bytes_freed',   v_bytes,
-        'executed_at',   now()
-    );
-EXCEPTION WHEN OTHERS THEN
-    -- Toujours restaurer le rôle en cas d'erreur
-    RESET ROLE;
-    RETURN json_build_object(
-        'blobs_deleted', 0,
-        'error',         SQLERRM,
-        'executed_at',   now()
-    );
-END;
-$$;
-
-COMMENT ON FUNCTION public.cleanup_expired_blobs()
-    IS 'Supprime les blobs chiffrés > 48h du bucket ghostr-blobs. Cron: 0 */6 * * *';
+-- ── Blobs expirés : PAS de fonction SQL ──
+-- L'ancienne cleanup_expired_blobs() (SET LOCAL ROLE supabase_storage_admin
+-- puis DELETE sur storage.objects) n'a jamais pu s'exécuter : « cannot set
+-- parameter "role" within security-definer function » (PostgreSQL 17.6), et
+-- postgres n'est pas membre de supabase_storage_admin en prod. Un DELETE SQL
+-- laisserait de toute façon le fichier orphelin sur le disque. La purge des
+-- blobs > 48 h est faite par le gateway via l'API Storage (§ 12).
 
 
 -- ── get_app_notice ──
@@ -844,7 +790,6 @@ CREATE POLICY "ghostr_blobs_delete"
 ALTER TABLE public.messages     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.call_signals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.rate_limits  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.blob_cleanup_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.app_notice   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.reports      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.invite_ttl_exempt ENABLE ROW LEVEL SECURITY;
@@ -864,10 +809,6 @@ CREATE POLICY rate_limits_deny_direct
     TO anon, authenticated
     USING (false) WITH CHECK (false);
 
-CREATE POLICY blob_cleanup_log_deny_direct
-    ON public.blob_cleanup_log
-    TO anon, authenticated
-    USING (false) WITH CHECK (false);
 
 -- app_notice: aucun accès direct, lecture uniquement via la RPC SECURITY DEFINER.
 CREATE POLICY app_notice_deny_direct
@@ -899,7 +840,6 @@ GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
 REVOKE ALL ON public.messages          FROM anon, authenticated;
 REVOKE ALL ON public.call_signals      FROM anon, authenticated;
 REVOKE ALL ON public.rate_limits       FROM anon, authenticated;
-REVOKE ALL ON public.blob_cleanup_log  FROM anon, authenticated;
 REVOKE ALL ON public.app_notice        FROM anon, authenticated;
 REVOKE ALL ON public.reports           FROM anon, authenticated;
 REVOKE ALL ON public.invite_ttl_exempt FROM anon, authenticated;
@@ -907,13 +847,9 @@ REVOKE ALL ON public.invite_ttl_exempt FROM anon, authenticated;
 GRANT ALL ON public.messages          TO service_role;
 GRANT ALL ON public.call_signals      TO service_role;
 GRANT ALL ON public.rate_limits       TO service_role;
-GRANT ALL ON public.blob_cleanup_log  TO service_role;
 GRANT ALL ON public.app_notice        TO service_role;
 GRANT ALL ON public.reports           TO service_role;
 GRANT ALL ON public.invite_ttl_exempt TO service_role;
-
--- Séquence
-GRANT USAGE, SELECT ON SEQUENCE public.blob_cleanup_log_id_seq TO service_role;
 
 -- RPCs publiques: accessibles par anon/authenticated
 GRANT EXECUTE ON FUNCTION public.send_sealed_message(TEXT, TEXT, INTEGER)               TO anon, authenticated;
@@ -925,13 +861,11 @@ GRANT EXECUTE ON FUNCTION public.submit_report(TEXT, TEXT, TEXT, TEXT)          
 
 -- RPCs internes: service_role uniquement
 --
--- PUBLIC D'ABORD, ET POUR LES QUATRE. `CREATE FUNCTION` accorde EXECUTE à
+-- PUBLIC D'ABORD, ET POUR LES TROIS. `CREATE FUNCTION` accorde EXECUTE à
 -- PUBLIC par défaut, et `anon` est membre de PUBLIC : un REVOKE ciblé sur
 -- anon/authenticated ne retire donc RIEN tant que PUBLIC garde le droit.
 -- Sans ces lignes, un porteur de la clé anon — elle est embarquée dans le
--- binaire de l'app — appelle cleanup_old_data(0, 0, 0) → purge totale, ou
--- cleanup_expired_blobs() en boucle → scan + DELETE sur storage.objects avec
--- 60 s de budget, en tant que supabase_storage_admin.
+-- binaire de l'app — appelle cleanup_old_data(0, 0, 0) → purge totale.
 -- Contrôle : deux pièges rendent le test à l'œil faux. Un proacl NULL signifie
 -- « droits par défaut », donc PUBLIC A EXECUTE ; et chercher la chaîne « =X/ »
 -- attrape aussi l'entrée d'un rôle nommé (« postgres=X/postgres »). Seul le
@@ -946,12 +880,9 @@ REVOKE EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER, IN
 REVOKE EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER, INTEGER)FROM anon, authenticated;
 REVOKE EXECUTE ON FUNCTION public.is_handshake_payload(TEXT)                  FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.is_handshake_payload(TEXT)                  FROM anon, authenticated;
-REVOKE EXECUTE ON FUNCTION public.cleanup_expired_blobs()                     FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.cleanup_expired_blobs()                     FROM anon, authenticated;
 GRANT  EXECUTE ON FUNCTION public.check_rate_limit(TEXT, TEXT, INTEGER)       TO service_role;
 GRANT  EXECUTE ON FUNCTION public.cleanup_old_data(INTEGER, INTEGER, INTEGER, INTEGER)TO service_role;
 GRANT  EXECUTE ON FUNCTION public.is_handshake_payload(TEXT)                  TO service_role;
-GRANT  EXECUTE ON FUNCTION public.cleanup_expired_blobs()                     TO service_role;
 
 -- Verrouiller les DEFAULT PRIVILEGES Supabase
 -- Une fonction créée par postgres dans public reçoit EXECUTE par DEUX voies,
@@ -1007,37 +938,17 @@ EXCEPTION WHEN OTHERS THEN
     RAISE NOTICE '  SELECT cron.schedule(''cleanup-ghostr'', ''*/15 * * * *'', ''SELECT public.cleanup_old_data()'');';
 END $cron_block_1$;
 
-DO $cron_block_2$
-BEGIN
-    PERFORM cron.schedule(
-        'cleanup-ghostr-blobs',
-        '0 */6 * * *',
-        'SELECT public.cleanup_expired_blobs()'
-    );
-    RAISE NOTICE 'pg_cron: cleanup-ghostr-blobs scheduled (every 6h)';
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'pg_cron: extension not available. Activate it in Dashboard, then run:';
-    RAISE NOTICE '  SELECT cron.schedule(''cleanup-ghostr-blobs'', ''0 */6 * * *'', ''SELECT public.cleanup_expired_blobs()'');';
-END $cron_block_2$;
+-- PAS de tâche cron pour les blobs (0.3bis, 2026-10-25). La suppression
+-- d'objets Storage doit passer par l'API Storage, jamais par SQL : un DELETE
+-- sur storage.objects laisse le fichier orphelin (doc Supabase), et le
+-- trigger protect_delete le bloque de toute façon. Le gateway OHTTP, seul
+-- client du bucket, liste et supprime les blobs > 48 h toutes les 6 h avec
+-- la clé anon (policies ghostr_blobs_download / ghostr_blobs_delete) :
+-- ohttp-gateway/blobSweep.js, compteurs blob_sweep_* dans /metrics.
 
 
 -- ============================================================================
--- 13. INDEX STORAGE (après création du bucket)
--- ============================================================================
--- Accélère le cleanup DELETE WHERE created_at < NOW() - 48h
-
-DO $$
-BEGIN
-    CREATE INDEX IF NOT EXISTS idx_ghostr_blobs_created_at
-        ON storage.objects (created_at)
-        WHERE bucket_id = 'ghostr-blobs';
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Could not create index on storage.objects (owned by supabase_storage_admin). Cleanup will still work, just slower on large datasets.';
-END $$;
-
-
--- ============================================================================
--- 14. VÉRIFICATION FINALE
+-- 13. VÉRIFICATION FINALE
 -- ============================================================================
 
 DO $$
@@ -1051,7 +962,7 @@ BEGIN
     SELECT count(*) INTO v_tables
     FROM information_schema.tables
     WHERE table_schema = 'public'
-      AND table_name IN ('messages', 'call_signals', 'rate_limits', 'blob_cleanup_log', 'app_notice');
+      AND table_name IN ('messages', 'call_signals', 'rate_limits', 'app_notice');
 
     SELECT count(*) INTO v_functions
     FROM information_schema.routines
@@ -1059,13 +970,15 @@ BEGIN
       AND routine_name IN (
         'send_sealed_message', 'get_messages_by_tags',
         'send_call_signal', 'get_call_signals_by_tags',
-        'check_rate_limit', 'cleanup_old_data', 'cleanup_expired_blobs',
+        'check_rate_limit', 'cleanup_old_data',
         'get_app_notice'
       );
 
+    -- whisper-media n'est plus créé par ce script (P0-A2) : un seul bucket
+    -- attendu, trois policies ghostr_blobs_*.
     SELECT count(*) INTO v_buckets
     FROM storage.buckets
-    WHERE id IN ('ghostr-blobs', 'whisper-media');
+    WHERE id = 'ghostr-blobs';
 
     SELECT count(*) INTO v_policies
     FROM pg_policies
@@ -1082,14 +995,14 @@ BEGIN
     RAISE NOTICE '════════════════════════════════════════════════';
     RAISE NOTICE '  GHOSTR SCHEMA v26.0 — DEPLOYMENT COMPLETE';
     RAISE NOTICE '════════════════════════════════════════════════';
-    RAISE NOTICE '  Tables:             % / 5 expected', v_tables;
-    RAISE NOTICE '  Functions (RPCs):   % / 8 expected', v_functions;
-    RAISE NOTICE '  Storage buckets:    % / 2 expected', v_buckets;
-    RAISE NOTICE '  Storage policies:   % / 6 expected', v_policies;
+    RAISE NOTICE '  Tables:             % / 4 expected', v_tables;
+    RAISE NOTICE '  Functions (RPCs):   % / 7 expected', v_functions;
+    RAISE NOTICE '  Storage buckets:    % / 1 expected', v_buckets;
+    RAISE NOTICE '  Storage policies:   % / 3 expected', v_policies;
     RAISE NOTICE '  Public indexes:     % / 4 expected', v_indexes;
     RAISE NOTICE '════════════════════════════════════════════════';
 
-    IF v_tables    = 5 AND v_functions = 8 AND v_buckets = 2 AND v_policies >= 6 THEN
+    IF v_tables    = 4 AND v_functions = 7 AND v_buckets = 1 AND v_policies >= 3 THEN
         RAISE NOTICE '  ✅ ALL CHECKS PASSED';
     ELSE
         RAISE WARNING '  ⚠️  SOME CHECKS FAILED — review above counts';
@@ -1105,12 +1018,10 @@ END $$;
 -- Messages actifs:
 --   SELECT count(*), min(created_at), max(created_at) FROM messages;
 --
--- Blobs actifs:
---   SELECT count(*), pg_size_pretty(coalesce(sum((metadata->>'size')::bigint), 0))
+-- Blobs actifs (doivent tous avoir < 48 h, le gateway balaie toutes les 6 h) :
+--   SELECT count(*), now() - min(created_at) AS age_plus_ancien,
+--          pg_size_pretty(coalesce(sum((metadata->>'size')::bigint), 0))
 --   FROM storage.objects WHERE bucket_id = 'ghostr-blobs';
---
--- Dernier cleanup:
---   SELECT * FROM blob_cleanup_log ORDER BY cleaned_at DESC LIMIT 5;
 --
 -- Rate limits actifs:
 --   SELECT * FROM rate_limits ORDER BY window_start DESC LIMIT 20;
@@ -1121,7 +1032,6 @@ END $$;
 --
 -- Cleanup manuel:
 --   SELECT cleanup_old_data();
---   SELECT cleanup_expired_blobs();
 --
 -- Cron jobs actifs (si pg_cron):
 --   SELECT * FROM cron.job;

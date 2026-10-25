@@ -2,7 +2,7 @@ FROM node:20-alpine
 WORKDIR /app
 COPY package.json ./
 RUN npm install --production
-COPY server.js cluster.js keyTransparencyTree.js push-integration.js ./
+COPY server.js cluster.js keyTransparencyTree.js push-integration.js blobSweep.js ./
 RUN adduser -D ghostr && mkdir -p /data && chown ghostr:ghostr /data
 USER ghostr
 EXPOSE 3100

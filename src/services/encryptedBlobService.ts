@@ -390,7 +390,8 @@ export async function downloadAndDecryptBlob(
 
 /**
  * Supprime un blob du storage via OHTTP relay (best-effort).
- * En pratique, le cron job côté serveur nettoie les blobs > 48h.
+ * En pratique, le gateway balaie le bucket toutes les 6 h et supprime les
+ * blobs > 48 h via l'API Storage (ohttp-gateway/blobSweep.js).
  */
 export async function deleteBlob(blobId: string): Promise<void> {
   try {

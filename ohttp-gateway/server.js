@@ -18,6 +18,9 @@ const nacl = require('tweetnacl');
 // Push Notification Integration (Split-Trust)
 const { initPushIntegration, triggerPushNotification, recordRealActivity } = require('./push-integration');
 
+// 0.3bis : balayage périodique des blobs > 48 h via l'API Storage
+const { startBlobSweep, BLOB_TTL_MS } = require('./blobSweep');
+
 // P0: Key Transparency — optional, gateway works without it
 let createTransparencyTree = null;
 try {
@@ -448,6 +451,11 @@ const METRICS = {
   // Push intégration
   push_blobs_forwarded: 0,
   push_blobs_urgent: 0,
+  // Balayage des blobs expirés (0.3bis) — comptes agrégés uniquement
+  blob_sweep_runs: 0,
+  blob_sweep_deleted: 0,
+  blob_sweep_errors: 0,
+  blob_sweep_last_at: 0,
   // Sealed sender rotation
   sealed_sender_rotated_at: 0, // sera rempli au démarrage
 };
@@ -1824,6 +1832,43 @@ loadKeys();
 loadSealedSenderKeys();
 startKeyRotation(); // ACTION 10: Schedule automatic key rotation
 startSealedSenderRotation(); // P1-B1: Rotation 30j sealed sender
+
+// 0.3bis : balayage des blobs expirés du bucket ghostr-blobs, toutes les 6 h,
+// premier passage 60 s après le démarrage. Défaut ACTIF (aucune variable à
+// ajouter au déploiement). GATEWAY_BLOB_SWEEP=false le désactive,
+// GATEWAY_BLOB_SWEEP_DRY_RUN=true liste sans supprimer. Logs : comptes
+// seulement, jamais un nom de blob (règle 0.5).
+const GATEWAY_BLOB_SWEEP = process.env.GATEWAY_BLOB_SWEEP !== 'false';
+const GATEWAY_BLOB_SWEEP_DRY_RUN = process.env.GATEWAY_BLOB_SWEEP_DRY_RUN === 'true';
+const BLOB_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+function startBlobSweepIfConfigured() {
+  if (!GATEWAY_BLOB_SWEEP) {
+    console.log('🧹 Blob sweep DISABLED (GATEWAY_BLOB_SWEEP=false): expired blobs are not purged.');
+    return;
+  }
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    console.warn('🧹 Blob sweep SKIPPED: SUPABASE_URL / SUPABASE_ANON_KEY not set.');
+    return;
+  }
+  startBlobSweep({
+    supabaseUrl: SUPABASE_URL,
+    anonKey: SUPABASE_ANON_KEY,
+    intervalMs: BLOB_SWEEP_INTERVAL_MS,
+    dryRun: GATEWAY_BLOB_SWEEP_DRY_RUN,
+    onResult: (r) => {
+      METRICS.blob_sweep_runs++;
+      METRICS.blob_sweep_deleted += r.deleted;
+      METRICS.blob_sweep_last_at = Date.now();
+      console.log(`🧹 Blob sweep${r.dryRun ? ' (dry run)' : ''}: listed=${r.listed} expired=${r.expired} deleted=${r.deleted} skipped=${r.skipped} pages=${r.pages}`);
+    },
+    onError: () => {
+      METRICS.blob_sweep_errors++;
+      console.error('🧹 Blob sweep failed (Storage API error, see blob_sweep_errors)');
+    },
+  });
+  console.log(`🧹 Blob sweep scheduled every ${BLOB_SWEEP_INTERVAL_MS / 3600000}h, TTL ${BLOB_TTL_MS / 3600000}h${GATEWAY_BLOB_SWEEP_DRY_RUN ? ' (DRY RUN: list only)' : ''}`);
+}
+startBlobSweepIfConfigured();
 
 // PRODUCTION FIX: Load persisted state and schedule periodic saves
 loadCertUsage();
