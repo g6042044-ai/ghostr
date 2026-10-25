@@ -1,6 +1,11 @@
 {
   "name": "ghostr",
   "version": "3.0.0",
+  "description": "End-to-end encrypted messenger: post-quantum Triple Ratchet, sealed sender, OHTTP split-trust routing. No phone number, no email.",
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=20"
+  },
   "main": "expo/AppEntry.js",
   "scripts": {
     "start": "expo start",
@@ -78,6 +83,5 @@
   },
   "overrides": {
     "expo-font": "14.0.12"
-  },
-  "private": true
+  }
 }
