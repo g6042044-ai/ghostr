@@ -17,6 +17,10 @@ GoogleService-Info.plist
 *.crt
 secrets/
 credentials/
+# Identifiants de signature EAS (mots de passe du keystore en clair).
+# Retiré du suivi le 2026-10-25 (tâche 1.1) ; purge de l'historique au moment
+# de publier, voir plan_actions.md.
+credentials.json
 
 # Clé privée Ed25519 du système d'avis (kill-switch)
 # La publique est embarquée dans le code source. La privée reste offline.
