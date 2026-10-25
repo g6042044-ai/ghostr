@@ -90,8 +90,6 @@ export {
   kyberDecapsulate,
   chunkPublicKey,
   chunkCiphertext,
-  reconstructPublicKey,
-  reconstructCiphertext,
   serializeKyberPublicKey,
   deserializeKyberPublicKey,
   serializeKyberCiphertext,
@@ -143,7 +141,6 @@ export {
   rotateSPQR,
   encapsulatePQ,
   decapsulatePQ,
-  mixPQSecrets,
   prepareBraidChunks,
   processReceivedChunks,
   deriveHybridRootKey,
@@ -210,10 +207,6 @@ export {
 
 export {
   type PaddingSize,
-  type PaddingConfig,
-  type PaddingStats,
-  DEFAULT_PADDING_CONFIG,
-  BUCKET_SIZES,
   padMessage,
   unpadMessage,
   padMessageConstantTime,

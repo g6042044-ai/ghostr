@@ -44,7 +44,8 @@ export type SecurityEventType =
   | 'SUSPICIOUS_ACTIVITY'
   | 'BRUTE_FORCE_ATTEMPT'
   | 'RATE_LIMIT_EXCEEDED'
-  
+  | 'AUTO_WIPE_TRIGGERED'
+
   // Événements informatifs
   | 'SECURITY_CHECK_PASSED'
   | 'KEY_ROTATION'
@@ -201,6 +202,7 @@ class SecurityLoggerImpl {
   private getSeverity(type: SecurityEventType): SecurityEvent['severity'] {
     const criticalTypes: SecurityEventType[] = [
       'CERTIFICATE_MISMATCH', 'HOOK_DETECTED', 'BRUTE_FORCE_ATTEMPT', 'NETWORK_TAMPERING',
+      'AUTO_WIPE_TRIGGERED',
     ];
     const errorTypes: SecurityEventType[] = [
       'DECRYPTION_FAILED', 'RATCHET_DESYNC', 'INVALID_SIGNATURE', 'REPLAY_DETECTED',

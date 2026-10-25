@@ -1500,7 +1500,7 @@ async function handleFailedAttempt(): Promise<void> {
         __DEV__ && console.warn('☢️ AUTO-WIPE TRIGGERED — erasing all data');
         await securityLogger.log('AUTO_WIPE_TRIGGERED', {
           source: 'appLock',
-          attempts,
+          count: attempts,
         });
         await performSecurityWipe();
       }

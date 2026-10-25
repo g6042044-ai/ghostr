@@ -5,6 +5,7 @@
   "scripts": {
     "start": "expo start",
     "i18n:check": "node scripts/validate-i18n.js",
+    "test": "node scripts/run-tests.js",
     "android": "expo run:android",
     "ios": "expo run:ios",
     "build:android": "eas build --platform android",

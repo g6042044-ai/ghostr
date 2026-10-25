@@ -1,4 +1,4 @@
-const codec = require('./groupInviteCodec.js');
+const codec = require('./groupInviteCodec.ts'); // transpilé à la volée par scripts/load-ts.js (npm run test)
 const crypto = require('crypto');
 
 let pass = 0, fail = 0;

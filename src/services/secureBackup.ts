@@ -5,7 +5,7 @@
 //
 //   user_password
 //        │
-//        │  Argon2id (m=64MiB, t=3, p=1) — same params as appLock.ts
+//        │  Argon2id (m=19 MiB, t=2, p=1) — OWASP 2025, via kdf.ts, same params as appLock.ts
 //        │  salt: 32 bytes, fresh per backup
 //        ▼
 //   backup_KEK (32 bytes)
@@ -25,7 +25,7 @@
 //   FILE = magic || version || headerLen(BE32) || header || headerMac || ciphertext
 //
 // KEY PROPERTIES:
-//   1. Without the password, the DEK is unrecoverable (Argon2id 64MiB makes
+//   1. Without the password, the DEK is unrecoverable (Argon2id 19 MiB / t=2 makes
 //      brute force ~$10^9 per try at scale; password strength dominates).
 //   2. Header tampering (e.g. lowering Argon2id memory to make brute force
 //      easier) is detected by the headerMac BEFORE any decryption attempt.
