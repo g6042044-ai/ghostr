@@ -59,6 +59,14 @@ const APNS_TEAM_ID = process.env.APNS_TEAM_ID;
 const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.ghostr.app';
 const APNS_PRODUCTION = process.env.APNS_PRODUCTION === 'true';
 
+// Tâche 0.5 : aucune donnée de trafic dans les logs (jetons d'appareil compris,
+// même tronqués : un préfixe de jeton APNs identifie l'appareil chez Apple).
+// PUSH_PROXY_VERBOSE_LOGS=true réactive les logs de diagnostic par envoi.
+const PUSH_PROXY_VERBOSE_LOGS = process.env.PUSH_PROXY_VERBOSE_LOGS === 'true';
+function diag(...args) {
+  if (PUSH_PROXY_VERBOSE_LOGS) console.log(...args);
+}
+
 // ============================================
 // VALIDATION
 // ============================================
@@ -404,10 +412,10 @@ async function sendApnsPing(deviceToken, isCall = false, isCallCancel = false, i
   // APNs HTTP/2 requires lowercase hex without separators
   const cleanToken = deviceToken.replace(/[<>\s]/g, '').toLowerCase();
   if (cleanToken.length < 32 || !/^[0-9a-f]+$/.test(cleanToken)) {
-    throw new Error(`Invalid APNs token format (len=${cleanToken.length}, raw=${deviceToken.slice(0, 20)}...)`);
+    throw new Error(`Invalid APNs token format (len=${cleanToken.length})`);
   }
   if (cleanToken !== deviceToken) {
-    console.log(`📱 APNs token sanitized: "${deviceToken.slice(0, 12)}..." → "${cleanToken.slice(0, 12)}..." (len: ${cleanToken.length})`);
+    diag('📱 APNs token sanitized');
   }
 
   const jwtToken = getApnsJwt();
@@ -773,7 +781,6 @@ const server = http.createServer(async (req, res) => {
           metrics.fcmSent++;
           if (isCall || isCallCancel) metrics.fcmCallSent++;
         } else if (tokenData.platform === 'apns') {
-          console.log(`📱 APNs token debug: len=${tokenData.token.length} prefix="${tokenData.token.slice(0, 16)}" suffix="${tokenData.token.slice(-8)}"`);
           await sendApnsPing(tokenData.token, isCall, isCallCancel, isMissedCall);
           metrics.apnsSent++;
           if (isCall || isCallCancel) metrics.apnsCallSent++;
@@ -781,7 +788,7 @@ const server = http.createServer(async (req, res) => {
           throw new Error(`Unknown platform: ${tokenData.platform}`);
         }
 
-        console.log(`🔔 Push sent (${pushLabel}, ${tokenData.platform})`);
+        diag(`🔔 Push sent (${pushLabel}, ${tokenData.platform})`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true }));
 

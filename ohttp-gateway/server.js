@@ -70,6 +70,22 @@ const ALLOWED_RPCS = new Set([
 ]);
 
 // ============================================
+// JOURNALISATION (tâche 0.5 — aucune donnée de trafic dans les logs)
+// ============================================
+// Les logs partent dans Cloud Logging, horodatés et persistants. Règle :
+// aucune valeur dérivée du trafic d'un utilisateur n'y entre jamais — ni tag,
+// ni préfixe de tag, ni chemin de blob, ni taille individuelle, ni message
+// d'erreur relayé (JSON.parse, Supabase, raison PoW : ils peuvent contenir du
+// contenu ou des valeurs envoyées par le client). Les compteurs agrégés
+// (METRICS) sont le seul niveau de détail autorisé.
+// GATEWAY_VERBOSE_LOGS=true réactive les logs de diagnostic par requête, qui
+// respectent eux aussi cette règle. Défaut : silencieux.
+const GATEWAY_VERBOSE_LOGS = process.env.GATEWAY_VERBOSE_LOGS === 'true';
+function diag(...args) {
+  if (GATEWAY_VERBOSE_LOGS) console.log(...args);
+}
+
+// ============================================
 // SEALED SENDER (Audit Fix C-01)
 // ============================================
 // Le sealed sender utilise une paire de clés DISTINCTE du gateway OHTTP.
@@ -421,7 +437,9 @@ const METRICS = {
   rpc_blob_delete: 0,
   // Erreurs
   err_decryption: 0,
+  err_ohttp_decryption: 0, // requête OHTTP indéchiffrable (clé obsolète côté client)
   err_pow_rejected: 0,
+  err_rpc_blocked: 0,
   err_cert_expired: 0,
   err_cert_quota_exceeded: 0,
   err_rate_limit_gateway: 0,
@@ -745,6 +763,21 @@ let gatewayKeyPair = null;
 let previousGatewayKeyPair = null; // Keep old keys for 1h overlap
 const KEY_ROTATION_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const KEY_OVERLAP_MS = 60 * 60 * 1000; // 1h overlap for in-transit requests
+
+// Tâche 0.5 (2026-10-25) : rotation en mémoire DÉSACTIVÉE PAR DÉFAUT.
+// La clé tournée n'existe que dans la mémoire de l'instance. À chaque
+// redémarrage (déploiement, ou recyclage décidé par Cloud Run), l'instance
+// repart de la clé d'environnement et la clé tournée disparaît avec sa période
+// de recouvrement. Un client qui l'a en cache chiffre alors vers une clé que
+// plus personne ne détient : réponse 400, polls et envois en échec jusqu'à la
+// relance de l'app. La version publiée ne rafraîchit pas sa clé sur erreur.
+// Propriété perdue tant que c'est désactivé : la confidentialité persistante
+// du tunnel OHTTP à 24 h (une fuite de la clé d'env relit tout le trafic
+// capturé). Propriétés conservées : pinning de l'identité, signature de la
+// clé publiée, et le gateway lit déjà le contenu en clair par conception.
+// Réactivation : GATEWAY_KEY_ROTATION=true — seulement avec un client qui
+// rafraîchit le manifest et réessaie après un 400, et un manifest à deux clés.
+const GATEWAY_KEY_ROTATION = process.env.GATEWAY_KEY_ROTATION === 'true';
 let keyRotationTimestamp = 0;
 
 // P1-A6: Identity key pair (Ed25519, FIXED, from env vars)
@@ -858,6 +891,10 @@ function rotateGatewayKeys() {
 
 // Schedule automatic rotation
 function startKeyRotation() {
+  if (!GATEWAY_KEY_ROTATION) {
+    console.log('🔑 OHTTP key rotation DISABLED (default): the env key stays stable across restarts. Set GATEWAY_KEY_ROTATION=true to enable.');
+    return;
+  }
   // Only rotate if using env-provided keys (not for auto-generated testing keys)
   if (GATEWAY_SECRET_KEY && GATEWAY_PUBLIC_KEY) {
     setInterval(() => {
@@ -1164,7 +1201,8 @@ async function requestHandlerInner(req, res) {
 
       // Validate RPC name
       if (!request.rpc || !ALLOWED_RPCS.has(request.rpc)) {
-        console.log(`❌ Blocked RPC: ${request.rpc}`);
+        bumpMetric('err_rpc_blocked');
+        diag('❌ Blocked RPC');
         const errorResponse = encryptResponse(
           JSON.stringify({ error: `RPC '${request.rpc}' not allowed` }),
           ephemeralPubKey, usedSecretKey
@@ -1180,7 +1218,8 @@ async function requestHandlerInner(req, res) {
         const pow = request.params && request.params.pow;
         const powResult = verifyProofOfWork(pow);
         if (!powResult.valid) {
-          console.log(`❌ PoW rejected: ${powResult.reason}`);
+          // Seule la catégorie est journalisée : le détail contient des valeurs client.
+          diag(`❌ PoW rejected: ${String(powResult.reason).split(':')[0]}`);
           bumpMetric('err_pow_rejected');
           const errResp = encryptResponse(
             JSON.stringify({ data: null, error: `Invalid or missing proof-of-work: ${powResult.reason}` }),
@@ -1195,7 +1234,7 @@ async function requestHandlerInner(req, res) {
           ? { data: cert, error: null }
           : { data: null, error: 'Sealed sender not configured' };
         const certResponse = encryptResponse(JSON.stringify(result), ephemeralPubKey, usedSecretKey);
-        console.log(`✅ get_sealed_certificate (PoW verified) → ${cert ? 'issued' : 'not configured'}`);
+        diag(`✅ get_sealed_certificate (PoW verified) → ${cert ? 'issued' : 'not configured'}`);
         bumpMetric('rpc_get_certificate');
         bumpMetric('rpc_total');
         res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
@@ -1245,7 +1284,7 @@ async function requestHandlerInner(req, res) {
             error: null,
           }), ephemeralPubKey, usedSecretKey);
 
-          console.log(`🌳 kt_register_key → ${result.alreadyRegistered ? 'already exists' : 'registered'} #${result.index} (tree: ${result.treeSize})`);
+          diag(`🌳 kt_register_key → ${result.alreadyRegistered ? 'already exists' : 'registered'}`);
           res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
           res.end(Buffer.from(resp));
         } catch (e) {
@@ -1277,7 +1316,7 @@ async function requestHandlerInner(req, res) {
             error: proof ? null : 'Key not found in transparency log',
           }), ephemeralPubKey, usedSecretKey);
 
-          console.log(`🌳 kt_get_proof → ${proof ? 'found #' + proof.index : 'NOT FOUND'}`);
+          diag(`🌳 kt_get_proof → ${proof ? 'found' : 'NOT FOUND'}`);
           res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
           res.end(Buffer.from(resp));
         } catch (e) {
@@ -1437,7 +1476,7 @@ async function requestHandlerInner(req, res) {
           });
 
           const sealedResp = encryptResponse(JSON.stringify(supabaseResult), ephemeralPubKey, usedSecretKey);
-          console.log(`✅ send_sealed_message → unwrapped & forwarded (cert valid, tag: ${tag.slice(0, 12)}...)`);
+          diag('✅ send_sealed_message → unwrapped & forwarded (cert valid)');
           bumpMetric('rpc_send_sealed');
           bumpMetric('rpc_total');
           
@@ -1465,7 +1504,8 @@ async function requestHandlerInner(req, res) {
           res.end(Buffer.from(sealedResp));
 
         } catch (sealedErr) {
-          console.error(`❌ send_sealed_message failed: ${sealedErr.message}`);
+          // Pas de sealedErr.message : un échec de JSON.parse y recopie du contenu.
+          console.error('❌ send_sealed_message failed');
           // P1-B6: catégoriser l'erreur pour les métriques
           const msg = String(sealedErr.message || '');
           if (msg.includes('Certificate expired')) bumpMetric('err_cert_expired');
@@ -1534,11 +1574,11 @@ async function requestHandlerInner(req, res) {
             JSON.stringify({ data: { path: blobPath }, error: null }),
             ephemeralPubKey, usedSecretKey
           );
-          console.log(`✅ upload_blob → ${blobPath.slice(0, 16)}... (${Math.round(blobBuffer.length / 1024)}KB)`);
+          diag('✅ upload_blob → stored');
           res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
           res.end(Buffer.from(resp));
         } catch (e) {
-          console.error(`❌ upload_blob failed: ${e.message}`);
+          console.error('❌ upload_blob failed');
           const errResp = encryptResponse(
             JSON.stringify({ data: null, error: e.message }),
             ephemeralPubKey, usedSecretKey
@@ -1579,11 +1619,11 @@ async function requestHandlerInner(req, res) {
             JSON.stringify({ data: { blob_data: blobB64 }, error: null }),
             ephemeralPubKey, usedSecretKey
           );
-          console.log(`✅ download_blob → ${blobPath.slice(0, 16)}... (${Math.round(blobBuffer.length / 1024)}KB)`);
+          diag('✅ download_blob → served');
           res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
           res.end(Buffer.from(resp));
         } catch (e) {
-          console.error(`❌ download_blob failed: ${e.message}`);
+          console.error('❌ download_blob failed');
           const errResp = encryptResponse(
             JSON.stringify({ data: null, error: e.message }),
             ephemeralPubKey, usedSecretKey
@@ -1634,78 +1674,6 @@ async function requestHandlerInner(req, res) {
 
       // ============================================
       // END BLOB STORAGE RPCs
-      // ============================================
-
-      // ============================================
-      // ACTION-01 (Phase 1 Security): LEGACY MEDIA DOWNLOAD VIA OHTTP
-      // ============================================
-      // Old media was stored at whisper-media/<tag>/<fileId><suffix>.enc
-      // The tag in the storage path allowed CF Relay to correlate IP ↔ conversation.
-      // This RPC proxies downloads through the OHTTP tunnel so the CF Relay
-      // sees only an opaque encrypted blob, not the tag/fileId.
-
-      if (request.rpc === 'download_legacy_media') {
-        try {
-          const params = request.params || {};
-          const storagePath = params.storage_path;  // The tag (conversation identifier)
-          const fileId = params.file_id;            // Anonymous file UUID
-          const suffix = params.suffix || '';        // '' or '_thumb' or '_voice'
-
-          // Validate inputs to prevent path traversal
-          if (!storagePath || typeof storagePath !== 'string' || storagePath.length < 8 || storagePath.length > 128) {
-            throw new Error('Invalid storage_path');
-          }
-          if (!fileId || typeof fileId !== 'string' || fileId.length < 10 || fileId.length > 64) {
-            throw new Error('Invalid file_id');
-          }
-          if (suffix && !['_thumb', '_voice'].includes(suffix)) {
-            throw new Error('Invalid suffix');
-          }
-          // Block path traversal
-          if (storagePath.includes('..') || storagePath.includes('/') || storagePath.includes('\\') ||
-              fileId.includes('..') || fileId.includes('/') || fileId.includes('\\')) {
-            throw new Error('Path traversal detected');
-          }
-
-          const objectPath = `${storagePath}/${fileId}${suffix}.enc`;
-          const downloadUrl = `${SUPABASE_URL}/storage/v1/object/whisper-media/${objectPath}`;
-
-          const dlResp = await fetch(downloadUrl, {
-            method: 'GET',
-            headers: {
-              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-              'apikey': SUPABASE_ANON_KEY,
-            },
-          });
-
-          if (!dlResp.ok) {
-            throw new Error(`Supabase Storage ${dlResp.status}`);
-          }
-
-          const mediaBuffer = Buffer.from(await dlResp.arrayBuffer());
-          const mediaB64 = mediaBuffer.toString('base64');
-
-          const resp = encryptResponse(
-            JSON.stringify({ data: { media_data: mediaB64 }, error: null }),
-            ephemeralPubKey, usedSecretKey
-          );
-          console.log(`✅ download_legacy_media → ${objectPath.slice(0, 30)}... (${Math.round(mediaBuffer.length / 1024)}KB)`);
-          res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-          res.end(Buffer.from(resp));
-        } catch (e) {
-          console.error(`❌ download_legacy_media failed: ${e.message}`);
-          const errResp = encryptResponse(
-            JSON.stringify({ data: null, error: e.message }),
-            ephemeralPubKey, usedSecretKey
-          );
-          res.writeHead(400, { 'Content-Type': 'application/octet-stream' });
-          res.end(Buffer.from(errResp));
-        }
-        return;
-      }
-
-      // ============================================
-      // END LEGACY MEDIA RPCs
       // ============================================
 
       // P1-B3: Rate limit gateway-level pour les RPCs de lecture.
@@ -1764,7 +1732,8 @@ async function requestHandlerInner(req, res) {
         ephemeralPubKey, usedSecretKey
       );
 
-      console.log(`✅ ${request.rpc} → ${supabaseResult.error ? 'error' : 'ok'} (${body.length}B in, ${encryptedResponse.length}B out)`);
+      // request.rpc est validé contre ALLOWED_RPCS plus haut : ensemble fixe.
+      diag(`✅ ${request.rpc} → ${supabaseResult.error ? 'error' : 'ok'}`);
 
       res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
       res.end(Buffer.from(encryptedResponse));
@@ -1775,7 +1744,15 @@ async function requestHandlerInner(req, res) {
         res.writeHead(413, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Payload too large (max 22MB)' }));
       } else {
-        console.error('❌ Relay error:', error.message);
+        // Seuls les messages fixes de decryptBlob sont journalisés ; une erreur
+        // de JSON.parse recopie un extrait de la requête.
+        const isKeyMismatch = error.message === 'Decryption failed (invalid key or corrupted data)';
+        const isUpstreamDown = error.message === 'fetch failed'; // message fixe d'undici
+        if (isKeyMismatch) bumpMetric('err_ohttp_decryption');
+        if (isUpstreamDown) bumpMetric('err_supabase');
+        const reason = isKeyMismatch || error.message === 'Blob too small' ? error.message
+          : isUpstreamDown ? 'upstream unreachable' : 'unparseable request';
+        console.error(`❌ Relay error: ${reason}`);
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Bad request' }));
       }

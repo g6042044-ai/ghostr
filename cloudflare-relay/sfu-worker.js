@@ -322,7 +322,8 @@ export class VoiceRoom {
         this.resetInactivityTimer();
         
       } catch (error) {
-        console.error('[VoiceRoom] Message handling error:', error.message);
+        // Pas de error.message : un échec de JSON.parse y recopie le message reçu.
+        console.error('[VoiceRoom] Message handling error');
         // Ne pas envoyer d'erreur au client pour éviter les fuites d'information
       }
     });
