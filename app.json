@@ -28,7 +28,6 @@
           "audio",
           "remote-notification"
         ],
-        "ITSAppUsesNonExemptEncryption": true,
         "CFBundleAllowMixedLocalizations": true
       },
       "entitlements": {
