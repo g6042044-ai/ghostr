@@ -557,7 +557,7 @@ export type MessageType =
   | 'group_leave';          // Membre → membres : départ volontaire
 
 // v20.0: Types de messages de protocole à ne jamais afficher dans l'UI
-const PROTOCOL_MESSAGE_TYPES: MessageType[] = [
+export const PROTOCOL_MESSAGE_TYPES: MessageType[] = [
   'handshake_ack',
   'media_chunk',
   'push_token_update', // Invisible dans l'UI
@@ -577,6 +577,24 @@ const PROTOCOL_MESSAGE_TYPES: MessageType[] = [
   'mute_preference',   // v28.0: Invisible dans l'UI
   'catch_up_request',  // v29.0: Invisible dans l'UI (message de protocole)
 ];
+
+/**
+ * Vrai pour tout message qui ne doit jamais atteindre l'UI de la liste de
+ * conversations : les types de protocole ci-dessus, et TOUS les messages de
+ * groupe (`group_*`) — y compris `group_msg`, dont le contenu est un
+ * GroupCiphertext routé par groupId via apiGroups/notifyGroupUpdate, pas par
+ * le sessionId 1:1 du membre qui l'a transporté.
+ *
+ * Source de vérité unique : la liste de conversations s'y réfère au lieu de
+ * tenir sa propre liste (qui avait dérivé — push_token_update,
+ * mute_preference et catch_up_request s'affichaient comme dernier message
+ * et déclenchaient une bannière in-app avec leur JSON).
+ */
+export function isUiInvisibleMessageType(type: string | undefined): boolean {
+  if (!type) return false;
+  if (type.startsWith('group_')) return true;
+  return PROTOCOL_MESSAGE_TYPES.includes(type as MessageType);
+}
 
 // ============================================
 // PUSH NOTIFICATION — Sender-Side Architecture
@@ -2853,10 +2871,14 @@ async function doFetchMessages1to1(
                 const gid = p?.ciphertext?.groupId || p?.groupId;
                 if (gid) {
                   // v30.0: compteur de non-lus du groupe (réutilise le mécanisme
-                  // 1:1, indexé par groupId). `visible` n'est vrai que pour un
-                  // group_msg de contenu d'un AUTRE membre (les messages de
-                  // contrôle renvoient false), donc on ne compte pas les nôtres.
-                  await incrementUnreadCount(gid);
+                  // 1:1, indexé par groupId). Seul un group_msg de contenu d'un
+                  // AUTRE membre compte comme non-lu : les messages de contrôle
+                  // (membre ajouté, retiré, promu, méta, roster, départ) sont
+                  // « visibles » au sens où ils changent l'affichage du groupe,
+                  // mais ce ne sont pas des messages à lire.
+                  if (message.messageType === 'group_msg') {
+                    await incrementUnreadCount(gid);
+                  }
                   notifyGroupUpdate(gid);
                 }
               } catch {}
@@ -3772,7 +3794,11 @@ async function doPollAllSessions(): Promise<void> {
                       const p = JSON.parse((message as any).content);
                       const gid = p?.ciphertext?.groupId || p?.groupId;
                       if (gid) {
-                        await incrementUnreadCount(gid);
+                        // Même règle que fetchMessages1to1 : non-lu seulement
+                        // pour un group_msg de contenu, rafraîchissement pour tout.
+                        if (message.messageType === 'group_msg') {
+                          await incrementUnreadCount(gid);
+                        }
                         notifyGroupUpdate(gid);
                       }
                     } catch {}
@@ -3799,7 +3825,13 @@ async function doPollAllSessions(): Promise<void> {
                 deliveredIds.push(message.id);
               }
               
-              // Notifier les callbacks globaux (toast, badge, etc.)
+              // Notifier les callbacks globaux (toast, badge, etc.) — JAMAIS
+              // pour un message de protocole ni pour un message de groupe :
+              // ils ont été traités ci-dessus sans être enregistrés, et la
+              // liste de conversations les afficherait sinon tels quels
+              // (aperçu + bannière in-app avec leur JSON). Les accusés et
+              // réactions passent : la liste en a besoin pour ses statuts.
+              if (isUiInvisibleMessageType(message.messageType)) continue;
               for (const callback of globalPollState.newMessageCallbacks) {
                 try {
                   callback(sessionId, message);

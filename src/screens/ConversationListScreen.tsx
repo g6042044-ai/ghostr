@@ -16,7 +16,7 @@ import { sessionService } from '../services/tripleRatchet';
 import { pendingInviteStore, PendingInvite } from '../services/pendingInvites';
 import { inviteWatcher } from '../services/inviteWatcher';
 import { showInAppNotification } from '../components/InAppNotification';
-import { subscribeToAllMessages1to1, getAllUnreadCounts, pollAllSessions, getLocalMessages1to1, clearLocalMessages1to1, clearUnreadCount, waitForSealedSenderReady, getAllLastMessagePreviews, updateLastMessagePreview, onGroupUpdate } from '../services/api1to1';
+import { subscribeToAllMessages1to1, getAllUnreadCounts, pollAllSessions, getLocalMessages1to1, clearLocalMessages1to1, clearUnreadCount, waitForSealedSenderReady, getAllLastMessagePreviews, updateLastMessagePreview, onGroupUpdate, isUiInvisibleMessageType } from '../services/api1to1';
 import { isSealedSenderReady } from '../services/sealedSender';
 import { isSessionMutedSync } from '../services/muteService';
 import { isInCall1to1 } from '../services/call1to1Service';
@@ -904,10 +904,21 @@ export function ConversationListScreen() {
   // S'abonner aux nouveaux messages pour rafraîchir la liste + notification in-app
   useEffect(() => {
     // Types de messages qui ne doivent PAS déclencher de notification in-app
-    // (ils sont invisibles côté UX — internes au protocole / état local).
+    // ni écraser l'aperçu du dernier message. Deux familles :
+    // - les événements d'état local (accusés, frappe, signaux d'appel,
+    //   réactions), listés ici ;
+    // - les messages de protocole et de groupe, dont la liste de référence
+    //   est PROTOCOL_MESSAGE_TYPES dans api1to1 (`isUiInvisibleMessageType`).
+    //   Ne JAMAIS les recopier ici : cette copie avait dérivé et laissait
+    //   passer push_token_update, mute_preference et catch_up_request, qui
+    //   s'affichaient avec leur JSON. api1to1 ne les notifie plus, la garde
+    //   ci-dessous est une ceinture en plus des bretelles.
     const NOTIFICATION_SILENT_TYPES = new Set([
       'read_receipt', 'delivered_receipt', 'typing', 'call_signal', 'handshake_ack', 'reaction',
     ]);
+    // Un message sans type (champ optionnel) reste visible, comme avant.
+    const isSilent = (type: string | undefined): boolean =>
+      !!type && (NOTIFICATION_SILENT_TYPES.has(type) || isUiInvisibleMessageType(type));
     // PERF FIX (4.3) : types qui ne doivent PAS rafraîchir la liste de conversations.
     // - typing/call_signal/handshake_ack/reaction : n'affectent ni le dernier message
     //   ni le compteur de non-lus → rafraîchir = setState avec un nouveau tableau
@@ -922,7 +933,7 @@ export function ConversationListScreen() {
       // PERF A6: Mettre à jour le cache du dernier message AVANT de rafraîchir la liste.
       // Cela évite que loadConversations recharge tous les messages depuis AsyncStorage.
       // Le cache est mis à jour si ce message est plus récent que l'entrée actuelle.
-      if (!NOTIFICATION_SILENT_TYPES.has(message.messageType as string)) {
+      if (!isSilent(message.messageType as string | undefined)) {
         const cached = lastMessageCacheRef.current.get(sessionId);
         if (!cached || message.timestamp >= cached.timestamp) {
           lastMessageCacheRef.current.set(sessionId, messageToLastInfo(message));
@@ -936,7 +947,7 @@ export function ConversationListScreen() {
 
       // Notification in-app pour les messages entrants visibles uniquement
       if (message.isMine) return;
-      if (message.messageType && NOTIFICATION_SILENT_TYPES.has(message.messageType)) return;
+      if (isSilent(message.messageType as string | undefined)) return;
       
       // CORRECTION: Ne pas afficher la notification si la conversation est mutée
       if (isSessionMutedSync(sessionId)) return;
