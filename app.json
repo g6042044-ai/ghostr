@@ -2,7 +2,7 @@
   "expo": {
     "name": "Ghostr",
     "slug": "whisper-app",
-    "version": "1.1",
+    "version": "1.2",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
@@ -18,7 +18,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.ghostr.app",
-      "buildNumber": "9",
+      "buildNumber": "12",
       "infoPlist": {
         "NSCameraUsageDescription": "Ghostr uses the camera so you can scan a contact's QR code to start an encrypted conversation, scan a safety number to verify a contact's identity, take a photo to send inside a conversation (for example, sharing a picture with a friend), and set or update your profile picture.",
         "NSMicrophoneUsageDescription": "Ghostr uses the microphone so you can make end-to-end encrypted voice calls with your contacts and record voice messages to send inside a conversation.",
@@ -61,7 +61,7 @@
         "backgroundColor": "#0A0F14"
       },
       "package": "com.ghostr.app",
-      "versionCode": 21,
+      "versionCode": 22,
       "permissions": [
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO",
