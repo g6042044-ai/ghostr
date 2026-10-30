@@ -211,9 +211,11 @@ function selectTier(size: number): number {
  * Les bytes aléatoires empêchent la compression HTTP / au stockage de
  * révéler la taille originale.
  *
- * v28.0: Une seule allocation (le buffer paddé final), pas de copie
- * intermédiaire. Le random est écrit DIRECTEMENT dans la queue du buffer
- * via fillRandomBytes(subarray) → un seul appel JSI par 64KB de padding.
+ * v28.0: Une seule allocation (le buffer paddé final). Le random est écrit
+ * dans la queue du buffer via fillRandomBytes(subarray) → un seul appel JSI
+ * par 64KB de padding. Depuis 0.12, fillRandomBytes passe par un tampon à
+ * décalage zéro avant de copier dans la vue : donner une vue décalée au
+ * natif plantait Android (double byteOffset dans expo-crypto, SDK 54).
  */
 function padToTier(ciphertext: Uint8Array, tierSize: number): Uint8Array {
   if (ciphertext.length >= tierSize) {
@@ -225,10 +227,12 @@ function padToTier(ciphertext: Uint8Array, tierSize: number): Uint8Array {
   // Préfixe = ciphertext (memcpy natif via Uint8Array.set)
   padded.set(ciphertext, 0);
 
-  // Queue = bytes aléatoires écrits EN PLACE.
+  // Queue = bytes aléatoires.
   // fillRandomBytes utilise crypto.getRandomValues (1 appel natif / 64KB)
   // au lieu de la chaîne Crypto.getRandomBytes (1 appel natif / 1024B).
   // Gain pour le tier 16MB: ~64× moins d'appels au pont natif iOS.
+  // La vue décalée reste côté JS : fillRandomBytes copie depuis un tampon
+  // à décalage zéro (voir naclSetup.ts, tâche 0.12).
   fillRandomBytes(padded.subarray(ciphertext.length));
 
   return padded;

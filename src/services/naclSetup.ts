@@ -22,16 +22,33 @@
 //   On utilise globalThis.crypto.getRandomValues (polyfillé au boot via
 //   react-native-get-random-values, déjà importé dans App.tsx). Cette API
 //   suit la spec Web Crypto et accepte jusqu'à 65 536 bytes par appel —
-//   soit 64× moins d'appels natifs. On écrit DIRECTEMENT dans le buffer
-//   cible via subarray (zéro-copy) au lieu d'allouer un nouveau Uint8Array
-//   à chaque chunk.
+//   soit 64× moins d'appels natifs.
 //
 // IMPACT MESURÉ:
 //   - Padding 16MB tier:    16 384 appels → 256 appels (64× moins)
 //   - Padding 4MB tier:      4 096 appels →  64 appels
 //   - Padding 1MB tier:      1 024 appels →  16 appels
 //   - Padding 256KB tier:      256 appels →   4 appels
-//   - Zéro allocation Uint8Array intermédiaire dans le chemin critique
+//
+// ============================================================================
+// Tâche 0.12 (2026-10-30) — PLANTAGE ANDROID À L'ENVOI D'UN MÉDIA :
+//
+//   La version v28.0 passait des vues DÉCALÉES (subarray à byteOffset > 0)
+//   à crypto.getRandomValues pour écrire sans copie dans la queue du blob.
+//   Sur Android, expo-crypto 15 (SDK 54) applique le byteOffset DEUX fois :
+//   CryptoModule.kt appelle typedArray.write(bytes, byteOffset, byteLength)
+//   alors que le pointeur natif d'expo-modules-core inclut déjà le décalage
+//   (TypedArray::getRawPointer). Toute vue décalée est donc écrite hors du
+//   buffer → SIGSEGV dans JavaScriptTypedArray::writeBuffer. Corrigé en
+//   amont seulement en SDK 55 (expo/expo PR #42186, issue #43124). iOS
+//   n'est pas touché (SecRandomCopyBytes sur array.rawPointer, une seule
+//   application du décalage).
+//
+//   Règle : ne JAMAIS donner au natif une vue dont byteOffset ≠ 0. On remplit
+//   un tampon à décalage zéro de 64 Ko au plus, puis on le copie dans la
+//   cible avec view.set (memcpy). Même nombre d'appels natifs qu'avant,
+//   une copie mémoire supplémentaire par tranche de 64 Ko, imperceptible.
+//   Vérifié par src/services/naclSetup.test.js (npm run test).
 // ============================================================================
 
 import * as Crypto from 'expo-crypto';
@@ -68,8 +85,9 @@ function getWebCrypto(): { getRandomValues: (a: Uint8Array) => Uint8Array } | nu
 /**
  * Remplit un Uint8Array EN PLACE avec des bytes aléatoires cryptographiquement sûrs.
  *
- * Zéro allocation intermédiaire dans le chemin chaud — on passe des subarray()
- * directement à crypto.getRandomValues qui écrit dans le buffer sous-jacent.
+ * La cible peut être une vue décalée (subarray) : elle n'est jamais passée
+ * telle quelle au natif (voir « Tâche 0.12 » en tête de fichier). Le natif ne
+ * reçoit que des tampons à byteOffset 0, copiés ensuite dans la cible.
  *
  * Hot path pour le padding des blobs média (jusqu'à 16MB de random).
  *
@@ -82,19 +100,20 @@ export function fillRandomBytes(view: Uint8Array): void {
   // Chemin rapide: crypto.getRandomValues (1 appel natif par 64KB)
   const webCrypto = getWebCrypto();
   if (webCrypto) {
+    // Tampon à décalage zéro, réutilisé pour toutes les tranches pleines ;
+    // la dernière tranche, plus courte, a son propre tampon exact.
+    let scratch = new Uint8Array(Math.min(WEB_CRYPTO_QUOTA, total));
     let offset = 0;
     while (offset < total) {
       const chunkSize = Math.min(WEB_CRYPTO_QUOTA, total - offset);
-      // Subarray = vue zéro-copy sur le même ArrayBuffer.
-      // crypto.getRandomValues écrit directement dedans, pas d'allocation.
-      const slice = new Uint8Array(
-        view.buffer,
-        view.byteOffset + offset,
-        chunkSize
-      );
-      webCrypto.getRandomValues(slice);
+      if (scratch.byteLength !== chunkSize) scratch = new Uint8Array(chunkSize);
+      webCrypto.getRandomValues(scratch);
+      view.set(scratch, offset);
       offset += chunkSize;
     }
+    // Le tampon a pu porter une clé ou un nonce (getSecureRandomBytes) :
+    // on ne laisse pas de copie traîner en mémoire.
+    scratch.fill(0);
     return;
   }
 
